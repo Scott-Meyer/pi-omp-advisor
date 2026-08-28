@@ -1,6 +1,54 @@
 # Development
 
-## Outstanding task: make this installable on machines other than your own
+## How this is installed (and why not npm)
+
+Every machine runs a **local, editable checkout** at `$HOME/git/pi-omp-advisor`,
+registered as a local-path package:
+
+```json
+{ "packages": ["../../git/pi-omp-advisor"] }
+```
+
+That path is resolved by pi against `~/.pi/agent`, so it means
+`$HOME/git/pi-omp-advisor` on **any** machine regardless of what `$HOME` is. One
+synced `settings.json` therefore carries this install everywhere without
+hard-coding anyone's paths.
+
+To set up a new machine:
+
+```bash
+./scripts/bootstrap-machine.sh
+# or, with no checkout yet:
+curl -fsSL https://raw.githubusercontent.com/Scott-Meyer/pi-omp-advisor/main/scripts/bootstrap-machine.sh | bash
+```
+
+It clones or fast-forwards the checkout, installs production dependencies, and
+adds the settings entry. It is idempotent, and it refuses to touch a checkout with
+uncommitted changes.
+
+**Why not `pi install npm:` or `pi install git:`.** Both hand you a pi-managed
+copy you must not edit:
+
+- `npm:` means a publish round-trip for every change.
+- `git:` clones into `~/.pi/agent/git/`, and pi's updater runs `git reset --hard`
+  followed by `git clean -fdx` in that clone (`package-manager.js`) — any local
+  edit or untracked file is destroyed on the next update.
+
+A local-path entry keeps the install and the working tree the same directory, so
+edits are live and updates are `git pull`.
+
+**Do not list more than one entry for this project.** pi keys package identity
+separately for local paths (resolved absolute path), git URLs, and npm names, so a
+local path *plus* a `git:`/`npm:` spec loads the extension twice and both copies
+register `/advisor`. The bootstrap script warns if it sees a rival entry.
+
+**What pi does not do for local-path packages:** install dependencies. Only `npm:`
+and `git:` specs get an `npm install`. The checkout needs its own `node_modules`,
+or `yaml` will not resolve and every `WATCHDOG.yml` is silently ignored (the
+advisor degrades rather than crashing, so this fails quietly). That is the single
+reason the bootstrap script exists rather than just documenting a `git clone`.
+
+## Optional: publishing to npm
 
 **Remember to do this.** Right now pi-omp-advisor is installed by a local path entry in
 `~/.pi/agent/settings.json`:
@@ -9,8 +57,11 @@
 { "packages": ["../../git/pi-omp-advisor"] }
 ```
 
-That works on the machine holding the checkout only, and a local path entry does
-not travel:
+Publishing is **not** required for the setup above, and is only worth doing if you
+want other people to install this. For your own machines, prefer the checkout
+workflow — it avoids a publish round-trip per change.
+
+If you do publish, note what a local path entry cannot do on its own:
 
 - Tooling that syncs an agent config across machines typically copies
   `settings.json` and friends, not your working tree. The remote machine then has

@@ -45,7 +45,18 @@ boundary before a note can enter the delivery state machine.
 
 ## Install
 
-Install it as a **pi package**, so its dependencies travel with it:
+**Running from an editable checkout** (recommended if you intend to modify it —
+the checkout *is* the install, so edits are live and updates are `git pull`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Scott-Meyer/pi-omp-advisor/main/scripts/bootstrap-machine.sh | bash
+```
+
+That clones to `$HOME/git/pi-omp-advisor`, installs dependencies, and registers it
+as a local-path package. Because pi resolves that path relative to `~/.pi/agent`,
+the same settings entry works on every machine.
+
+**Or install it as a managed pi package**, so its dependencies travel with it:
 
 ```bash
 pi install npm:pi-omp-advisor
