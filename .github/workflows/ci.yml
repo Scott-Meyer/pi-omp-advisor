@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # Matches the `engines.node` floor, which in turn matches pi's own.
+          node-version: "22.19.0"
+          cache: npm
+
+      - run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      # Guards the failure mode that would break the published package while
+      # working perfectly from a checkout: the extension loads its prompts at
+      # runtime via `new URL("../prompts/....md", import.meta.url)`, so a `files`
+      # whitelist or ignore-rule change that drops them is invisible locally.
+      - name: Verify runtime assets are packaged
+        run: npm run verify:package

@@ -1,0 +1,552 @@
+/**
+ * Ported from oh-my-pi `src/advisor/config.ts` + `src/advisor/watchdog.ts`
+ * (npm `@oh-my-pi/pi-coding-agent@17.4.1`): discovery of `WATCHDOG.yml` /
+ * `WATCHDOG.yaml` (advisor roster) and `WATCHDOG.md` (freeform attention
+ * text) walking from `cwd` up to the repo root (or home), plus the user
+ * agent dir, both bare and under a `.omp` subdirectory — kept identical to
+ * upstream (filenames AND the `.omp` dotfolder name) per explicit user
+ * instruction that config discovery be byte-for-byte compatible, not just
+ * the file names. Bun-specific I/O (`Bun.file`, `Bun.YAML`) is replaced with
+ * `node:fs` + the `yaml` npm package; git-root resolution is a plain
+ * `git rev-parse --show-toplevel` shellout instead of omp's internal `repo`
+ * helper. See ../../PROVENANCE.md.
+ */
+import { execFile } from "node:child_process";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import { promisify } from "node:util";
+/**
+ * `yaml` is a genuine third-party dependency (declared in this package's
+ * `dependencies`) — unlike `typebox` and the `@earendil-works/*` packages, pi
+ * does NOT provide it to extensions (see pi's `docs/packages.md`, whose
+ * host-provided list is pi-ai, pi-agent-core, pi-coding-agent, pi-tui,
+ * typebox). A statically-imported bare `yaml` therefore only resolves when it
+ * happens to be hoisted into the agent's shared `node_modules` by some
+ * unrelated package, which varies per machine and install order.
+ *
+ * It is loaded dynamically and guarded so that an unresolvable `yaml` degrades
+ * to "no YAML roster discovered" instead of throwing at extension load — an
+ * extension that throws while loading takes down the entire pi session, so a
+ * missing optional-at-runtime dependency must never be a hard failure.
+ * Freeform `WATCHDOG.md` instructions need no parser and keep working.
+ */
+interface YamlModule {
+  parse: (source: string) => unknown;
+  stringify: (value: unknown) => string;
+}
+
+let yamlModule: YamlModule | null | undefined;
+
+async function requireYaml(): Promise<YamlModule | null> {
+  if (yamlModule !== undefined) return yamlModule;
+  try {
+    const mod = (await import("yaml")) as unknown as YamlModule & { default?: YamlModule };
+    yamlModule = mod.default?.parse ? mod.default : mod;
+  } catch (err) {
+    yamlModule = null;
+    console.error(
+      `[pi-omp-advisor] cannot load the 'yaml' package, so WATCHDOG.yml/.yaml files will be ignored ` +
+        `(WATCHDOG.md still works). Install pi-omp-advisor as a pi package so its dependencies are ` +
+        `installed with it, rather than symlinking its source directory. Cause: ${String(err)}`,
+    );
+  }
+  return yamlModule;
+}
+import { ADVISOR_TOOL_NAME_ALIASES } from "./advise-logic.ts";
+
+const execFileAsync = promisify(execFile);
+
+export interface AdvisorConfig {
+  name: string;
+  model?: string;
+  tools?: string[];
+  instructions?: string;
+  /** Per-advisor on/off toggle (default `true`). */
+  enabled?: boolean;
+}
+
+export interface DiscoveredAdvisors {
+  advisors: AdvisorConfig[];
+  sharedInstructions: string | undefined;
+  /**
+   * pi-omp-advisor-specific addition, not part of upstream's `WATCHDOG.yml` schema
+   * (upstream has no concept of a separate subagent process to gate — it
+   * IS the whole product, always on). Top-level `subagents: true|false` in
+   * any discovered `WATCHDOG.yml`/`.yaml`; `true` from a more specific file
+   * wins over `false` from a less specific one, same precedence as
+   * `instructions`. `undefined` when no file sets it explicitly (caller
+   * default: off in a subagent process).
+   */
+  subagentsEnabled: boolean | undefined;
+  /**
+   * pi-omp-advisor-specific addition. Top-level `main: true|false` — the
+   * persisted default for whether a MAIN (non-subagent) session watches
+   * itself, independent of whether an advisor roster is present. Lets a
+   * roster stay configured (e.g. for subagent use only, via `subagents:
+   * true`) while the main session itself defaults off. `undefined` when no
+   * file sets it explicitly (caller default: on, if a roster exists — the
+   * pre-existing behavior).
+   */
+  mainEnabled: boolean | undefined;
+  /**
+   * Upstream's `advisor.syncBacklog` setting (`off` | `1` | `3` | `5`),
+   * expressed here as a `WATCHDOG.yml` field because pi has no equivalent
+   * settings-schema surface to register into. Pause the primary for up to 30s
+   * when an advisor is this many batches behind; `"off"` disables catch-up
+   * delays entirely. Upstream's default is `"off"` — the primary is never
+   * gated on an advisor unless you opt in — and `undefined` here means the
+   * same.
+   */
+  syncBacklog: number | "off" | undefined;
+  /**
+   * Upstream's `advisor.immuneTurns` setting (default `3`). After a concern or
+   * blocker interrupts, route further **concerns** non-interruptingly for this
+   * many primary turns. Blockers are deliberately exempt and keep interrupting
+   * — see `resolveAdvisorDeliveryChannel`, which only downgrades when
+   * `severity !== "blocker"`. `undefined` means upstream's default.
+   */
+  immuneTurns: number | undefined;
+  /**
+   * Whether at least one `WATCHDOG.yml`/`.yaml` was found **and parsed into a
+   * valid mapping**, even if it declares no advisors. Upstream's activation
+   * switch is the `advisor.enabled` setting with the roster optional (an empty
+   * roster runs one implicit `default` advisor); pi has no such setting, so
+   * writing a watchdog config file *is* the opt-in. Without this, a file
+   * containing only `main: true` would parse fine and then start nothing.
+   *
+   * Deliberately keyed on a successful parse, not on file existence: a
+   * malformed or non-mapping file must NOT silently activate a default advisor
+   * off the back of a config the user clearly intended to say something else.
+   */
+  configFound: boolean;
+}
+
+/**
+ * Normalize an advisor name into a filesystem-/id-safe slug: lowercase,
+ * non-alphanumerics collapsed to `-`, leading/trailing `-` trimmed. Falls
+ * back to `"advisor"` when nothing survives; callers dedupe collisions.
+ */
+export function slugifyAdvisorName(name: string): string {
+  const slug = name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return slug || "advisor";
+}
+
+async function gitRoot(cwd: string): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync("git", ["rev-parse", "--show-toplevel"], { cwd });
+    return stdout.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+function isEnoent(err: unknown): boolean {
+  return typeof err === "object" && err !== null && (err as { code?: string }).code === "ENOENT";
+}
+
+export interface ConfigCandidate {
+  path: string;
+  content: string;
+  level: "user" | "project";
+  depth: number;
+}
+
+/**
+ * Walk the watchdog/advisor config search path — the user agent dir plus
+ * every directory from `cwd` up to the repo root (or home), probing both
+ * `<F>` and `.omp/<F>` for each given filename — and return the
+ * readable candidates with their raw content, sorted user-first then
+ * project ancestor→leaf (depth descending, so the leaf directory is
+ * most specific/last). Content is returned verbatim; callers expand what
+ * they need.
+ */
+export async function collectConfigCandidates(
+  cwd: string,
+  agentDir: string | undefined,
+  filenames: string[],
+): Promise<ConfigCandidate[]> {
+  const home = os.homedir();
+  const resolvedAgentDir = agentDir;
+  const userPaths = new Set<string>();
+  const repoRoot = await gitRoot(cwd);
+
+  const candidates = new Set<string>();
+
+  if (resolvedAgentDir) {
+    for (const filename of filenames) {
+      const userPath = path.resolve(resolvedAgentDir, filename);
+      candidates.add(userPath);
+      userPaths.add(userPath);
+    }
+  }
+
+  let current = cwd;
+  while (true) {
+    for (const filename of filenames) {
+      candidates.add(path.resolve(current, ".omp", filename));
+      candidates.add(path.resolve(current, filename));
+    }
+    if (current === (repoRoot ?? home)) break;
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+
+  const items: ConfigCandidate[] = [];
+  for (const candidate of candidates) {
+    try {
+      const content = await fs.readFile(candidate, "utf8");
+      const parent = path.dirname(candidate);
+      const baseName = parent.split(path.sep).pop() ?? "";
+      const isUser = userPaths.has(candidate);
+      const ownerDir = baseName === ".omp" ? path.dirname(parent) : parent;
+      const ownerBaseName = ownerDir.split(path.sep).pop() ?? "";
+      if (isUser || !ownerBaseName.startsWith(".") || baseName === ".omp") {
+        const relative = path.relative(cwd, ownerDir);
+        const depth = relative === "" ? 0 : relative.split(path.sep).filter(Boolean).length;
+        items.push({ path: candidate, content, level: isUser ? "user" : "project", depth });
+      }
+    } catch (err) {
+      if (!isEnoent(err)) {
+        console.error(`[pi-omp-advisor] failed to read config candidate ${candidate}: ${String(err)}`);
+      }
+    }
+  }
+
+  items.sort((a, b) => {
+    if (a.level !== b.level) return a.level === "user" ? -1 : 1;
+    return b.depth - a.depth;
+  });
+
+  return items;
+}
+
+/**
+ * Discover and load WATCHDOG.md files walking up from cwd, project
+ * `.omp` folder, and user agent dir. Returns formatted blocks ready to
+ * be appended to the advisor system prompt.
+ */
+export async function discoverWatchdogFiles(cwd: string, agentDir?: string): Promise<string[]> {
+  const items = await collectConfigCandidates(cwd, agentDir, ["WATCHDOG.md"]);
+  return items.map(item => `Especially pay attention to:\n<attention>\n${item.content.trim()}\n</attention>`);
+}
+
+/** Known pi built-in tool names an advisor may be granted (validated at config-parse time). */
+const KNOWN_TOOL_NAMES = new Set<string>([
+  "read",
+  "grep",
+  "find",
+  "glob",
+  "ls",
+  "edit",
+  "write",
+  "bash",
+  "advise",
+]);
+
+function normalizeToolNames(tools: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const raw of tools) {
+    const name = ADVISOR_TOOL_NAME_ALIASES.get(raw) ?? raw;
+    if (seen.has(name)) continue;
+    seen.add(name);
+    out.push(name);
+  }
+  return out;
+}
+
+function filterAdvisorTools(tools: string[] | undefined, sourcePath: string): string[] | undefined {
+  if (tools === undefined) return undefined;
+  if (tools.length === 0) return [];
+  const filtered = normalizeToolNames(tools).filter(name => {
+    if (KNOWN_TOOL_NAMES.has(name)) return true;
+    console.error(`[pi-omp-advisor] advisor config ${sourcePath}: dropping unknown tool "${name}"`);
+    return false;
+  });
+  return filtered.length > 0 ? filtered : undefined;
+}
+
+interface WatchdogYamlAdvisorEntry {
+  name?: unknown;
+  model?: unknown;
+  tools?: unknown;
+  instructions?: unknown;
+  enabled?: unknown;
+}
+interface WatchdogYamlDoc {
+  instructions?: unknown;
+  advisors?: unknown;
+  /** pi-omp-advisor-specific; see {@link DiscoveredAdvisors.subagentsEnabled}. */
+  subagents?: unknown;
+  syncBacklog?: unknown;
+  immuneTurns?: unknown;
+  /** pi-omp-advisor-specific; see {@link DiscoveredAdvisors.mainEnabled}. */
+  main?: unknown;
+}
+
+function validateAdvisorEntry(entry: WatchdogYamlAdvisorEntry, sourcePath: string): { name: string; model?: string; tools?: string[]; instructions?: string; enabled?: boolean } | undefined {
+  if (typeof entry.name !== "string" || !entry.name.trim()) {
+    console.error(`[pi-omp-advisor] advisor config ${sourcePath}: skipping advisor entry with missing/invalid "name"`);
+    return undefined;
+  }
+  const out: { name: string; model?: string; tools?: string[]; instructions?: string; enabled?: boolean } = {
+    name: entry.name,
+  };
+  if (typeof entry.model === "string" && entry.model.trim()) out.model = entry.model;
+  if (Array.isArray(entry.tools) && entry.tools.every(t => typeof t === "string")) out.tools = entry.tools as string[];
+  if (typeof entry.instructions === "string" && entry.instructions.trim()) out.instructions = entry.instructions;
+  if (typeof entry.enabled === "boolean") out.enabled = entry.enabled;
+  return out;
+}
+
+/**
+ * Discover advisor configs from `WATCHDOG.yml`/`WATCHDOG.yaml` files on the
+ * same search path as `WATCHDOG.md`. Advisors are keyed by slug; a
+ * more-specific file (project leaf > project ancestor > user) replaces an
+ * earlier entry with the same slug. Top-level `instructions` across all
+ * files concatenate into the shared baseline. A malformed file is logged
+ * and skipped — never thrown.
+ */
+export async function discoverAdvisorConfigs(cwd: string, agentDir?: string): Promise<DiscoveredAdvisors> {
+  const items = await collectConfigCandidates(cwd, agentDir, ["WATCHDOG.yml", "WATCHDOG.yaml"]);
+  const advisors = new Map<string, AdvisorConfig>();
+  const sharedParts: string[] = [];
+  let subagentsEnabled: boolean | undefined;
+  let mainEnabled: boolean | undefined;
+  let syncBacklog: number | "off" | undefined;
+  let immuneTurns: number | undefined;
+  let parsedAnyConfig = false;
+
+  const yaml = items.length > 0 ? await requireYaml() : null;
+  for (const item of items) {
+    if (!yaml) break;
+    let parsed: unknown;
+    try {
+      parsed = yaml.parse(item.content);
+    } catch (err) {
+      console.error(`[pi-omp-advisor] advisor config: failed to parse YAML at ${item.path}: ${String(err)}`);
+      continue;
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      console.error(`[pi-omp-advisor] advisor config: expected a YAML mapping at ${item.path}`);
+      continue;
+    }
+    const doc = parsed as WatchdogYamlDoc;
+
+    if (typeof doc.instructions === "string" && doc.instructions.trim()) {
+      sharedParts.push(doc.instructions.trim());
+    }
+    if (typeof doc.subagents === "boolean") subagentsEnabled = doc.subagents;
+    if (typeof doc.main === "boolean") mainEnabled = doc.main;
+    if (doc.syncBacklog === "off" || doc.syncBacklog === false) {
+      syncBacklog = "off";
+    } else if (typeof doc.syncBacklog === "number" && Number.isFinite(doc.syncBacklog) && doc.syncBacklog > 0) {
+      syncBacklog = Math.floor(doc.syncBacklog);
+    } else if (typeof doc.syncBacklog === "string") {
+      const parsed = Number.parseInt(doc.syncBacklog, 10);
+      if (Number.isFinite(parsed) && parsed > 0) syncBacklog = parsed;
+      else console.error(`[pi-omp-advisor] advisor config ${item.path}: ignoring invalid "syncBacklog" (expected off, 1, 3, or 5)`);
+    } else if (doc.syncBacklog !== undefined) {
+      console.error(`[pi-omp-advisor] advisor config ${item.path}: ignoring invalid "syncBacklog" (expected off, 1, 3, or 5)`);
+    }
+    parsedAnyConfig = true;
+    if (typeof doc.immuneTurns === "number" && Number.isFinite(doc.immuneTurns) && doc.immuneTurns >= 0) {
+      immuneTurns = Math.floor(doc.immuneTurns);
+    } else if (doc.immuneTurns !== undefined) {
+      console.error(`[pi-omp-advisor] advisor config ${item.path}: ignoring invalid "immuneTurns" (expected a non-negative number)`);
+    }
+
+    if (Array.isArray(doc.advisors)) {
+      for (const raw of doc.advisors) {
+        if (!raw || typeof raw !== "object") continue;
+        const entry = validateAdvisorEntry(raw as WatchdogYamlAdvisorEntry, item.path);
+        if (!entry) continue;
+        const slug = slugifyAdvisorName(entry.name);
+        advisors.set(slug, {
+          name: entry.name,
+          model: entry.model,
+          tools: filterAdvisorTools(entry.tools, item.path),
+          instructions: entry.instructions,
+          enabled: entry.enabled,
+        });
+      }
+    }
+  }
+
+  return {
+    advisors: [...advisors.values()],
+    sharedInstructions: sharedParts.length > 0 ? sharedParts.join("\n\n") : undefined,
+    subagentsEnabled,
+    mainEnabled,
+    syncBacklog,
+    immuneTurns,
+    configFound: parsedAnyConfig,
+  };
+}
+
+/**
+ * Thrown by {@link loadWatchdogConfigFile} when an existing config file cannot be
+ * read or parsed. Callers that persist the returned document MUST let this
+ * propagate rather than saving a blank document over the user's file.
+ */
+export class WatchdogConfigUnreadableError extends Error {
+  constructor(
+    readonly filePath: string,
+    readonly detail: string,
+  ) {
+    super(`cannot read ${filePath}: ${detail}. Fix or move the file, then retry — refusing to overwrite it.`);
+    this.name = "WatchdogConfigUnreadableError";
+  }
+}
+
+export type AdvisorConfigScope = "project" | "user";
+
+export interface WatchdogConfigDoc {
+  instructions?: string;
+  advisors: AdvisorConfig[];
+  /** pi-omp-advisor-specific; see {@link DiscoveredAdvisors.subagentsEnabled}. */
+  subagents?: boolean;
+  /** pi-omp-advisor-specific; see {@link DiscoveredAdvisors.mainEnabled}. */
+  main?: boolean;
+  /** See {@link DiscoveredAdvisors.syncBacklog}. */
+  syncBacklog?: number | "off";
+  /** See {@link DiscoveredAdvisors.immuneTurns}. */
+  immuneTurns?: number;
+}
+
+export function advisorConfigFilePath(scope: AdvisorConfigScope, dirs: { projectDir: string; agentDir: string }): string {
+  return path.join(scope === "user" ? dirs.agentDir : dirs.projectDir, "WATCHDOG.yml");
+}
+
+export async function resolveAdvisorConfigEditPath(
+  scope: AdvisorConfigScope,
+  dirs: { projectDir: string; agentDir: string },
+): Promise<string> {
+  const dir = scope === "user" ? dirs.agentDir : dirs.projectDir;
+  const yml = path.join(dir, "WATCHDOG.yml");
+  const yaml = path.join(dir, "WATCHDOG.yaml");
+  const ymlExists = await fs
+    .access(yml)
+    .then(() => true)
+    .catch(() => false);
+  const yamlExists = await fs
+    .access(yaml)
+    .then(() => true)
+    .catch(() => false);
+  if (!ymlExists && yamlExists) return yaml;
+  return yml;
+}
+
+export async function loadWatchdogConfigFile(filePath: string): Promise<WatchdogConfigDoc> {
+  let text: string;
+  try {
+    text = await fs.readFile(filePath, "utf8");
+  } catch (err) {
+    // A genuinely absent file is the "create new config" case. Any other read
+    // error (permissions, I/O) must not masquerade as an empty document that a
+    // caller then writes back over the real file.
+    if (isEnoent(err)) return { advisors: [] };
+    throw new WatchdogConfigUnreadableError(filePath, String(err));
+  }
+  const yaml = await requireYaml();
+  if (!yaml) throw new WatchdogConfigUnreadableError(filePath, "the 'yaml' package is not resolvable");
+  let parsed: unknown;
+  try {
+    parsed = yaml.parse(text);
+  } catch (err) {
+    // Must NOT return an empty document: callers save what this returns, so
+    // treating an unparseable file as "empty" turns a syntax error into silent
+    // destruction of the user's whole config. A missing file is different — that
+    // legitimately starts from empty (handled above).
+    throw new WatchdogConfigUnreadableError(filePath, String(err));
+  }
+  // A blank or comment-only file parses to null/undefined — that is legitimately
+  // an empty document to start editing from. Anything else that is not a mapping
+  // (a sequence, a bare scalar) is a file whose meaning we do not understand, and
+  // returning an empty document for it would let the caller save over real
+  // content. Refuse, exactly as for a syntax error.
+  if (parsed === null || parsed === undefined) return { advisors: [] };
+  if (typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new WatchdogConfigUnreadableError(
+      filePath,
+      `expected a YAML mapping at the document root, found ${Array.isArray(parsed) ? "a sequence" : typeof parsed}`,
+    );
+  }
+  const doc = parsed as WatchdogYamlDoc;
+  const advisors: AdvisorConfig[] = [];
+  if (Array.isArray(doc.advisors)) {
+    for (const raw of doc.advisors) {
+      if (!raw || typeof raw !== "object") continue;
+      const entry = validateAdvisorEntry(raw as WatchdogYamlAdvisorEntry, filePath);
+      if (entry) advisors.push(entry);
+    }
+  }
+  const result: WatchdogConfigDoc = { advisors };
+  if (typeof doc.instructions === "string" && doc.instructions.trim()) result.instructions = doc.instructions;
+  if (typeof doc.subagents === "boolean") result.subagents = doc.subagents;
+  if (typeof doc.main === "boolean") result.main = doc.main;
+  // EVERY field `serializeWatchdogConfig` writes must be read back here, or an
+  // edit round-trip silently deletes it: the editable doc is what gets saved, so
+  // a field this loader drops is a field `/advisor config` or `/advisor main
+  // on|off` erases from the user's file.
+  if (doc.syncBacklog === "off") {
+    result.syncBacklog = "off";
+  } else if (typeof doc.syncBacklog === "number" && Number.isFinite(doc.syncBacklog) && doc.syncBacklog > 0) {
+    result.syncBacklog = Math.floor(doc.syncBacklog);
+  } else if (typeof doc.syncBacklog === "string") {
+    const parsed = Number.parseInt(doc.syncBacklog, 10);
+    if (Number.isFinite(parsed) && parsed > 0) result.syncBacklog = parsed;
+  }
+  if (typeof doc.immuneTurns === "number" && Number.isFinite(doc.immuneTurns) && doc.immuneTurns >= 0) {
+    result.immuneTurns = Math.floor(doc.immuneTurns);
+  }
+  return result;
+}
+
+export async function serializeWatchdogConfig(doc: WatchdogConfigDoc): Promise<string> {
+  const yaml = await requireYaml();
+  if (!yaml) {
+    throw new Error(
+      "cannot write WATCHDOG.yml: the 'yaml' package is not resolvable from this install of pi-omp-advisor. " +
+        "Install pi-omp-advisor as a pi package (so its dependencies install with it) instead of symlinking its source directory.",
+    );
+  }
+  const plain: Record<string, unknown> = {};
+  if (doc.instructions?.trim()) plain.instructions = doc.instructions;
+  if (doc.subagents !== undefined) plain.subagents = doc.subagents;
+  if (doc.main !== undefined) plain.main = doc.main;
+  if (doc.syncBacklog !== undefined) plain.syncBacklog = doc.syncBacklog;
+  if (doc.immuneTurns !== undefined) plain.immuneTurns = doc.immuneTurns;
+
+  if (doc.advisors.length > 0) {
+    plain.advisors = doc.advisors.map(a => {
+      const entry: Record<string, unknown> = { name: a.name };
+      if (a.model?.trim()) entry.model = a.model;
+      if (a.tools !== undefined) entry.tools = a.tools;
+      if (a.instructions?.trim()) entry.instructions = a.instructions;
+      if (a.enabled !== undefined) entry.enabled = a.enabled;
+      return entry;
+    });
+  }
+  if (Object.keys(plain).length === 0) return "";
+  return yaml.stringify(plain);
+}
+
+export async function saveWatchdogConfigFile(filePath: string, doc: WatchdogConfigDoc): Promise<void> {
+  const content = await serializeWatchdogConfig(doc);
+  if (!content.trim()) {
+    try {
+      await fs.rm(filePath, { force: true });
+    } catch (err) {
+      if (!isEnoent(err)) throw err;
+    }
+    return;
+  }
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  await fs.writeFile(filePath, content, "utf8");
+}

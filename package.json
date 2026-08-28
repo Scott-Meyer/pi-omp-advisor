@@ -1,0 +1,52 @@
+{
+  "name": "pi-omp-advisor",
+  "version": "0.1.0",
+  "description": "A live advisor for pi that watches your session as it works and sends advice mid-run — a port of oh-my-pi's advisor/watchdog onto pi's own Agent SDK.",
+  "license": "MIT",
+  "author": "Scott Meyer",
+  "type": "module",
+  "keywords": [
+    "pi",
+    "pi-coding-agent",
+    "pi-package",
+    "pi-extension",
+    "advisor",
+    "watchdog",
+    "code-review",
+    "agent"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Scott-Meyer/pi-omp-advisor.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Scott-Meyer/pi-omp-advisor/issues"
+  },
+  "homepage": "https://github.com/Scott-Meyer/pi-omp-advisor#readme",
+  "files": ["src", "!src/**/*.test.ts", "PROVENANCE.md", "LICENSE", "README.md"],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "node --import jiti/register --test \"src/**/*.test.ts\"",
+    "verify:package": "node scripts/verify-package.mjs"
+  },
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "dependencies": {
+    "yaml": "^2.5.0"
+  },
+  "devDependencies": {
+    "jiti": "^2.4.2",
+    "typescript": "^5.7.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  }
+}
