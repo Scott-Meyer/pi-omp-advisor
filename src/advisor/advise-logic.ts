@@ -38,9 +38,10 @@ function escapeXmlText(value: string): string {
 /**
  * Behavioral framing for the watched agent — advice, not orders. Carried as
  * a tag attribute (rather than a prose header) so the rendered agent-facing
- * output stays a clean `<advisory>` block. The primary agent's system
- * prompt never mentions advisories, so this is its only cue for how to
- * treat them.
+ * output stays a clean `<advisory>` block. The primary agent's system prompt
+ * identifies the block's AI-advisor provenance and explains how late follow-up
+ * completions appear in the transcript; this attribute remains the cue for how
+ * much weight to give the note itself.
  */
 const ADVISOR_GUIDANCE = "weigh, don't blindly obey";
 

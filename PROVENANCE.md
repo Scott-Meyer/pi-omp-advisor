@@ -131,6 +131,19 @@ copyright Scott Meyer, MIT (see `LICENSE`):
    with no `advisors:` now starts that same implicit default advisor instead of
    silently doing nothing. Keyed on a successful parse rather than file existence,
    so a malformed config cannot activate an advisor by accident.
+10. **Primary-message provenance and presentation.** Upstream marks advisor custom
+   messages with `attribution: "agent"`; its message conversion then sends custom
+   messages to the model as `developer`. Pi's extension API has no attribution
+   field and pi converts every custom message to provider-level `user`, dropping
+   `customType`. This port keeps pi's supported custom-message channel (the same
+   channel used by asynchronous pi-intercom messages) and adds primary-system
+   context identifying `<advisory>` messages as AI-advisor output, not
+   user-authored text. A second narrowly describes late-completion placement: a
+   response triggered after a completed answer should stand alone because it may
+   scroll that unread answer out of view. Neither dictates whether to accept the
+   advisor's technical claim. The TUI presentation also now diverges from
+   upstream's collapsing rail: it is a full-width bordered card that never hides
+   notes.
 
 ## Corrections made after the initial port
 
@@ -159,11 +172,12 @@ never executed before this):
   defaults to 3 upstream; this port hardcoded 1. Both are now `WATCHDOG.yml`
   fields (`syncBacklog`, `immuneTurns`) with upstream's defaults, since pi has
   no settings-schema surface to register into.
-- **No transcript renderer.** Upstream renders advisor notes as a card
-  (`createAdvisorMessageCard`: bold header, note/blocker counts, a
-  severity-tinted rail per note, collapse past 3). This port registered nothing,
-  so pi fell back to generic custom-message rendering and printed the raw
-  `<advisory …>` XML inline. Ported as `src/advisor/advisor-message.ts` +
+- **No transcript renderer.** This port initially registered nothing, so pi fell
+  back to generic custom-message rendering and printed the raw `<advisory …>` XML
+  inline. It first ported upstream's compact severity-rail renderer, then moved to
+  a deliberately clearer pi-specific presentation: a full-width bordered card,
+  severity-colored frame and labels, and no collapsed/hidden notes. Implemented
+  in `src/advisor/advisor-message.ts` via
   `pi.registerMessageRenderer("advisor", …)`.
 - **An unresolvable explicit `model:` silently downgraded the advisor.** Upstream
   resolves an explicit `model` via `resolveModelOverride`, and on failure marks

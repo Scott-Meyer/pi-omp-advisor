@@ -1,36 +1,27 @@
 /**
  * Display-only transcript card for advisor notes injected into the primary
- * session — the pi equivalent of oh-my-pi's
- * `src/modes/components/advisor-message.ts` (`createAdvisorMessageCard`, npm
- * `@oh-my-pi/pi-coding-agent@17.4.1`), rebuilt against pi's own
- * `registerMessageRenderer` hook and `Theme` API.
+ * session. The model-facing message remains the structured `<advisory>` text;
+ * this renderer only controls how the message is presented to the person using
+ * pi.
  *
- * Styled as a distinct voice so notes never blend into thinking output (whose
- * `thinkingText` color equals `toolOutput` in most themes): a bold
- * `customMessageLabel` header tag, a heavy rail tinted per-note severity, and
- * the note body on the custom-message text color.
- *
- * Deviations from upstream, all forced by pi's narrower theme surface: pi's
- * `Theme` exposes `fg`/`bg`/`bold` but has no `status` icon set, no
- * `symbol()` registry (so the rail glyph is inlined rather than themeable),
- * and no `sep` separators. Upstream's `wrapVarying` two-width body wrap is
- * replaced by pi's own `Text` wrapping.
+ * Unlike the upstream compact rail renderer, this card is deliberately
+ * full-width and never collapses notes. Advisor output is an independent voice
+ * in the conversation, so it should be immediately recognizable without
+ * hiding any of what that voice said.
  */
-import { Text } from "@earendil-works/pi-tui";
+import type { Component } from "@earendil-works/pi-tui";
+import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import type { AdvisorNote, AdvisorSeverity } from "./advise-logic.ts";
-
-/** Upstream `advisor.rail` symbol default. */
-const RAIL = "▎";
-/** Upstream's collapsed-card note cap. */
-const COLLAPSED_NOTES = 3;
 
 export interface AdvisorMessageDetails {
   notes?: AdvisorNote[];
 }
 
-/** Upstream `severityColor`: blocker → error, concern → warning, nit → muted. */
-function severityColor(severity: AdvisorSeverity | undefined): "error" | "warning" | "muted" {
+type AdvisorColor = "error" | "warning" | "muted";
+
+/** blocker → error, concern → warning, nit/unspecified → muted. */
+function severityColor(severity: AdvisorSeverity | undefined): AdvisorColor {
   switch (severity) {
     case "blocker":
       return "error";
@@ -41,67 +32,111 @@ function severityColor(severity: AdvisorSeverity | undefined): "error" | "warnin
   }
 }
 
-function badge(severity: AdvisorSeverity | undefined, theme: Theme): string {
-  if (!severity) return "";
-  return `${theme.fg(severityColor(severity), theme.bold(severity.toUpperCase()))} `;
+function severityRank(severity: AdvisorSeverity | undefined): number {
+  switch (severity) {
+    case "blocker":
+      return 2;
+    case "concern":
+      return 1;
+    default:
+      return 0;
+  }
 }
 
-/**
- * Render one `<advisory>` batch as a card. Falls back to `undefined` when the
- * message carries no structured notes, which makes pi use its own default
- * custom-message rendering rather than showing an empty card.
- */
+function strongestSeverity(notes: readonly AdvisorNote[]): AdvisorSeverity | undefined {
+  let strongest: AdvisorSeverity | undefined;
+  for (const note of notes) {
+    if (severityRank(note.severity) > severityRank(strongest)) strongest = note.severity;
+  }
+  return strongest;
+}
+
+function textContent(rawContent: string | readonly { type: string; text?: string }[]): string {
+  if (typeof rawContent === "string") return rawContent;
+  return rawContent
+    .map(block => (block.type === "text" ? (block.text ?? "") : ""))
+    .filter(Boolean)
+    .join("\n");
+}
+
+class AdvisorMessageCard implements Component {
+  constructor(
+    private readonly notes: readonly AdvisorNote[],
+    private readonly fallbackContent: string,
+    private readonly theme: Theme,
+  ) {}
+
+  invalidate(): void {
+    // Styling and wrapping are computed from the current theme and width on
+    // every render, so there is no cached state to invalidate.
+  }
+
+  render(width: number): string[] {
+    if (width <= 0) return [];
+    if (width < 8) return [truncateToWidth("Advisor", width, "")];
+
+    const insideWidth = width - 2;
+    const contentWidth = Math.max(1, insideWidth - 2);
+    const strongest = strongestSeverity(this.notes);
+    const border = (text: string): string => this.theme.fg(severityColor(strongest), text);
+
+    const noteCount = this.notes.length;
+    const blockers = this.notes.filter(note => note.severity === "blocker").length;
+    const concerns = this.notes.filter(note => note.severity === "concern").length;
+    const summary = [
+      `${noteCount || 1} ${noteCount === 1 || noteCount === 0 ? "note" : "notes"}`,
+      blockers > 0 ? `${blockers} blocker${blockers === 1 ? "" : "s"}` : undefined,
+      concerns > 0 ? `${concerns} concern${concerns === 1 ? "" : "s"}` : undefined,
+    ].filter((part): part is string => part !== undefined);
+
+    const header = truncateToWidth(`─ Advisor · ${summary.join(" · ")} `, insideWidth, "");
+    const headerFill = "─".repeat(Math.max(0, insideWidth - visibleWidth(header)));
+    const lines: string[] = [border(`╭${header}${headerFill}╮`)];
+
+    const frameLine = (content: string): void => {
+      const clipped = truncateToWidth(content, contentWidth, "");
+      const padding = " ".repeat(Math.max(0, contentWidth - visibleWidth(clipped)));
+      const body = this.theme.bg("customMessageBg", ` ${clipped}${padding} `);
+      lines.push(`${border("│")}${body}${border("│")}`);
+    };
+
+    const wrapped = (content: string): string[] => {
+      if (content.length === 0) return [""];
+      const result = wrapTextWithAnsi(content, contentWidth);
+      return result.length > 0 ? result : [""];
+    };
+
+    if (this.notes.length === 0) {
+      for (const line of this.fallbackContent.split("\n")) {
+        for (const part of wrapped(this.theme.fg("customMessageText", line))) frameLine(part);
+      }
+    } else {
+      this.notes.forEach((note, index) => {
+        if (index > 0) frameLine("");
+        const label = note.severity?.toUpperCase() ?? "NOTE";
+        const source = note.advisor ? `  ${this.theme.fg("dim", note.advisor)}` : "";
+        frameLine(`${this.theme.fg(severityColor(note.severity), this.theme.bold(label))}${source}`);
+
+        for (const line of note.note.split("\n")) {
+          for (const part of wrapped(this.theme.fg("customMessageText", line))) frameLine(part);
+        }
+      });
+    }
+
+    lines.push(border(`╰${"─".repeat(insideWidth)}╯`));
+    return lines;
+  }
+}
+
+/** Render one advisory batch as a full-width, non-collapsing transcript card. */
 export function renderAdvisorMessage(
   details: AdvisorMessageDetails | undefined,
-  // Custom-message content is `string | (TextContent | ImageContent)[]`; an
-  // advisory is always built as a plain string, but the array form is flattened
-  // rather than assumed away so a restored/foreign message cannot crash render.
   rawContent: string | readonly { type: string; text?: string }[],
-  options: { expanded: boolean; outputPad?: number },
+  _options: { expanded: boolean; outputPad?: number },
   theme: Theme,
-): Text | undefined {
-  const content =
-    typeof rawContent === "string"
-      ? rawContent
-      : rawContent
-          .map(block => (block.type === "text" ? (block.text ?? "") : ""))
-          .filter(Boolean)
-          .join("\n");
+): Component | undefined {
+  const content = textContent(rawContent);
   const notes = details?.notes ?? [];
-  if (notes.length === 0) {
-    // No structured details (e.g. a message restored from an older session):
-    // show the raw content under the same header rather than nothing.
-    if (!content.trim()) return undefined;
-    const header = theme.bold(theme.fg("customMessageLabel", `${RAIL} Advisor`));
-    return new Text(`${header}\n${theme.fg("customMessageText", content)}`, options.outputPad ?? 0, 0);
-  }
-
-  const blockers = notes.filter(n => n.severity === "blocker").length;
-  const meta: string[] = [`${notes.length} ${notes.length === 1 ? "note" : "notes"}`];
-  if (blockers > 0) meta.push(theme.fg("error", `${blockers} blocker${blockers === 1 ? "" : "s"}`));
-
-  const header = theme.bold(theme.fg("customMessageLabel", `${RAIL} Advisor`));
-  const lines: string[] = [`${header} ${theme.fg("dim", meta.join(" · "))}`];
-
-  const shown = options.expanded ? notes : notes.slice(0, COLLAPSED_NOTES);
-  for (const note of shown) {
-    const rail = theme.fg(severityColor(note.severity), RAIL);
-    // Multi-advisor: attribute the note to its source. The implicit single
-    // advisor renders unlabeled, matching upstream.
-    const who = note.advisor ? `${theme.fg("dim", `[${note.advisor}]`)} ` : "";
-    const body = note.note.split("\n").filter(p => p.trim());
-    body.forEach((line, index) => {
-      const prefix = index === 0 ? `${badge(note.severity, theme)}${who}` : "";
-      lines.push(`  ${rail} ${prefix}${theme.fg("customMessageText", line)}`);
-    });
-  }
-
-  const hidden = notes.length - shown.length;
-  if (hidden > 0) {
-    lines.push(
-      `  ${theme.fg("dim", RAIL)} ${theme.fg("dim", `… +${hidden} more ${hidden === 1 ? "note" : "notes"}`)}`,
-    );
-  }
-
-  return new Text(lines.join("\n"), options.outputPad ?? 0, 0);
+  if (notes.length === 0 && !content.trim()) return undefined;
+  return new AdvisorMessageCard(notes, content, theme);
 }

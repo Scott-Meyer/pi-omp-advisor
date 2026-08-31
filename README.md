@@ -185,13 +185,25 @@ read-only and is what you want unless you have a specific reason otherwise.
 
 **The advisor reads untrusted content, and there is no output quarantine.** Error
 text, edit diffs, and anything it reads with its own tools may contain text crafted
-to manipulate a model. A manipulated advisor can
-put arbitrary text into your primary agent's context via `advise()`, where it is
-rendered as an `<advisory>` block. Notes carry `guidance="weigh, don't blindly
-obey"` and the primary is instructed to weigh rather than obey them, but this port
-implements **no** content filtering or provenance checking on advisor output.
-Combined with the point above, a prompt-injection payload reaching an advisor that
-holds `bash` is a genuine risk. Keep advisors read-only.
+to manipulate a model. A manipulated advisor can put arbitrary text into your
+primary agent's context via `advise()`.
+
+Pi stores each note as a distinct `customType: "advisor"` message and the TUI
+shows it in a full-width Advisor card. At the provider boundary, however, pi
+currently converts all extension custom messages to the model's `user` role and
+does not forward `customType`. The extension therefore adds primary-system
+context saying that messages wrapped in `<advisory>` come from a separate AI
+advisor watching the session and are not authored by the user. It also explains
+one transcript behavior: if a late
+advisory causes a second completion after a completed response, that newer
+response may scroll the preceding one out of view and should stand on its own
+without assuming the preceding response was read. Neither sentence tells the
+primary whether or how to act on the advisor's technical claim.
+
+Notes also carry `guidance="weigh, don't blindly obey"`. That wording can reduce
+blind compliance, but neither it nor the visible card is a security boundary or
+output quarantine. Combined with the point above, a prompt-injection payload
+reaching an advisor that holds `bash` is a genuine risk. Keep advisors read-only.
 
 **Cost and rate limits.** Each advisor is a live model session prompted roughly
 once per primary turn, so it consumes tokens continuously against whatever
