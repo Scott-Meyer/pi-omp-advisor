@@ -53,6 +53,9 @@
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { Text } from "@earendil-works/pi-tui";
+import { formatAdvisorBatchContent, type AdvisorNote } from "./advisor/advise-logic.ts";
+import { AdvisorInbox, type QueuedAdvisorNote } from "./advisor/advisor-inbox.ts";
 import { AdvisorOrchestrator, type OrchestratorHost } from "./advisor/orchestrator.ts";
 import { renderAdvisorMessage, type AdvisorMessageDetails } from "./advisor/advisor-message.ts";
 import {
@@ -71,6 +74,9 @@ function isSubagentProcess(): boolean {
 }
 
 const PI_ADVISOR_SUBAGENTS_ENV = "PI_ADVISOR_SUBAGENTS";
+const ADVISOR_INBOX_WIDGET_ID = "advisor-inbox";
+const ADVISOR_INBOX_SHORTCUT = "ctrl+shift+a";
+const ADVISOR_INBOX_STATE_TYPE = "pi-omp-advisor-inbox";
 
 /**
  * How long a headless (print/json) session waits at shutdown for advisors to
@@ -101,6 +107,9 @@ export default function (pi: ExtensionAPI) {
   );
 
   let orchestrator: AdvisorOrchestrator | undefined;
+  const inbox = new AdvisorInbox();
+  let sessionContext: ExtensionContext | undefined;
+  let advisorContextNeeded = false;
   // Explicit /advisor on|off for THIS process only. `undefined` means "no
   // explicit choice made yet" — defer to the config-derived default
   // computed in startOrchestrator. Once set, an explicit choice survives
@@ -118,8 +127,148 @@ export default function (pi: ExtensionAPI) {
     return runtimeEnabled && configHadRoster && !!orchestrator && orchestrator.advisorNames.length > 0;
   }
 
+  function persistInbox(): void {
+    pi.appendEntry(ADVISOR_INBOX_STATE_TYPE, {
+      version: 1,
+      items: inbox.items,
+    });
+  }
+
+  function restoreInbox(ctx: ExtensionContext): void {
+    const entry = [...ctx.sessionManager.getBranch()]
+      .reverse()
+      .find(candidate => candidate.type === "custom" && candidate.customType === ADVISOR_INBOX_STATE_TYPE);
+    const data = entry?.type === "custom" ? entry.data : undefined;
+    if (!data || typeof data !== "object" || !("items" in data) || !Array.isArray(data.items)) {
+      inbox.clear();
+      return;
+    }
+    const items = data.items.filter((item): item is QueuedAdvisorNote => {
+      if (!item || typeof item !== "object") return false;
+      const candidate = item as Partial<QueuedAdvisorNote>;
+      return Number.isInteger(candidate.id) && typeof candidate.note === "string";
+    });
+    inbox.restore(items);
+  }
+
+  function notePreview(item: QueuedAdvisorNote, limit = 100): string {
+    const text = item.note.trim().replace(/\s+/g, " ");
+    return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
+  }
+
+  function noteLabel(item: QueuedAdvisorNote): string {
+    const source = item.advisor ? `${item.advisor} · ` : "";
+    return `#${item.id} · ${source}${item.severity ?? "nit"} · ${notePreview(item)}`;
+  }
+
+  function updateInboxWidget(ctx = sessionContext): void {
+    if (!ctx?.hasUI) return;
+    const items = [...inbox.items];
+    if (items.length === 0) {
+      ctx.ui.setWidget(ADVISOR_INBOX_WIDGET_ID, undefined);
+      return;
+    }
+    ctx.ui.setWidget(ADVISOR_INBOX_WIDGET_ID, (_tui, theme) => {
+      const shown = items.slice(0, 3);
+      const lines = [
+        theme.fg("warning", theme.bold(`Advisor inbox · ${items.length} queued`)) +
+          theme.fg("dim", ` · ${ADVISOR_INBOX_SHORTCUT} to manage`),
+        ...shown.map(item => {
+          const marker = item.severity === "blocker" ? "■" : item.severity === "concern" ? "▲" : "•";
+          const styledMarker =
+            item.severity === "blocker"
+              ? theme.fg("error", marker)
+              : item.severity === "concern"
+                ? theme.fg("warning", marker)
+                : theme.fg("accent", marker);
+          const source = item.advisor ? theme.fg("muted", `${item.advisor} · `) : "";
+          return `  ${styledMarker} ${source}${theme.fg("dim", notePreview(item, 140))}`;
+        }),
+      ];
+      if (items.length > shown.length) lines.push(theme.fg("dim", `  … ${items.length - shown.length} more`));
+      return new Text(lines.join("\n"), 1, 0);
+    });
+  }
+
+  function deliverQueuedAdvice(queued: readonly QueuedAdvisorNote[], triggerTurn: boolean): void {
+    if (queued.length === 0) return;
+    const notes: AdvisorNote[] = queued.map(({ id: _id, ...note }) => note);
+    pi.sendMessage(
+      {
+        customType: "advisor",
+        content: formatAdvisorBatchContent(notes),
+        display: true,
+        details: { notes },
+      },
+      triggerTurn ? { deliverAs: "steer", triggerTurn: true } : { deliverAs: "steer", triggerTurn: false },
+    );
+    inbox.dismissMany(queued.map(item => item.id));
+    persistInbox();
+    updateInboxWidget();
+  }
+
+  function releaseInboxAheadOfPrompt(): void {
+    // The input event runs before pi records/renders the submitted user
+    // message. Appending without triggering therefore places these cards
+    // above that message while still making them context for its turn.
+    deliverQueuedAdvice([...inbox.items], false);
+  }
+
+  async function showAdvisorInbox(ctx: ExtensionContext): Promise<void> {
+    while (true) {
+      const items = [...inbox.items];
+      if (items.length === 0) {
+        ctx.ui.notify("Advisor inbox: no queued advisories.", "info");
+        return;
+      }
+      const labels = items.map(noteLabel);
+      const deliverAll = `Deliver all ${items.length} now`;
+      const dismissAll = `Dismiss all ${items.length} queued advisories`;
+      const close = "Close inbox";
+      const choice = await ctx.ui.select("Advisor inbox — select an advisory to manage", [
+        ...labels,
+        deliverAll,
+        dismissAll,
+        close,
+      ]);
+      if (choice === undefined || choice === close) return;
+      if (choice === deliverAll) {
+        deliverQueuedAdvice(items, true);
+        ctx.ui.notify(`Delivered ${items.length} queued advisories.`, "info");
+        return;
+      }
+      if (choice === dismissAll) {
+        if (await ctx.ui.confirm("Dismiss queued advisories?", `Discard all ${items.length} advisories before they reach the agent?`)) {
+          inbox.dismissMany(items.map(item => item.id));
+          persistInbox();
+          updateInboxWidget(ctx);
+          ctx.ui.notify(`Dismissed ${items.length} queued advisories.`, "info");
+          return;
+        }
+        continue;
+      }
+      const item = items[labels.indexOf(choice)];
+      if (!item) continue;
+      const source = item.advisor ? ` · ${item.advisor}` : "";
+      const action = await ctx.ui.select(
+        `Advisor #${item.id}${source} · ${item.severity ?? "nit"}\n${item.note}`,
+        ["Deliver now", "Dismiss", "Back"],
+      );
+      if (action === "Deliver now") {
+        deliverQueuedAdvice([item], true);
+        ctx.ui.notify(`Delivered advisor note #${item.id}.`, "info");
+        continue;
+      }
+      if (action === "Dismiss" && (await ctx.ui.confirm("Dismiss queued advisory?", item.note))) {
+        inbox.dismiss(item.id);
+        persistInbox();
+        updateInboxWidget(ctx);
+      }
+    }
+  }
+
   pi.on("before_agent_start", event => {
-    if (!isActive() || event.systemPrompt.includes(ADVISOR_PRIMARY_CONTEXT)) return;
+    if ((!isActive() && !advisorContextNeeded) || event.systemPrompt.includes(ADVISOR_PRIMARY_CONTEXT)) return;
     return { systemPrompt: `${event.systemPrompt}\n\n${ADVISOR_PRIMARY_CONTEXT}` };
   });
 
@@ -140,10 +289,17 @@ export default function (pi: ExtensionAPI) {
   function makeHost(ctx: ExtensionContext): OrchestratorHost {
     return {
       sendCustom(content, details, opts) {
+        advisorContextNeeded = true;
         pi.sendMessage(
           { customType: "advisor", content, display: true, details },
           opts.triggerTurn ? { deliverAs: opts.deliverAs, triggerTurn: true } : { deliverAs: opts.deliverAs },
         );
+      },
+      preserveAdvice(note) {
+        advisorContextNeeded = true;
+        inbox.enqueue(note);
+        persistInbox();
+        updateInboxWidget(ctx);
       },
       isStreaming: () => !ctx.isIdle(),
       // Best-effort: pi's extension API does not expose a distinct
@@ -187,6 +343,12 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     lastMode = ctx.mode;
+    sessionContext = ctx;
+    restoreInbox(ctx);
+    advisorContextNeeded =
+      inbox.items.length > 0 ||
+      ctx.sessionManager.getBranch().some(entry => entry.type === "custom_message" && entry.customType === "advisor");
+    updateInboxWidget(ctx);
     try {
       await startOrchestrator(ctx);
     } catch (err) {
@@ -211,6 +373,10 @@ export default function (pi: ExtensionAPI) {
     }
     await orchestrator?.disposeAll();
     orchestrator = undefined;
+    inbox.clear();
+    sessionContext?.ui.setWidget(ADVISOR_INBOX_WIDGET_ID, undefined);
+    sessionContext = undefined;
+    advisorContextNeeded = false;
   });
 
   // Compaction/branch/tree rewrite the primary transcript's shape without
@@ -221,7 +387,12 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_compact", async () => {
     await orchestrator?.resetRuntimesOnly();
   });
-  pi.on("session_tree", async () => {
+  pi.on("session_tree", async (_event, ctx) => {
+    restoreInbox(ctx);
+    advisorContextNeeded =
+      inbox.items.length > 0 ||
+      ctx.sessionManager.getBranch().some(entry => entry.type === "custom_message" && entry.customType === "advisor");
+    updateInboxWidget(ctx);
     await orchestrator?.resetRuntimesOnly();
   });
 
@@ -257,6 +428,12 @@ export default function (pi: ExtensionAPI) {
   // approximation (pi has no dedicated user-interrupt event) — see
   // PROVENANCE.md.
   pi.on("input", async (event, ctx) => {
+    // Keep preserved advisories in our cancellable inbox until a normal user
+    // prompt begins. Releasing here (before pi records the submitted user
+    // message) preserves the existing advisor-card-above-prompt ordering.
+    if ((event.source === "interactive" || event.source === "rpc") && event.streamingBehavior === undefined) {
+      releaseInboxAheadOfPrompt();
+    }
     if (!orchestrator) return;
     orchestrator.setPreserveOnly(isHeadlessMode(ctx.mode));
     if (event.source !== "interactive") return;
@@ -468,6 +645,10 @@ export default function (pi: ExtensionAPI) {
       await runConfigMenu(ctx);
       return;
     }
+    if (first === "inbox" || first === "queue") {
+      await showAdvisorInbox(ctx);
+      return;
+    }
 
     // /advisor subagents on|off | /advisor on|off subagents — changes the
     // DEFAULT for subagent children spawned from here on, NOT this
@@ -540,8 +721,13 @@ export default function (pi: ExtensionAPI) {
   // `/advisor` matches upstream's own command name, so muscle memory transfers.
   // Registered exactly once — pi resolves commands by name, so a second
   // registration of the same name would be a self-conflict.
+  pi.registerShortcut(ADVISOR_INBOX_SHORTCUT, {
+    description: "Open the queued advisor inbox",
+    handler: showAdvisorInbox,
+  });
+
   pi.registerCommand("advisor", {
-    description: "Control pi-omp-advisor: on | off | status | config | main on|off | subagents on|off",
+    description: "Control pi-omp-advisor: on | off | status | inbox | config | main on|off | subagents on|off",
     handler: handleCommand,
   });
 }

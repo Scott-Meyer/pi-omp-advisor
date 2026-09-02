@@ -151,7 +151,8 @@ interface ActiveAdvisor {
 }
 
 export interface OrchestratorHost {
-  sendCustom(content: string, details: unknown, opts: { deliverAs: "steer" | "nextTurn"; triggerTurn?: boolean }): void;
+  sendCustom(content: string, details: unknown, opts: { deliverAs: "steer"; triggerTurn?: boolean }): void;
+  preserveAdvice(note: AdvisorNote): void;
   isStreaming(): boolean;
   isAborting(): boolean;
   hasQueuedWork(): boolean;
@@ -719,8 +720,7 @@ export class AdvisorOrchestrator {
       return;
     }
     if (channel === "preserve") {
-      const content = formatAdvisorBatchContent([noteRecord]);
-      this.#host.sendCustom(content, { notes: [noteRecord] }, { deliverAs: "nextTurn" });
+      this.#host.preserveAdvice(noteRecord);
       return;
     }
     // "steer"

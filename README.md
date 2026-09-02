@@ -34,7 +34,7 @@ what the primary is doing:
 |---|---|
 | `nit` | `aside` — batched, delivered at the next step boundary, no interruption |
 | `concern` / `blocker` | `steer` — interrupts the live turn, or triggers one when idle |
-| Primary already gave its final answer, nothing queued | `preserve` — visible card, does not wake the primary (`blocker` still steers) |
+| Primary already gave its final answer, nothing queued | `preserve` — visible, cancellable inbox entry; released above the next normal user prompt (`blocker` still steers) |
 | Within `immuneTurns` (default 3) of a previous interrupt | concerns downgraded to `aside` (`blocker` exempt) |
 | Print mode, or right after a user interrupt | `preserve` |
 
@@ -42,6 +42,14 @@ Two gates keep the primary's transcript clean even when an advisor model
 misbehaves: a noise filter (`stop`, `done`, `lgtm`, `no issues`, …) and a
 budget of one accepted note per update, both applied at the tool-call
 boundary before a note can enter the delivery state machine.
+
+Preserved notes remain in an extension-owned **Advisor inbox** instead of pi's
+invisible `nextTurn` queue. A widget above the editor shows up to three queued
+notes immediately. Open the inbox with `Ctrl+Shift+A` or `/advisor inbox` to
+deliver or dismiss one note, or deliver/dismiss the whole queue. Notes you keep
+are rendered as advisor cards above the next accepted normal user message and
+included in that turn's model context. The queue is persisted as session
+metadata, so it survives extension reloads.
 
 ## Install
 
@@ -60,7 +68,7 @@ the same settings entry works on every machine.
 
 ```bash
 pi install npm:pi-omp-advisor
-pi install git:github.com/Scott-Meyer/pi-omp-advisor@v0.1.0
+pi install git:github.com/Scott-Meyer/pi-omp-advisor@v0.2.0
 ```
 
 Requires pi **0.84.2 or newer** (it uses `createAgentSession`,
@@ -139,6 +147,8 @@ primary by its own round-trip time.
 > an ordinary main session and follows `main:` — setting `PI_ADVISOR_SUBAGENTS`
 > alone does nothing.
 - `/advisor status` — which advisors are running, and their state
+- `/advisor inbox` — inspect, deliver, or dismiss preserved advisories waiting
+  for the next normal user prompt (`Ctrl+Shift+A` opens the same inbox)
 - `/advisor config` — interactive editor for `WATCHDOG.yml`
 
 ## Security and privacy

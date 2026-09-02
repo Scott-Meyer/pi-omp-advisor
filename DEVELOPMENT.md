@@ -149,11 +149,26 @@ the guard admitted the note and shows which channel it took.
 
 **Do not use `"customType":"advisor"` in the session jsonl as the headless
 success signal.** Headless runs set `preserveOnly`, so a `concern` routes to
-`preserve`, which sends with `deliverAs: "nextTurn"` — and a print run has no
-next turn, so the message never materializes into the session file. Zero
-advisor messages there is *expected* in print mode and does not mean delivery
-failed. (Chasing that signal is what made a totally inert advisor look like
-five different bugs.)
+`preserve`, which stays in the extension-owned Advisor inbox — and a print run
+has neither a visible inbox nor a next interactive prompt that releases it.
+Zero advisor messages there is *expected* in print mode and does not mean
+delivery failed. (Chasing that signal is what made a totally inert advisor look
+like five different bugs.)
+
+For an inbox/UI change, also test interactively: force a late `concern`, verify
+the widget appears above the editor, open it with `Ctrl+Shift+A`, dismiss one
+note, then submit a normal prompt and verify every remaining advisor card renders
+above that user message. Pi's public TUI components expose keyboard input but no
+pointer hit-testing, so a literal clickable `×` requires a pi-core API change.
+
+The card-above-prompt guarantee is exact for an accepted idle prompt: pi runs
+`input` before constructing the user message, and `sendMessage` appends the card
+synchronously. Pi currently has no hook between successful prompt preflight and
+user-message construction. Consequently, if a *later* input handler consumes
+the prompt or model/auth preflight fails, a released card can appear without a
+following user message. Making release transactional in that rare failure path
+also requires a pi-core API change; moving release to `before_agent_start` would
+put the card below the user message and is not an acceptable workaround.
 
 To exercise the `steer` path instead, the primary must still be streaming when
 the note arrives — give it a long multi-step task (read several files one at a

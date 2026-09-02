@@ -61,7 +61,10 @@ copyright Scott Meyer, MIT (see `LICENSE`):
 - activation on config presence (`DiscoveredAdvisors.configFound`) — deviation 9
 - the pi extension host bridge in `src/index.ts` (`pi.sendMessage`,
   `pi.registerMessageRenderer`, lifecycle wiring, headless drain)
-- `src/advisor/config-roundtrip.test.ts` (not shipped in the npm tarball)
+- the visible, cancellable preserved-advice queue in
+  `src/advisor/advisor-inbox.ts`
+- `src/advisor/config-roundtrip.test.ts`, `advisor-inbox.test.ts`, and
+  `advisor-message.test.ts` (not shipped in the npm tarball)
 
 ## Known deviations from upstream (documented, not silent)
 
@@ -80,9 +83,16 @@ copyright Scott Meyer, MIT (see `LICENSE`):
    omp `"steer"` channel → `pi.sendMessage(msg, { deliverAs: "steer", triggerTurn: true })`;
    omp `"aside"` channel → `pi.sendMessage(msg, { deliverAs: "steer" })` (no
    `triggerTurn`, so it queues at the next step boundary without forcing a
-   turn when the primary is idle); omp `"preserve"` → `pi.sendMessage(msg,
-   { deliverAs: "nextTurn" })` (recorded in context, delivered whenever the
-   conversation next continues, no forced turn now).
+   turn when the primary is idle). The `"preserve"` channel originally mapped
+   directly to `pi.sendMessage(msg, { deliverAs: "nextTurn" })`, but pi keeps
+   that queue private: extensions cannot enumerate or cancel it, and the TUI
+   does not display it. Preserved advice therefore stays in pi-omp-advisor's
+   own session-scoped inbox until the next normal user `input` event. The
+   extension shows the inbox above the editor and lets the user deliver or dismiss notes;
+   its latest state is stored in a non-context session entry so reloads do not
+   discard it. Uncancelled notes are appended immediately during `input`, before
+   pi records the submitted user message, preserving card-above-prompt ordering
+   without forcing a turn.
 3. **Multi-message delta chunking** (omp's `delta-split.ts`, built for
    provider prompt-cache locality) IS ported (`src/advisor/delta-render.ts`,
    `renderAdvisorDeltaMessages`): each batch is split into one user message
