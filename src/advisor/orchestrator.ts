@@ -38,6 +38,7 @@ import {
 import { makeAdviseTool } from "./advise-tool.ts";
 import { AdvisorEmissionGuard } from "./emission-guard.ts";
 import { renderAdvisorDeltaMessages } from "./delta-render.ts";
+import { SerializedTransition } from "./serialized-transition.ts";
 import type { AdvisorConfig } from "./watchdog-config.ts";
 import { discoverWatchdogFiles } from "./watchdog-config.ts";
 import { buildAdvisorSystemPrompt } from "./system-prompt.ts";
@@ -166,6 +167,8 @@ export class AdvisorOrchestrator {
   #interruptImmuneTurnStart: number | undefined;
   #autoResumeSuppressed = false;
   #preserveOnly = false;
+  #paused = false;
+  #pauseTransitions = new SerializedTransition();
   /** Build inputs captured at `start()` so `resetRuntimesOnly()` can rebuild
    *  each advisor's underlying session in place without needing the caller
    *  to re-supply them. */
@@ -212,6 +215,7 @@ export class AdvisorOrchestrator {
    * otherwise park for the whole 30s budget.
    */
   async waitForCatchup(): Promise<void> {
+    if (this.#paused) return;
     const threshold = this.#syncBacklog;
     if (threshold === "off") return;
     const deadline = Date.now() + CATCHUP_TIMEOUT_MS;
@@ -447,6 +451,37 @@ export class AdvisorOrchestrator {
     return drained;
   }
 
+  /**
+   * Stop observing and generating without destroying the advisor sessions or
+   * the extension-owned inbox. Work not yet sent to an advisor is discarded;
+   * already-generated asides are preserved in the visible inbox instead of
+   * being delivered while paused.
+   */
+  setPaused(paused: boolean): Promise<void> {
+    // A resume requested while pause is still aborting an advisor must wait for
+    // that abort to settle. Otherwise #paused could flip false early and a
+    // final advise call emitted by the cancelled turn could escape the inbox.
+    return this.#pauseTransitions.run(async () => {
+      if (this.#paused === paused) return;
+      this.#paused = paused;
+      if (!paused) return;
+
+      const asides = this.#asideQueue;
+      this.#asideQueue = [];
+      for (const note of asides) this.#host.preserveAdvice(note);
+
+      const aborts: Promise<void>[] = [];
+      for (const advisor of this.#advisors) {
+        if (advisor.disposed) continue;
+        advisor.pendingMessages = [];
+        advisor.awaitingBatch = undefined;
+        advisor.queue = [];
+        if (advisor.session.isStreaming) aborts.push(advisor.session.abort());
+      }
+      await Promise.allSettled(aborts);
+    });
+  }
+
   async disposeAll(): Promise<void> {
     for (const advisor of this.#advisors) {
       advisor.disposed = true;
@@ -541,6 +576,7 @@ export class AdvisorOrchestrator {
 
   /** Feed one finalized primary message into every advisor's pending buffer. */
   onMessage(message: AgentMessage): void {
+    if (this.#paused) return;
     for (const advisor of this.#advisors) {
       if (advisor.disposed) continue;
       advisor.pendingMessages.push(message);
@@ -549,6 +585,7 @@ export class AdvisorOrchestrator {
 
   /** Called on `turn_start`: release any batch that was held pending WIP confirmation, marked WIP (a new turn is starting, so the prior batch wasn't final). */
   onTurnStart(): void {
+    if (this.#paused) return;
     for (const advisor of this.#advisors) {
       if (advisor.disposed || !advisor.awaitingBatch) continue;
       const batch = advisor.awaitingBatch;
@@ -559,6 +596,7 @@ export class AdvisorOrchestrator {
 
   /** Called on `turn_end`: close the current pending buffer into an awaiting batch. */
   onTurnEnd(): void {
+    if (this.#paused) return;
     this.#primaryTurnsCompleted++;
     for (const advisor of this.#advisors) {
       if (advisor.disposed || advisor.pendingMessages.length === 0) continue;
@@ -573,6 +611,7 @@ export class AdvisorOrchestrator {
 
   /** Called on `agent_settled`: the run is genuinely done; flush every remaining batch as final. */
   onAgentSettled(): void {
+    if (this.#paused) return;
     for (const advisor of this.#advisors) {
       if (advisor.disposed) continue;
       const batch = advisor.awaitingBatch ?? (advisor.pendingMessages.length > 0 ? advisor.pendingMessages : undefined);
@@ -597,7 +636,7 @@ export class AdvisorOrchestrator {
     if (advisor.draining || advisor.disposed) return;
     advisor.draining = true;
     try {
-      while (advisor.queue.length > 0 && !advisor.disposed) {
+      while (advisor.queue.length > 0 && !advisor.disposed && !this.#paused) {
         const { batch, wip } = advisor.queue.shift()!;
         // Deliberately not logged: an advisor running behind the primary is the
         // normal steady state, not an error, and upstream reports it through a
@@ -653,6 +692,10 @@ export class AdvisorOrchestrator {
       await attempt(advisor.includeThinking);
       advisor.status = "running";
     } catch (err) {
+      if (this.#paused || advisor.disposed) {
+        advisor.status = "running";
+        return;
+      }
       if (advisor.includeThinking) {
         advisor.includeThinking = false;
         try {
@@ -715,6 +758,10 @@ export class AdvisorOrchestrator {
 
     const noteRecord: AdvisorNote = { note, severity, advisor: sourceName };
 
+    if (this.#paused) {
+      this.#host.preserveAdvice(noteRecord);
+      return;
+    }
     if (channel === "aside") {
       this.#enqueueAside(noteRecord);
       return;
@@ -735,7 +782,7 @@ export class AdvisorOrchestrator {
     this.#asideFlushScheduled = true;
     queueMicrotask(() => {
       this.#asideFlushScheduled = false;
-      if (this.#asideQueue.length === 0) return;
+      if (this.#paused || this.#asideQueue.length === 0) return;
       const notes = this.#asideQueue;
       this.#asideQueue = [];
       const content = formatAdvisorBatchContent(notes);

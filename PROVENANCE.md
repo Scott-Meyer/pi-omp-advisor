@@ -61,10 +61,12 @@ copyright Scott Meyer, MIT (see `LICENSE`):
 - activation on config presence (`DiscoveredAdvisors.configFound`) — deviation 9
 - the pi extension host bridge in `src/index.ts` (`pi.sendMessage`,
   `pi.registerMessageRenderer`, lifecycle wiring, headless drain)
-- the visible, cancellable preserved-advice queue in
-  `src/advisor/advisor-inbox.ts`
-- `src/advisor/config-roundtrip.test.ts`, `advisor-inbox.test.ts`, and
-  `advisor-message.test.ts` (not shipped in the npm tarball)
+- the visible, cancellable preserved-advice queue and session-scoped
+  pause/clear controls in `src/advisor/advisor-inbox.ts`,
+  `src/advisor/serialized-transition.ts`, and `src/index.ts`
+- `src/advisor-command.test.ts`, `src/advisor/config-roundtrip.test.ts`,
+  `src/advisor/advisor-inbox.test.ts`, `src/advisor/advisor-message.test.ts`,
+  and `src/advisor/serialized-transition.test.ts` (not shipped in the npm tarball)
 
 ## Known deviations from upstream (documented, not silent)
 
@@ -89,8 +91,9 @@ copyright Scott Meyer, MIT (see `LICENSE`):
    does not display it. Preserved advice therefore stays in pi-omp-advisor's
    own session-scoped inbox until the next normal user `input` event. The
    extension shows the inbox above the editor and lets the user deliver or dismiss notes;
-   its latest state is stored in a non-context session entry so reloads do not
-   discard it. Uncancelled notes are appended immediately during `input`, before
+   its latest state, including session-scoped pause state, is stored in a
+   non-context session entry so reloads do not discard it. Uncancelled notes are
+   appended immediately during `input`, before
    pi records the submitted user message, preserving card-above-prompt ordering
    without forcing a turn.
 3. **Multi-message delta chunking** (omp's `delta-split.ts`, built for

@@ -158,8 +158,15 @@ like five different bugs.)
 For an inbox/UI change, also test interactively: force a late `concern`, verify
 the widget appears above the editor, open it with `Ctrl+Shift+A`, dismiss one
 note, then submit a normal prompt and verify every remaining advisor card renders
-above that user message. Pi's public TUI components expose keyboard input but no
-pointer hit-testing, so a literal clickable `×` requires a pi-core API change.
+above that user message. Pause with `Ctrl+Shift+R`, submit a prompt, and verify
+queued notes remain while no new advisor work starts; resume with the same key.
+Finally, verify `Ctrl+Shift+X` clears the queue without a confirmation dialog.
+Type `/advisor`, press Tab to accept it and insert its argument space, then
+type `pau` and press Tab to verify it completes to `/advisor pause`; submit bare
+`/advisor` and verify the control menu opens with help and config reachable from
+it. Pi's public TUI
+components expose keyboard input but no pointer hit-testing, so
+a literal clickable `×` requires a pi-core API change.
 
 The card-above-prompt guarantee is exact for an accepted idle prompt: pi runs
 `input` before constructing the user message, and `sendMessage` appends the card

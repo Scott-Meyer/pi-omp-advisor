@@ -46,10 +46,12 @@ boundary before a note can enter the delivery state machine.
 Preserved notes remain in an extension-owned **Advisor inbox** instead of pi's
 invisible `nextTurn` queue. A widget above the editor shows up to three queued
 notes immediately. Open the inbox with `Ctrl+Shift+A` or `/advisor inbox` to
-deliver or dismiss one note, or deliver/dismiss the whole queue. Notes you keep
-are rendered as advisor cards above the next accepted normal user message and
-included in that turn's model context. The queue is persisted as session
-metadata, so it survives extension reloads.
+deliver or dismiss one note, or deliver/dismiss the whole queue. `Ctrl+Shift+R`
+pauses or resumes observation without releasing the queue; `Ctrl+Shift+X`
+clears the queue immediately. Notes you keep are rendered as advisor cards above
+the next accepted normal user message and included in that turn's model context.
+Queue and pause state are persisted as session metadata, so they survive
+extension reloads.
 
 ## Install
 
@@ -146,10 +148,17 @@ primary by its own round-trip time.
 > `subagents:` for that child. Without `PI_SUBAGENT_CHILD=1` a child is treated as
 > an ordinary main session and follows `main:` — setting `PI_ADVISOR_SUBAGENTS`
 > alone does nothing.
+- `/advisor` — open the interactive control menu; subcommands also provide
+  descriptions and Tab completion
 - `/advisor status` — which advisors are running, and their state
 - `/advisor inbox` — inspect, deliver, or dismiss preserved advisories waiting
   for the next normal user prompt (`Ctrl+Shift+A` opens the same inbox)
+- `/advisor pause` / `/advisor resume` — suspend or resume observation while
+  retaining the queue (`Ctrl+Shift+R` toggles)
+- `/advisor clear` — immediately discard every queued advisory
+  (`Ctrl+Shift+X`; no confirmation)
 - `/advisor config` — interactive editor for `WATCHDOG.yml`
+- `/advisor help` — command, shortcut, queue, and pause behavior reference
 
 ## Security and privacy
 

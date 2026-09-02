@@ -53,11 +53,12 @@
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { Text } from "@earendil-works/pi-tui";
+import { Text, type AutocompleteItem } from "@earendil-works/pi-tui";
 import { formatAdvisorBatchContent, type AdvisorNote } from "./advisor/advise-logic.ts";
 import { AdvisorInbox, type QueuedAdvisorNote } from "./advisor/advisor-inbox.ts";
 import { AdvisorOrchestrator, type OrchestratorHost } from "./advisor/orchestrator.ts";
 import { renderAdvisorMessage, type AdvisorMessageDetails } from "./advisor/advisor-message.ts";
+import { RequestedBooleanState, SerializedTransition } from "./advisor/serialized-transition.ts";
 import {
   discoverAdvisorConfigs,
   loadWatchdogConfigFile,
@@ -76,7 +77,33 @@ function isSubagentProcess(): boolean {
 const PI_ADVISOR_SUBAGENTS_ENV = "PI_ADVISOR_SUBAGENTS";
 const ADVISOR_INBOX_WIDGET_ID = "advisor-inbox";
 const ADVISOR_INBOX_SHORTCUT = "ctrl+shift+a";
+const ADVISOR_PAUSE_SHORTCUT = "ctrl+shift+r";
+const ADVISOR_CLEAR_SHORTCUT = "ctrl+shift+x";
 const ADVISOR_INBOX_STATE_TYPE = "pi-omp-advisor-inbox";
+
+const ADVISOR_COMMAND_COMPLETIONS: readonly AutocompleteItem[] = [
+  { value: "menu", label: "menu", description: "Open the interactive advisor control menu" },
+  { value: "status", label: "status", description: "Show runtime, model, backlog, and queue state" },
+  { value: "inbox", label: "inbox", description: "Inspect, deliver, or dismiss queued advisories" },
+  { value: "queue", label: "queue", description: "Alias for the advisor inbox" },
+  { value: "pause", label: "pause", description: "Pause observation and retain the queue" },
+  { value: "resume", label: "resume", description: "Resume observation without releasing the queue" },
+  { value: "clear", label: "clear", description: "Immediately discard every queued advisory" },
+  { value: "on", label: "on", description: "Enable the advisor for this session" },
+  { value: "off", label: "off", description: "Disable the advisor for this session" },
+  { value: "config", label: "config", description: "Edit project or user WATCHDOG.yml settings" },
+  { value: "main on", label: "main on", description: "Persistently enable normal-session observation" },
+  { value: "main off", label: "main off", description: "Persistently disable normal-session observation" },
+  { value: "subagents on", label: "subagents on", description: "Enable advisor defaults for new subagent processes" },
+  { value: "subagents off", label: "subagents off", description: "Disable advisor defaults for new subagent processes" },
+  { value: "help", label: "help", description: "Show commands, shortcuts, and delivery behavior" },
+];
+
+export function getAdvisorArgumentCompletions(argumentPrefix: string): AutocompleteItem[] | null {
+  const prefix = argumentPrefix.trimStart().toLowerCase();
+  const matches = ADVISOR_COMMAND_COMPLETIONS.filter(item => item.value.startsWith(prefix));
+  return matches.length > 0 ? [...matches] : null;
+}
 
 /**
  * How long a headless (print/json) session waits at shutdown for advisors to
@@ -110,6 +137,9 @@ export default function (pi: ExtensionAPI) {
   const inbox = new AdvisorInbox();
   let sessionContext: ExtensionContext | undefined;
   let advisorContextNeeded = false;
+  let advisorPaused = false;
+  const advisorPauseRequests = new RequestedBooleanState(false);
+  const advisorPauseTransitions = new SerializedTransition();
   // Explicit /advisor on|off for THIS process only. `undefined` means "no
   // explicit choice made yet" — defer to the config-derived default
   // computed in startOrchestrator. Once set, an explicit choice survives
@@ -124,13 +154,14 @@ export default function (pi: ExtensionAPI) {
   let lastDiscoveredSubagentsEnabled: boolean | undefined; // last-discovered `subagents:` field, for the status line
 
   function isActive(): boolean {
-    return runtimeEnabled && configHadRoster && !!orchestrator && orchestrator.advisorNames.length > 0;
+    return !advisorPaused && runtimeEnabled && configHadRoster && !!orchestrator && orchestrator.advisorNames.length > 0;
   }
 
   function persistInbox(): void {
     pi.appendEntry(ADVISOR_INBOX_STATE_TYPE, {
       version: 1,
       items: inbox.items,
+      paused: advisorPaused,
     });
   }
 
@@ -141,14 +172,31 @@ export default function (pi: ExtensionAPI) {
     const data = entry?.type === "custom" ? entry.data : undefined;
     if (!data || typeof data !== "object" || !("items" in data) || !Array.isArray(data.items)) {
       inbox.clear();
+      advisorPaused = false;
+      advisorPauseRequests.restore(false);
       return;
     }
+    advisorPaused = "paused" in data && data.paused === true;
+    advisorPauseRequests.restore(advisorPaused);
     const items = data.items.filter((item): item is QueuedAdvisorNote => {
       if (!item || typeof item !== "object") return false;
       const candidate = item as Partial<QueuedAdvisorNote>;
       return Number.isInteger(candidate.id) && typeof candidate.note === "string";
     });
     inbox.restore(items);
+  }
+
+  function updateAdvisorStatus(ctx = sessionContext): void {
+    if (!ctx?.hasUI) return;
+    if (advisorPaused) {
+      ctx.ui.setStatus("advisor", `pi-omp-advisor: paused${inbox.items.length > 0 ? ` · ${inbox.items.length} queued` : ""}`);
+      return;
+    }
+    if (!runtimeEnabled) {
+      ctx.ui.setStatus("advisor", "pi-omp-advisor: off");
+      return;
+    }
+    ctx.ui.setStatus("advisor", `pi-omp-advisor: ${orchestrator?.advisorNames.join(", ") || "no advisors configured"}`);
   }
 
   function notePreview(item: QueuedAdvisorNote, limit = 100): string {
@@ -172,6 +220,7 @@ export default function (pi: ExtensionAPI) {
       const shown = items.slice(0, 3);
       const lines = [
         theme.fg("warning", theme.bold(`Advisor inbox · ${items.length} queued`)) +
+          (advisorPaused ? theme.fg("error", " · PAUSED") : "") +
           theme.fg("dim", ` · ${ADVISOR_INBOX_SHORTCUT} to manage`),
         ...shown.map(item => {
           const marker = item.severity === "blocker" ? "■" : item.severity === "concern" ? "▲" : "•";
@@ -205,6 +254,7 @@ export default function (pi: ExtensionAPI) {
     inbox.dismissMany(queued.map(item => item.id));
     persistInbox();
     updateInboxWidget();
+    updateAdvisorStatus();
   }
 
   function releaseInboxAheadOfPrompt(): void {
@@ -233,6 +283,10 @@ export default function (pi: ExtensionAPI) {
       ]);
       if (choice === undefined || choice === close) return;
       if (choice === deliverAll) {
+        if (advisorPaused) {
+          ctx.ui.notify("Advisor is paused; resume it before delivering queued notes.", "warning");
+          continue;
+        }
         deliverQueuedAdvice(items, true);
         ctx.ui.notify(`Delivered ${items.length} queued advisories.`, "info");
         return;
@@ -242,6 +296,7 @@ export default function (pi: ExtensionAPI) {
           inbox.dismissMany(items.map(item => item.id));
           persistInbox();
           updateInboxWidget(ctx);
+          updateAdvisorStatus(ctx);
           ctx.ui.notify(`Dismissed ${items.length} queued advisories.`, "info");
           return;
         }
@@ -255,6 +310,10 @@ export default function (pi: ExtensionAPI) {
         ["Deliver now", "Dismiss", "Back"],
       );
       if (action === "Deliver now") {
+        if (advisorPaused) {
+          ctx.ui.notify("Advisor is paused; resume it before delivering queued notes.", "warning");
+          continue;
+        }
         deliverQueuedAdvice([item], true);
         ctx.ui.notify(`Delivered advisor note #${item.id}.`, "info");
         continue;
@@ -263,8 +322,69 @@ export default function (pi: ExtensionAPI) {
         inbox.dismiss(item.id);
         persistInbox();
         updateInboxWidget(ctx);
+        updateAdvisorStatus(ctx);
       }
     }
+  }
+
+  function clearAdvisorInbox(ctx: ExtensionContext): void {
+    const count = inbox.items.length;
+    if (count === 0) {
+      ctx.ui.notify("Advisor inbox is already empty.", "info");
+      return;
+    }
+    inbox.clear();
+    persistInbox();
+    updateInboxWidget(ctx);
+    updateAdvisorStatus(ctx);
+    ctx.ui.notify(`Cleared ${count} queued ${count === 1 ? "advisory" : "advisories"}.`, "info");
+  }
+
+  function enqueueAdvisorPaused(paused: boolean, ctx: ExtensionContext): Promise<void> {
+    // Serialize shortcut/command invocations so a rapid resume cannot make the
+    // host look active while the preceding pause is still aborting a turn.
+    const transition = advisorPauseTransitions.run(async () => {
+      if (paused === advisorPaused) {
+        ctx.ui.notify(`Advisor is already ${paused ? "paused" : "running"}.`, "info");
+        return;
+      }
+      if (paused && (!runtimeEnabled || !configHadRoster || !orchestrator)) {
+        advisorPauseRequests.reject(paused);
+        ctx.ui.notify("pi-omp-advisor is not running; use /advisor on before pausing it.", "warning");
+        return;
+      }
+      if (paused) {
+        advisorPaused = true;
+        advisorPauseRequests.apply(true);
+      }
+      await orchestrator?.setPaused(paused);
+      if (!paused) {
+        advisorPaused = false;
+        advisorPauseRequests.apply(false);
+      }
+      persistInbox();
+      updateInboxWidget(ctx);
+      updateAdvisorStatus(ctx);
+      ctx.ui.notify(
+        paused
+          ? `Advisor paused${inbox.items.length > 0 ? `; ${inbox.items.length} queued ${inbox.items.length === 1 ? "note" : "notes"} retained` : ""}.`
+          : `Advisor resumed${inbox.items.length > 0 ? `; ${inbox.items.length} notes remain queued` : ""}.`,
+        "info",
+      );
+    });
+    return transition.catch(err => {
+      advisorPauseRequests.reject(paused);
+      throw err;
+    });
+  }
+
+  function setAdvisorPaused(paused: boolean, ctx: ExtensionContext): Promise<void> {
+    advisorPauseRequests.request(paused);
+    return enqueueAdvisorPaused(paused, ctx);
+  }
+
+  function toggleAdvisorPaused(ctx: ExtensionContext): Promise<void> {
+    return enqueueAdvisorPaused(advisorPauseRequests.toggleRequest(), ctx);
   }
 
   pi.on("before_agent_start", event => {
@@ -300,6 +420,7 @@ export default function (pi: ExtensionAPI) {
         inbox.enqueue(note);
         persistInbox();
         updateInboxWidget(ctx);
+        updateAdvisorStatus(ctx);
       },
       isStreaming: () => !ctx.isIdle(),
       // Best-effort: pi's extension API does not expose a distinct
@@ -338,7 +459,8 @@ export default function (pi: ExtensionAPI) {
     // first prompt.
     orchestrator.setPreserveOnly(isHeadlessMode(ctx.mode));
     await orchestrator.start(discovered, ctx, modelRuntime, agentDir);
-    ctx.ui.setStatus("advisor", `pi-omp-advisor: ${orchestrator.advisorNames.join(", ") || "default"}`);
+    if (advisorPaused) await orchestrator.setPaused(true);
+    updateAdvisorStatus(ctx);
   }
 
   pi.on("session_start", async (_event, ctx) => {
@@ -354,6 +476,7 @@ export default function (pi: ExtensionAPI) {
     } catch (err) {
       console.error(`[pi-omp-advisor] startOrchestrator failed: ${err instanceof Error ? err.stack : String(err)}`);
     }
+    updateAdvisorStatus(ctx);
   });
 
   pi.on("session_shutdown", async () => {
@@ -377,6 +500,8 @@ export default function (pi: ExtensionAPI) {
     sessionContext?.ui.setWidget(ADVISOR_INBOX_WIDGET_ID, undefined);
     sessionContext = undefined;
     advisorContextNeeded = false;
+    advisorPaused = false;
+    advisorPauseRequests.restore(false);
   });
 
   // Compaction/branch/tree rewrite the primary transcript's shape without
@@ -394,6 +519,8 @@ export default function (pi: ExtensionAPI) {
       ctx.sessionManager.getBranch().some(entry => entry.type === "custom_message" && entry.customType === "advisor");
     updateInboxWidget(ctx);
     await orchestrator?.resetRuntimesOnly();
+    await orchestrator?.setPaused(advisorPaused);
+    updateAdvisorStatus(ctx);
   });
 
   pi.on("message_end", async (event, _ctx) => {
@@ -431,7 +558,7 @@ export default function (pi: ExtensionAPI) {
     // Keep preserved advisories in our cancellable inbox until a normal user
     // prompt begins. Releasing here (before pi records the submitted user
     // message) preserves the existing advisor-card-above-prompt ordering.
-    if ((event.source === "interactive" || event.source === "rpc") && event.streamingBehavior === undefined) {
+    if (!advisorPaused && (event.source === "interactive" || event.source === "rpc") && event.streamingBehavior === undefined) {
       releaseInboxAheadOfPrompt();
     }
     if (!orchestrator) return;
@@ -464,11 +591,27 @@ export default function (pi: ExtensionAPI) {
     }
 
     const availableModels = ctx.modelRegistry.getAvailable();
-    const NO_OVERRIDE = "(use the advisor role's default model — no override)";
+    const NO_OVERRIDE = "(use the current Pi session model — no override)";
+
+    async function showConfigHelp(): Promise<void> {
+      await ctx.ui.select(
+        [
+          "WATCHDOG.yml configuration",
+          "",
+          "Shared instructions apply to every configured advisor.",
+          "Main/subagents choose which Pi process types are watched by default.",
+          "Backpressure can briefly pause the primary when an advisor falls behind; off is the normal default.",
+          "Immune turns prevent repeated concerns from interrupting; blockers remain interrupting.",
+          "Each advisor can choose a model, tools, specialization instructions, and whether it is enabled.",
+          "Changes are not written until you choose Save.",
+        ].join("\n"),
+        ["Back"],
+      );
+    }
 
     async function pickModel(current: string | undefined): Promise<string | undefined | null> {
       const labels = [NO_OVERRIDE, ...availableModels.map(m => `${m.provider}/${m.id} — ${m.name}`)];
-      const choice = await ctx.ui.select(`Model (current: ${current ?? "advisor role default"})`, labels);
+      const choice = await ctx.ui.select(`Model (current: ${current ?? "current Pi session model"})`, labels);
       if (choice === undefined) return null;
       if (choice === NO_OVERRIDE) return undefined;
       const model = availableModels[labels.indexOf(choice) - 1];
@@ -478,7 +621,7 @@ export default function (pi: ExtensionAPI) {
     async function editAdvisor(a: AdvisorConfig): Promise<"removed" | "done"> {
       while (true) {
         const options = [
-          `Model: ${a.model ?? "(advisor role default)"}`,
+          `Model: ${a.model ?? "(current Pi session model)"}`,
           `Tools: ${a.tools?.join(", ") ?? "(default: read, grep, glob)"}`,
           `Instructions: ${a.instructions ? `${a.instructions.slice(0, 60)}${a.instructions.length > 60 ? "…" : ""}` : "(none)"}`,
           `Enabled: ${a.enabled !== false}`,
@@ -505,7 +648,7 @@ export default function (pi: ExtensionAPI) {
           continue;
         }
         if (choice.startsWith("Instructions:")) {
-          const text = await ctx.ui.input("This advisor's specialization instructions (blank = none)", a.instructions ?? "");
+          const text = await ctx.ui.editor("This advisor's specialization instructions (blank = none)", a.instructions ?? "");
           if (text !== undefined) {
             if (text.trim() === "") delete a.instructions;
             else a.instructions = text;
@@ -526,16 +669,17 @@ export default function (pi: ExtensionAPI) {
 
     while (true) {
       const advisorLabels = doc.advisors.map(
-        a => `Advisor: ${a.name} (${a.model ?? "role default"}${a.enabled === false ? ", disabled" : ""})`,
+        a => `Advisor: ${a.name} (${a.model ?? "current session model"}${a.enabled === false ? ", disabled" : ""})`,
       );
       const options = [
         `Shared instructions: ${doc.instructions ? `${doc.instructions.slice(0, 40)}…` : "(none)"}`,
         `Watch the main session by default: ${doc.main === true ? "on" : doc.main === false ? "off" : "on (unset, default)"}`,
         `Watch sub-agent sessions too: ${doc.subagents === true ? "on" : doc.subagents === false ? "off" : "off (unset)"}`,
-        `Pause me when an advisor falls behind: ${doc.syncBacklog === undefined ? "off (default)" : doc.syncBacklog === "off" ? "off" : `${doc.syncBacklog} batches`}`,
+        `Backpressure: pause the primary when an advisor falls behind: ${doc.syncBacklog === undefined ? "off (default)" : doc.syncBacklog === "off" ? "off" : `${doc.syncBacklog} batches`}`,
         `Turns where later concerns stop interrupting: ${doc.immuneTurns ?? "3 (default)"}`,
         ...advisorLabels,
         "+ Add advisor",
+        "Help: what these settings mean",
         "Save",
         "Discard",
       ];
@@ -557,7 +701,7 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       if (choice.startsWith("Shared instructions:")) {
-        const text = await ctx.ui.input("Shared instructions for every advisor (blank = none)", doc.instructions ?? "");
+        const text = await ctx.ui.editor("Shared instructions for every advisor (blank = none)", doc.instructions ?? "");
         if (text !== undefined) {
           if (text.trim() === "") delete doc.instructions;
           else doc.instructions = text;
@@ -577,7 +721,7 @@ export default function (pi: ExtensionAPI) {
         doc.subagents = !(doc.subagents === true);
         continue;
       }
-      if (choice.startsWith("Pause me when an advisor falls behind:")) {
+      if (choice.startsWith("Backpressure: pause the primary when an advisor falls behind:")) {
         // Matches upstream's `advisor.syncBacklog` values exactly. "off" means
         // the primary is never gated on a lagging advisor (upstream default).
         const picked = await ctx.ui.select(
@@ -605,6 +749,10 @@ export default function (pi: ExtensionAPI) {
             else ctx.ui.notify("Not a non-negative number — unchanged.", "warning");
           }
         }
+        continue;
+      }
+      if (choice === "Help: what these settings mean") {
+        await showConfigHelp();
         continue;
       }
       if (choice === "+ Add advisor") {
@@ -637,16 +785,125 @@ export default function (pi: ExtensionAPI) {
     return filePath;
   }
 
+  async function showAdvisorHelp(ctx: ExtensionCommandContext): Promise<void> {
+    await ctx.ui.select(
+      [
+        "pi-omp-advisor controls",
+        "",
+        "/advisor — open the interactive control menu",
+        "/advisor status — show runtime, model, backlog, and queue details",
+        "/advisor inbox — inspect, deliver, or dismiss queued notes",
+        "/advisor pause | resume — stop or restart observation without releasing the queue",
+        "/advisor clear — immediately discard every queued note",
+        "/advisor on | off — enable or disable this session",
+        "/advisor config — edit project or user WATCHDOG.yml",
+        "/advisor main on|off — persist the normal-session default",
+        "/advisor subagents on|off — set the default for newly spawned subagents",
+        "",
+        `${ADVISOR_INBOX_SHORTCUT}: inbox · ${ADVISOR_PAUSE_SHORTCUT}: pause/resume · ${ADVISOR_CLEAR_SHORTCUT}: clear queue`,
+        "Use Tab to accept the highlighted command or subcommand completion.",
+        "Paused notes remain visible and are neither delivered nor cleared.",
+      ].join("\n"),
+      ["Back"],
+    );
+  }
+
+  function advisorMenuState(): string {
+    const queued = `${inbox.items.length} queued`;
+    if (advisorPaused) return `paused · ${queued}`;
+    if (isActive()) return `running: ${orchestrator!.advisorNames.join(", ")} · ${queued}`;
+    if (runtimeOverride === false || !runtimeEnabled) return `off · ${queued}`;
+    return `not running · ${queued}`;
+  }
+
+  async function runAdvisorMenu(ctx: ExtensionCommandContext): Promise<void> {
+    while (true) {
+      const inboxChoice = `Inbox (${inbox.items.length} queued)`;
+      const toggleChoice = advisorPaused
+        ? "Resume advisor"
+        : isActive()
+          ? "Pause advisor"
+          : "Enable or restart advisor for this session";
+      const options = [
+        inboxChoice,
+        toggleChoice,
+        ...(runtimeEnabled || advisorPaused ? ["Disable advisor for this session"] : []),
+        ...(inbox.items.length > 0 ? [`Clear all ${inbox.items.length} queued advisories now`] : []),
+        "Configure advisors…",
+        "Status details",
+        "Help & shortcuts",
+        "Close",
+      ];
+      const choice = await ctx.ui.select(`pi-omp-advisor · ${advisorMenuState()}`, options);
+      if (choice === undefined || choice === "Close") return;
+      if (choice === inboxChoice) {
+        await showAdvisorInbox(ctx);
+        continue;
+      }
+      if (choice === "Pause advisor") {
+        await setAdvisorPaused(true, ctx);
+        continue;
+      }
+      if (choice === "Resume advisor") {
+        await setAdvisorPaused(false, ctx);
+        continue;
+      }
+      if (choice === "Enable or restart advisor for this session") {
+        await handleCommand("on", ctx);
+        continue;
+      }
+      if (choice === "Disable advisor for this session") {
+        await handleCommand("off", ctx);
+        continue;
+      }
+      if (choice.startsWith("Clear all ")) {
+        clearAdvisorInbox(ctx);
+        continue;
+      }
+      if (choice === "Configure advisors…") {
+        await runConfigMenu(ctx);
+        continue;
+      }
+      if (choice === "Status details") {
+        await handleCommand("status", ctx);
+        continue;
+      }
+      if (choice === "Help & shortcuts") {
+        await showAdvisorHelp(ctx);
+      }
+    }
+  }
+
   async function handleCommand(args: string, ctx: ExtensionCommandContext): Promise<void> {
     const parts = args.trim().toLowerCase().split(/\s+/).filter(Boolean);
     const [first, second] = parts;
 
+    if (first === undefined || first === "menu") {
+      await runAdvisorMenu(ctx);
+      return;
+    }
+    if (first === "help") {
+      await showAdvisorHelp(ctx);
+      return;
+    }
     if (first === "config") {
       await runConfigMenu(ctx);
       return;
     }
     if (first === "inbox" || first === "queue") {
       await showAdvisorInbox(ctx);
+      return;
+    }
+    if (first === "pause") {
+      await setAdvisorPaused(true, ctx);
+      return;
+    }
+    if (first === "resume") {
+      await setAdvisorPaused(false, ctx);
+      return;
+    }
+    if (first === "clear") {
+      clearAdvisorInbox(ctx);
       return;
     }
 
@@ -677,21 +934,44 @@ export default function (pi: ExtensionAPI) {
     }
 
     if (first === "off") {
-      runtimeOverride = false;
-      runtimeEnabled = false;
-      ctx.ui.setStatus("advisor", "pi-omp-advisor: off");
-      ctx.ui.notify("pi-omp-advisor disabled for this session.", "info");
+      advisorPauseRequests.request(false);
+      await advisorPauseTransitions.run(async () => {
+        runtimeOverride = false;
+        runtimeEnabled = false;
+        advisorPaused = false;
+        advisorPauseRequests.apply(false);
+        await orchestrator?.disposeAll();
+        orchestrator = undefined;
+        persistInbox();
+        ctx.ui.setStatus("advisor", "pi-omp-advisor: off");
+        ctx.ui.notify("pi-omp-advisor disabled for this session.", "info");
+      });
       return;
     }
     if (first === "on") {
-      runtimeOverride = true;
-      runtimeEnabled = true;
-      if (!orchestrator) {
-        ctx.ui.setStatus("advisor", "pi-omp-advisor: starting…");
-        await startOrchestrator(ctx, /* force */ true);
-      }
-      ctx.ui.setStatus("advisor", `pi-omp-advisor: ${orchestrator?.advisorNames.join(", ") || "no advisors configured"}`);
-      ctx.ui.notify("pi-omp-advisor enabled for this session.", "info");
+      advisorPauseRequests.request(false);
+      await advisorPauseTransitions.run(async () => {
+        runtimeOverride = true;
+        runtimeEnabled = true;
+        advisorPaused = false;
+        advisorPauseRequests.apply(false);
+        if (!orchestrator || orchestrator.advisorNames.length === 0) {
+          ctx.ui.setStatus("advisor", "pi-omp-advisor: starting…");
+          await startOrchestrator(ctx, /* force */ true);
+        } else {
+          await orchestrator.setPaused(false);
+        }
+        persistInbox();
+        updateInboxWidget(ctx);
+        updateAdvisorStatus(ctx);
+        ctx.ui.notify("pi-omp-advisor enabled for this session.", "info");
+      });
+      return;
+    }
+
+    if (first !== "status") {
+      ctx.ui.notify(`Unknown advisor command: ${parts.join(" ")}. Use /advisor to open the menu or /advisor help.`, "warning");
+      await showAdvisorHelp(ctx);
       return;
     }
 
@@ -707,9 +987,11 @@ export default function (pi: ExtensionAPI) {
     const describe = (s: { name: string; status: string; backlog: number }) =>
       `${s.name}: ${s.status}${s.backlog > 0 ? ` (${s.backlog} batch(es) behind)` : ""}`;
     const unusable = overview.filter(s => s.status === "no_model");
-    const state = isActive()
-      ? `on — watching with: ${orchestrator!.advisorNames.join(", ")} (${overview.map(describe).join(", ")})`
-      : runtimeOverride === false
+    const state = advisorPaused
+      ? `paused — ${inbox.items.length} queued ${inbox.items.length === 1 ? "advisory" : "advisories"} retained; no new advisor work will start`
+      : isActive()
+        ? `on — watching with: ${orchestrator!.advisorNames.join(", ")} (${overview.map(describe).join(", ")})`
+        : runtimeOverride === false
         ? "off (disabled for this session via /advisor off)"
         : unusable.length > 0
           ? `off — every configured advisor failed to start: ${unusable.map(describe).join(", ")}. ` +
@@ -725,9 +1007,18 @@ export default function (pi: ExtensionAPI) {
     description: "Open the queued advisor inbox",
     handler: showAdvisorInbox,
   });
+  pi.registerShortcut(ADVISOR_PAUSE_SHORTCUT, {
+    description: "Pause or resume the advisor",
+    handler: toggleAdvisorPaused,
+  });
+  pi.registerShortcut(ADVISOR_CLEAR_SHORTCUT, {
+    description: "Clear every queued advisory",
+    handler: clearAdvisorInbox,
+  });
 
   pi.registerCommand("advisor", {
-    description: "Control pi-omp-advisor: on | off | status | inbox | config | main on|off | subagents on|off",
+    description: "Open advisor controls, inbox, status, and configuration",
+    getArgumentCompletions: getAdvisorArgumentCompletions,
     handler: handleCommand,
   });
 }
