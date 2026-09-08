@@ -1,0 +1,90 @@
+name: Publish to npm
+
+on:
+  push:
+    tags: ["v*"]
+  # Exercise verification and packaging without publishing a version.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: npm-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      dist-tag: ${{ steps.metadata.outputs.dist-tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+      - run: npm install --global npm@12.0.1 --ignore-scripts
+
+      - name: Check tag and package versions
+        id: metadata
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if [[ "$EVENT_NAME" == "push" ]]; then
+            node scripts/release-metadata.mjs "$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          else
+            node scripts/release-metadata.mjs >> "$GITHUB_OUTPUT"
+          fi
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run verify:package
+      - name: Pack release
+        run: |
+          mkdir -p "$RUNNER_TEMP/npm-release"
+          npm pack --ignore-scripts --pack-destination "$RUNNER_TEMP/npm-release"
+          cd "$RUNNER_TEMP/npm-release"
+          sha256sum *.tgz > SHA256SUMS
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: npm-release
+          path: ${{ runner.temp }}/npm-release/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      # No checkout or dependency/lifecycle scripts in the OIDC-capable job.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+      - run: npm install --global npm@12.0.1 --ignore-scripts
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: npm-release
+          path: release
+      - name: Publish verified tarball with npm trusted publishing
+        working-directory: release
+        env:
+          NPM_DIST_TAG: ${{ needs.verify.outputs.dist-tag }}
+        run: |
+          sha256sum --check SHA256SUMS
+          packages=(./*.tgz)
+          [[ ${#packages[@]} -eq 1 && -f "${packages[0]}" ]]
+          npm publish "${packages[0]}" --ignore-scripts --provenance --access public \
+            --registry=https://registry.npmjs.org/ --tag "$NPM_DIST_TAG"

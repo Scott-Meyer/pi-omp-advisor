@@ -48,37 +48,61 @@ or `yaml` will not resolve and every `WATCHDOG.yml` is silently ignored (the
 advisor degrades rather than crashing, so this fails quietly). That is the single
 reason the bootstrap script exists rather than just documenting a `git clone`.
 
-## Optional: publishing to npm
+## Releasing to npm
 
-**Remember to do this.** Right now pi-omp-advisor is installed by a local path entry in
-`~/.pi/agent/settings.json`:
+Pushing a new `v<version>` tag runs `.github/workflows/publish.yml`. GitHub tests
+and packs that tagged source, then publishes the same tarball through npm trusted
+publishing (OIDC). Collaborators with permission to push tags, including Sean,
+can release without an npm account login or an `NPM_TOKEN` secret.
 
-```json
-{ "packages": ["../../git/pi-omp-advisor"] }
+From a clean, up-to-date `main` with the release changes committed:
+
+```bash
+npm version patch --no-git-tag-version  # or choose an explicit version
+VERSION=$(node -p 'require("./package.json").version')
+git add package.json package-lock.json
+git commit -S -m "Release v$VERSION"
+git tag -s "v$VERSION" -m "pi-omp-advisor v$VERSION"
+git push origin main "v$VERSION"
 ```
 
-Publishing is **not** required for the setup above, and is only worth doing if you
-want other people to install this. For your own machines, prefer the checkout
-workflow — it avoids a publish round-trip per change.
+The tag and both lockfile version fields must match `package.json`. Stable
+versions publish to `latest`; prereleases such as `v0.3.0-rc.1` publish to `next`.
+The workflow also attaches npm provenance. Follow the **Publish to npm** run in
+GitHub Actions to confirm publication. A GitHub Release page is optional and
+separate from the npm publish.
 
-If you do publish, note what a local path entry cannot do on its own:
+Use `gh workflow run publish.yml --ref main` to run validation and packaging
+without publishing. This checks the build path, not the npm OIDC exchange; that
+last step is exercised by the next new release tag. Existing tags are not
+retroactively published. Keep published versions and release tags immutable;
+fix a failed check before creating the next version rather than moving a tag.
 
-- Tooling that syncs an agent config across machines typically copies
-  `settings.json` and friends, not your working tree. The remote machine then has
-  a `packages` entry pointing at a path that does not exist there, and pi reports
-  a missing package. `~/.pi/agent/npm/package.json` is not synced either, so
-  "just add the dependency there" fixes only the machine in front of you.
-- Copying `src/` into `~/.pi/agent/extensions/` instead is what caused the
-  "Cannot find module 'yaml'" bug: that directory gets no dependency install, so
-  `yaml` resolved only by accident (see "Dependencies" below).
+### One-time owner setup
 
-The fix is to publish the package so the spec in `settings.json` is
-self-installing, because pi runs `npm install` for npm and git specs:
+The npm package's GitHub trusted publisher is bound to:
 
-- [ ] publish to npm as `pi-omp-advisor`, then `pi install npm:pi-omp-advisor`, **or**
-- [ ] push to a git remote and use `pi install git:github.com/<user>/pi-omp-advisor@<tag>`
+- Repository: `Scott-Meyer/pi-omp-advisor`
+- Workflow filename: `publish.yml` (not the full path)
+- Environment: `npm`
 
-Until one of those is done, every other machine needs a manual checkout.
+The GitHub `npm` environment permits only `v*` tags and has no required reviewer,
+so a collaborator can release without waiting for the owner. Treat tag-push and
+workflow-edit access as publishing authority. Only the publish job has
+`id-token: write`; it installs no project dependencies and executes no package
+lifecycle scripts. The workflow uses GitHub-hosted runners and an OIDC-capable
+npm CLI, with no npm token stored in GitHub.
+
+An authenticated npm package owner can register that relationship with:
+
+```bash
+npm trust github pi-omp-advisor --repo Scott-Meyer/pi-omp-advisor \
+  --file publish.yml --env npm --allow-publish
+npm trust list pi-omp-advisor
+```
+
+Changing the repository, workflow filename, or environment requires updating the
+npm trust relationship too. See [npm's trusted publishing documentation](https://docs.npmjs.com/trusted-publishers/).
 
 ## Dependencies
 

@@ -234,6 +234,15 @@ and not in subagent processes (`subagents:`). Both are configurable; see the
 subagent-detection note above for the caveat about how child processes are
 identified.
 
+## Releasing
+
+Maintainers publish by pushing a version tag such as `v0.2.2`. GitHub Actions
+checks and packs the release, then publishes to npm through trusted publishing;
+no npm login or token is needed for the person pushing the tag. Stable releases
+use `latest`, prereleases use `next`. See the
+[release guide](https://github.com/Scott-Meyer/pi-omp-advisor/blob/main/DEVELOPMENT.md#releasing-to-npm)
+for versioning, signed tags, and one-time owner setup.
+
 ## Layout
 
 - `src/index.ts` — extension wiring: config discovery, lifecycle events, the
