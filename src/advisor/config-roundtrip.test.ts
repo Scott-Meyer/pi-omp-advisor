@@ -16,6 +16,7 @@ import * as path from "node:path";
 import { after, before, describe, it } from "node:test";
 import {
   WatchdogConfigUnreadableError,
+  discoverAdvisorConfigs,
   loadWatchdogConfigFile,
   serializeWatchdogConfig,
   type WatchdogConfigDoc,
@@ -50,6 +51,8 @@ describe("loadWatchdogConfigFile", () => {
         "    model: openai/gpt-5.1-codex-mini",
         "    tools: [read, grep]",
         "    enabled: false",
+        "    contextTokens: 16000",
+        "    includePrimaryThinking: false",
         "",
       ].join("\n"),
     );
@@ -75,6 +78,28 @@ describe("loadWatchdogConfigFile", () => {
     assert.equal(reloaded.instructions, "shared baseline");
     assert.equal(reloaded.advisors[0]?.name, "reviewer");
     assert.equal(reloaded.advisors[0]?.enabled, false);
+    assert.equal(reloaded.advisors[0]?.contextTokens, 16000);
+    assert.equal(reloaded.advisors[0]?.includePrimaryThinking, false);
+  });
+
+  it("discovers explicit memory settings and refuses unsafe fallback from invalid settings", async () => {
+    const cwd = await fs.mkdtemp(path.join(dir, "memory-"));
+    const agentDir = path.join(cwd, "agent");
+    await fs.mkdir(agentDir);
+    const file = path.join(cwd, "WATCHDOG.yml");
+    await fs.writeFile(file, "advisors:\n  - name: reviewer\n    contextTokens: 150000\n    includePrimaryThinking: true\n");
+    const valid = await discoverAdvisorConfigs(cwd, agentDir);
+    assert.equal(valid.advisors[0]?.contextTokens, 150000);
+    assert.equal(valid.advisors[0]?.includePrimaryThinking, true);
+    for (const field of ["contextTokens: 0", "contextTokens: 2048.5", "contextTokens: nope", "includePrimaryThinking: yes"]) {
+      const original = `advisors:\n  - name: reviewer\n    ${field}\n`;
+      await fs.writeFile(file, original);
+      await assert.rejects(() => loadWatchdogConfigFile(file), WatchdogConfigUnreadableError);
+      const invalid = await discoverAdvisorConfigs(cwd, agentDir);
+      assert.equal(invalid.advisors.length, 1, "invalid explicit advisor cannot become an implicit default");
+      assert.equal(invalid.advisors[0]?.enabled, false);
+      assert.equal(await fs.readFile(file, "utf8"), original);
+    }
   });
 
   it("accepts syncBacklog: off", async () => {

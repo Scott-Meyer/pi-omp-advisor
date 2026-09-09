@@ -12,17 +12,18 @@ session as it works and can send it advice mid-run.
 
 This is a port of the advisor/watchdog system in
 [oh-my-pi](https://github.com/can1357/oh-my-pi) onto pi's own Agent SDK —
-same system prompt, same `advise` tool description, same delivery-channel
-semantics, same emission guard. See `PROVENANCE.md` for exactly which files
-are byte-identical copies of upstream, which are ports, and every known
-deviation.
+retaining its compact observer context, `advise` description, delivery channels,
+and emission guard. Small prompt clarifications and editable pending advice are
+specific to this port; `PROVENANCE.md` documents those differences.
 
 ## What it does
 
 On session start, pi-omp-advisor builds one live in-process `AgentSession` per
 configured advisor, each with its own model and its own throwaway context,
-and feeds it a compact digest of the primary agent's transcript — one batch
-per primary turn, one line per tool call.
+and feeds it a compact digest of the primary agent's transcript — normally one
+batch per primary turn, one line per tool call. Its recent model context is
+bounded to **32,000 estimated input tokens** by default, and primary-agent
+reasoning is excluded unless explicitly enabled.
 
 An advisor's only way to reach the primary agent is `advise(note, severity)`.
 Alongside it, an advisor gets whatever investigative tools its config grants — by
@@ -32,11 +33,22 @@ what the primary is doing:
 
 | Situation | Channel |
 |---|---|
-| `nit` | `aside` — batched, delivered at the next step boundary, no interruption |
+| `nit` during active work | `aside` — batched, delivered at the next step boundary, no interruption |
 | `concern` / `blocker` | `steer` — interrupts the live turn, or triggers one when idle |
 | Primary already gave its final answer, nothing queued | `preserve` — visible, cancellable inbox entry; released above the next normal user prompt (`blocker` still steers) |
 | Within `immuneTurns` (default 3) of a previous interrupt | concerns downgraded to `aside` (`blocker` exempt) |
-| Print mode, or right after a user interrupt | `preserve` |
+| Print mode while idle, or a stopped/aborting primary run | `preserve` — including blockers after a stop |
+
+Escape aborting a primary run leaves auto-resume suppressed after the live abort
+signal disappears. Restarting an advisor does not clear that stop; submitting a
+new normal user prompt does. A blocker can still restart a naturally completed
+run that you did **not** stop.
+
+Non-blocker notes raised during work stay deferred. A completing update gives
+the advisor a chance to reconsider them **before** they enter these delivery
+channels; a failed or aborted review does not release them. Blockers retain
+immediate routing. This is review between completed model/tool cycles, not a
+pre-execution check of each tool call.
 
 Two gates keep the primary's transcript clean even when an advisor model
 misbehaves: a noise filter (`stop`, `done`, `lgtm`, `no issues`, …) and a
@@ -51,7 +63,79 @@ pauses or resumes observation without releasing the queue; `Ctrl+Shift+X`
 clears the queue immediately. Notes you keep are rendered as advisor cards above
 the next accepted normal user message and included in that turn's model context.
 Queue and pause state are persisted as session metadata, so they survive
-extension reloads.
+extension reloads. Late ordinary notes, including default-severity nits, stay
+here for you to read and discard before submitting your next prompt. Typing alone
+does not release them. Asides queued during work are checked again at handoff in
+case the primary has since finished or been stopped.
+
+The advisor can inspect its own unsent notes with `pending_advice`, replace their
+text with `revise_advice`, or remove them with `withdraw_advice`. A small pending
+summary accompanies its updates. These tools add no repository access and cannot
+change another advisor's notes or recall a message already handed to Pi. Revisions
+keep the same ID and severity and update the visible inbox when applicable.
+User dismissal wins: a withdrawn or cleared note cannot be resurrected by revision.
+Successful revisions also update duplicate tracking without spending a new-note
+slot, so their replacement text is not accepted again as fresh advice.
+
+Pending IDs survive within-session model-context rebuilds; preserved inbox notes
+also survive reloads. Deferred notes still being reviewed are in-memory only.
+Normal user prompts still release the preserved inbox immediately, so the advisor
+does not get a fresh review of that new prompt before those notes are handed off.
+
+### A limited memory, not a second full transcript
+
+Each advisor has a rolling context budget. Older observations and investigative
+exchanges expire instead of being compressed into an accumulating summary.
+Pending advice is stored separately, so expiration does not remove its IDs or
+prevent revision/withdrawal.
+
+The limit applies before **every model request**, including follow-ups after the
+advisor's own tool calls. It counts estimated system/tool overhead as well as
+conversation text, and is reduced on small models to leave reply headroom.
+Estimates use Pi's character-based heuristic, not an exact provider tokenizer.
+A budget is a ceiling, not a target amount of history to fill. It limits future
+model input, not host session records or the provider's data-retention policy.
+
+The latest observation and current tool exchange are kept. Large observation
+text or tool output can be shortened with an explicit omission marker; actual
+assistant tool calls and their result identities are not rewritten. If a required
+exchange cannot fit safely, that review fails without releasing deferred advice.
+An incomplete exchange from a known interrupted review is discarded as a whole,
+without inventing missing results or treating the review as successful.
+Standing system/project instructions are not silently cut to make room.
+
+Use `/advisor config` to change each advisor's budget and primary-reasoning setting.
+`/advisor status` shows the effective estimated budget, retained message count,
+and whether content has expired or been shortened. Changing this extension still
+requires `/reload` before the new policy is active.
+
+### Optional emergency stop
+
+Add `request_stop` explicitly to an advisor's `tools` to grant cancellation:
+
+```yaml
+advisors:
+  - name: advisor
+    tools: [read, grep, glob, request_stop]
+```
+
+That advisor also gets `current_tool`, which returns the exact execution
+`targetId` and a compact call summary. It receives tool-start updates before
+results, so it can notice a dangerous foreground operation while it is in flight.
+The transcript remains compact; reviews can still lag behind the primary.
+
+`request_stop(targetId, reason)` uses Pi's supported **active-turn abort**, not
+arbitrary process control. It accepts only a sole in-flight foreground call and
+rejects stale or ambiguous targets, multiple calls, paused/off advisors, and
+repeated requests until the run settles. The target ID is unique even when a provider reuses its
+own tool-call ID. A `blocker` advisory alone does **not** invoke cancellation.
+
+The reason is shown immediately and recorded in session metadata. After the
+primary settles, a visible receipt reports what was observed without restarting
+it. Acceptance means *cancellation requested*, not guaranteed termination or
+rollback: tools must cooperate with abort, and detached jobs or already-completed
+external side effects are not undone. Resume explicitly after inspecting the
+reason. After changing the grant or extension code, run `/reload` before testing.
 
 ## Install
 
@@ -120,6 +204,8 @@ advisors:
   - name: advisor
     model: openai/gpt-5.1-codex-mini   # or provider/id:high for a thinking level
     tools: [read, grep, glob]     # default; `glob` maps to pi's `find`
+    contextTokens: 32000         # default estimated input ceiling; configurable, minimum 2048
+    includePrimaryThinking: false  # default; independent of the advisor's own thinking level
     instructions: Pay extra attention to auth and data-loss risk.
     enabled: true
 ```
@@ -127,9 +213,10 @@ advisors:
 `WATCHDOG.md` files on the same search path are loaded as freeform standing
 instructions shared by every advisor.
 
-If `model` is omitted an advisor inherits the primary's model, and its
-latency with it. Pick something fast — an advisor's judgment always lags the
-primary by its own round-trip time.
+Set `model` explicitly to choose your advisor. If omitted, selection falls back
+to the SDK's configured/provider defaults; it does not reliably inherit the
+current primary model. Pick something fast — an advisor's judgment always lags
+the primary by its own round-trip time.
 
 ## Commands
 
@@ -174,22 +261,23 @@ goes to a *second* vendor.
 
    | Included | Form |
    |---|---|
-   | your messages | **verbatim, in full** |
-   | assistant replies | verbatim |
-   | assistant reasoning | verbatim, when the model exposes it |
+   | your messages | verbatim within the recent window; oversized text may be shortened |
+   | assistant replies | verbatim within the recent window; oversized text may be shortened |
+   | assistant reasoning | excluded by default; available text included only with `includePrimaryThinking: true` |
    | tool calls | name + one primary argument, truncated to 120 chars (so file paths, commands, grep patterns, URLs) |
    | successful tool results | status and size only — `⇒ ok · 31 lines`, **no body** |
    | failed tool results | status, size, and the **first line** of the error |
-   | `edit`/`write` results | the **full unified diff**, fenced (`expandEditDiffs`) |
+   | `edit`/`write` results | fenced unified diff; subject to the context window and shortening |
    | your `!` bash runs | command preview + exit status + line count, no output |
 
    So ordinary file reads and command output do **not** leave as content — but
-   your own prompts do, and so does every diff the agent applies.
+   your own prompts and applied diffs can. A context budget is not a secret-redaction policy.
 
 2. **The advisor's own tool calls.** It holds `read`/`grep`/`glob` by default and
    uses them to check claims, so it can read project files directly. Those results
-   enter the advisor's context in full and go to its provider, independent of what
-   the digest summarizes.
+   enter the advisor's bounded context and can go to its provider, independent of
+   what the digest summarizes. Large results may be shortened before the next
+   model request; older results expire with the rest of the conversation.
 
 If a session must stay within one provider, set `model:` to a model from that
 provider, or don't run an advisor there. To stop route 2 entirely, set
@@ -253,6 +341,7 @@ for versioning, signed tags, and one-time owner setup.
   `resolveAdvisorDeliveryChannel`
 - `src/advisor/advise-tool.ts` — the `advise` tool, with the emission guard
   gating at its boundary
+- `src/advisor/context-window.ts` — per-request rolling memory budget, safe exchange eviction, and explicit shortening
 - `src/advisor/emission-guard.ts` — noise filter + one-note-per-update budget
 - `src/advisor/session-history-format.ts` — compact primary-transcript render
 - `src/advisor/delta-render.ts` — per-source-message chunking for prompt-cache

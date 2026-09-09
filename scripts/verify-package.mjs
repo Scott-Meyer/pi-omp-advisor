@@ -13,6 +13,8 @@ import { execFileSync } from "node:child_process";
 const REQUIRED = [
   "package.json",
   "src/index.ts",
+  "src/advisor/context-window.ts",
+  "src/advisor/primary-interruption.ts",
   "src/prompts/system.md",
   "src/prompts/advise-tool.md",
   "src/prompts/active-repo-watchdog.md",
