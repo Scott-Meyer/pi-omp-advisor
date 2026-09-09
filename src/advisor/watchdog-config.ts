@@ -54,6 +54,7 @@ async function requireYaml(): Promise<YamlModule | null> {
   return yamlModule;
 }
 import { ADVISOR_TOOL_NAME_ALIASES } from "./advise-logic.ts";
+import { MIN_ADVISOR_CONTEXT_TOKENS } from "./context-window.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -64,6 +65,10 @@ export interface AdvisorConfig {
   instructions?: string;
   /** Per-advisor on/off toggle (default `true`). */
   enabled?: boolean;
+  /** Estimated total model-input budget; defaults to 32,000 tokens. */
+  contextTokens?: number;
+  /** Include the primary's reasoning in observations; defaults to false. */
+  includePrimaryThinking?: boolean;
 }
 
 export interface DiscoveredAdvisors {
@@ -235,7 +240,7 @@ export async function discoverWatchdogFiles(cwd: string, agentDir?: string): Pro
   return items.map(item => `Especially pay attention to:\n<attention>\n${item.content.trim()}\n</attention>`);
 }
 
-/** Known pi built-in tool names an advisor may be granted (validated at config-parse time). */
+/** Known advisor tool grants, validated at config-parse time. */
 const KNOWN_TOOL_NAMES = new Set<string>([
   "read",
   "grep",
@@ -246,6 +251,7 @@ const KNOWN_TOOL_NAMES = new Set<string>([
   "write",
   "bash",
   "advise",
+  "request_stop",
 ]);
 
 function normalizeToolNames(tools: string[]): string[] {
@@ -277,6 +283,8 @@ interface WatchdogYamlAdvisorEntry {
   tools?: unknown;
   instructions?: unknown;
   enabled?: unknown;
+  contextTokens?: unknown;
+  includePrimaryThinking?: unknown;
 }
 interface WatchdogYamlDoc {
   instructions?: unknown;
@@ -289,18 +297,30 @@ interface WatchdogYamlDoc {
   main?: unknown;
 }
 
-function validateAdvisorEntry(entry: WatchdogYamlAdvisorEntry, sourcePath: string): { name: string; model?: string; tools?: string[]; instructions?: string; enabled?: boolean } | undefined {
+function validateAdvisorEntry(entry: WatchdogYamlAdvisorEntry, sourcePath: string): AdvisorConfig | undefined {
   if (typeof entry.name !== "string" || !entry.name.trim()) {
     console.error(`[pi-omp-advisor] advisor config ${sourcePath}: skipping advisor entry with missing/invalid "name"`);
     return undefined;
   }
-  const out: { name: string; model?: string; tools?: string[]; instructions?: string; enabled?: boolean } = {
+  const out: AdvisorConfig = {
     name: entry.name,
   };
   if (typeof entry.model === "string" && entry.model.trim()) out.model = entry.model;
   if (Array.isArray(entry.tools) && entry.tools.every(t => typeof t === "string")) out.tools = entry.tools as string[];
   if (typeof entry.instructions === "string" && entry.instructions.trim()) out.instructions = entry.instructions;
   if (typeof entry.enabled === "boolean") out.enabled = entry.enabled;
+  if (entry.contextTokens !== undefined) {
+    if (typeof entry.contextTokens !== "number" || !Number.isSafeInteger(entry.contextTokens) || entry.contextTokens < MIN_ADVISOR_CONTEXT_TOKENS) {
+      throw new WatchdogConfigUnreadableError(sourcePath, `advisor "${entry.name}" contextTokens must be an integer of at least ${MIN_ADVISOR_CONTEXT_TOKENS}`);
+    }
+    out.contextTokens = entry.contextTokens;
+  }
+  if (entry.includePrimaryThinking !== undefined) {
+    if (typeof entry.includePrimaryThinking !== "boolean") {
+      throw new WatchdogConfigUnreadableError(sourcePath, `advisor "${entry.name}" includePrimaryThinking must be true or false`);
+    }
+    out.includePrimaryThinking = entry.includePrimaryThinking;
+  }
   return out;
 }
 
@@ -364,7 +384,17 @@ export async function discoverAdvisorConfigs(cwd: string, agentDir?: string): Pr
     if (Array.isArray(doc.advisors)) {
       for (const raw of doc.advisors) {
         if (!raw || typeof raw !== "object") continue;
-        const entry = validateAdvisorEntry(raw as WatchdogYamlAdvisorEntry, item.path);
+        let entry: AdvisorConfig | undefined;
+        try {
+          entry = validateAdvisorEntry(raw as WatchdogYamlAdvisorEntry, item.path);
+        } catch (error) {
+          console.error(`[pi-omp-advisor] ${String(error)}; advisor disabled`);
+          const name = (raw as WatchdogYamlAdvisorEntry).name;
+          // Keep an invalid explicit roster entry disabled instead of falling
+          // through to an implicit default advisor with a larger memory budget.
+          if (typeof name === "string" && name.trim()) advisors.set(slugifyAdvisorName(name), { name, enabled: false });
+          continue;
+        }
         if (!entry) continue;
         const slug = slugifyAdvisorName(entry.name);
         advisors.set(slug, {
@@ -373,6 +403,8 @@ export async function discoverAdvisorConfigs(cwd: string, agentDir?: string): Pr
           tools: filterAdvisorTools(entry.tools, item.path),
           instructions: entry.instructions,
           enabled: entry.enabled,
+          contextTokens: entry.contextTokens,
+          includePrimaryThinking: entry.includePrimaryThinking,
         });
       }
     }
@@ -530,6 +562,8 @@ export async function serializeWatchdogConfig(doc: WatchdogConfigDoc): Promise<s
       if (a.tools !== undefined) entry.tools = a.tools;
       if (a.instructions?.trim()) entry.instructions = a.instructions;
       if (a.enabled !== undefined) entry.enabled = a.enabled;
+      if (a.contextTokens !== undefined) entry.contextTokens = a.contextTokens;
+      if (a.includePrimaryThinking !== undefined) entry.includePrimaryThinking = a.includePrimaryThinking;
       return entry;
     });
   }

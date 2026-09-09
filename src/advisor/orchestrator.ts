@@ -20,6 +20,7 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createAgentSession, DefaultResourceLoader, loadProjectContextFiles, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { AssistantMessage } from "@earendil-works/pi-ai";
 // `ThinkingLevel` must come from pi-agent-core, which is what
 // `CreateAgentSessionOptions.thinkingLevel` is typed against (`sdk.d.ts:1`).
 // pi-ai exports a NARROWER type of the same name that omits "off", so importing
@@ -32,13 +33,17 @@ import {
   isInterruptingSeverity,
   resolveAdvisorDeliveryChannel,
   resolveAdvisorToolName,
-  type AdvisorNote,
+  type PendingAdvisorNote,
+  type PendingAdviceAccess,
   type AdvisorSeverity,
 } from "./advise-logic.ts";
-import { makeAdviseTool } from "./advise-tool.ts";
+import { ADVISOR_COMMUNICATION_TOOLS, makeAdviseTool } from "./advise-tool.ts";
 import { AdvisorEmissionGuard } from "./emission-guard.ts";
 import { renderAdvisorDeltaMessages } from "./delta-render.ts";
 import { SerializedTransition } from "./serialized-transition.ts";
+import { installAdvisorContextWindow, type ContextWindowStatus } from "./context-window.ts";
+import { ADVISOR_STOP_TOOLS } from "./stop-tools.ts";
+import type { CurrentToolResult, PrimaryStopAccess, PrimaryToolActivity, StopRequestResult } from "./primary-stop.ts";
 import type { AdvisorConfig } from "./watchdog-config.ts";
 import { discoverWatchdogFiles } from "./watchdog-config.ts";
 import { buildAdvisorSystemPrompt } from "./system-prompt.ts";
@@ -98,13 +103,15 @@ const ADVISOR_THINKING_LEVEL_SUFFIXES: ReadonlySet<string> = new Set([
  * `nextActiveToolNames`). Passing only the investigative tools therefore
  * filtered `advise` straight out of the advisor's toolset, leaving it able to
  * read the primary's transcript and physically unable to say anything about it.
- * The advise tool's name must always be in the list alongside them.
+ * The communication tools (advise plus pending-note controls) are included
+ * alongside the investigative tools, even with an explicit tools: allowlist.
  */
 function withAdviseTool(toolNames: string[]): string[] {
-  return toolNames.includes(ADVISE_TOOL_NAME) ? toolNames : [...toolNames, ADVISE_TOOL_NAME];
+  return [...new Set([
+    ...toolNames, ...ADVISOR_COMMUNICATION_TOOLS,
+    ...(toolNames.includes("request_stop") ? ADVISOR_STOP_TOOLS : []),
+  ])];
 }
-
-const ADVISE_TOOL_NAME = "advise";
 /** How long the primary may be paused waiting for a slow advisor to catch
  *  up before the session gives up and moves on (upstream: 30_000ms). */
 const CATCHUP_TIMEOUT_MS = 30_000;
@@ -127,6 +134,7 @@ interface ActiveAdvisor {
    *  byte-identical to the single-advisor form (no `advisor="..."` attribute). */
   sourceName: string | undefined;
   session: Awaited<ReturnType<typeof createAgentSession>>["session"];
+  memory: ReturnType<typeof installAdvisorContextWindow>;
   emissionGuard: AdvisorEmissionGuard;
   adviseState: ReturnType<typeof makeAdviseTool> extends Promise<{ state: infer S }> ? S : never;
   pendingMessages: AgentMessage[];
@@ -138,24 +146,32 @@ interface ActiveAdvisor {
    * preserved and drained in order instead of being dropped (upstream:
    * `AdvisorRuntime`'s own `#pending`/`#drain` single-flight loop).
    */
-  queue: { batch: AgentMessage[]; wip: boolean }[];
+  queue: { batch: AgentMessage[]; wip: boolean; toolActivity?: PrimaryToolActivity }[];
   draining: boolean;
   disposed: boolean;
+  generation: number;
+  contextNotice?: string;
   status: AdvisorRuntimeStatus;
   /**
-   * Whether to render/send thinking blocks for this advisor's context.
-   * Upstream (`runtime.ts` `#includeThinking`) starts `true` and is flipped
-   * to `false` only after a classifier refusal, then retried once with
-   * thinking stripped — see `#drainAdvisor`.
+   * Whether to include the primary's reasoning in observations. Off by
+   * default; an explicit opt-in can still fall back to text-only on error.
+   * This does not control the advisor model's own thinking level.
    */
   includeThinking: boolean;
 }
 
 export interface OrchestratorHost {
   sendCustom(content: string, details: unknown, opts: { deliverAs: "steer"; triggerTurn?: boolean }): void;
-  preserveAdvice(note: AdvisorNote): void;
+  preserveAdvice(note: PendingAdvisorNote): void;
+  pendingAdvice(advisor: string | undefined): PendingAdvisorNote[];
+  reviseAdvice(advisor: string | undefined, adviceId: string, note: string): boolean;
+  withdrawAdvice(advisor: string | undefined, adviceId: string): boolean;
+  currentTool(): CurrentToolResult;
+  requestStop(advisor: string | undefined, targetId: string, reason: string): StopRequestResult;
   isStreaming(): boolean;
   isAborting(): boolean;
+  /** Primary-owned latch, retained even when advisor runtimes are rebuilt. */
+  isAutoResumeSuppressed(): boolean;
   hasQueuedWork(): boolean;
   setStatus(text: string): void;
 }
@@ -165,7 +181,6 @@ export class AdvisorOrchestrator {
   #host: OrchestratorHost;
   #primaryTurnsCompleted = 0;
   #interruptImmuneTurnStart: number | undefined;
-  #autoResumeSuppressed = false;
   #preserveOnly = false;
   #paused = false;
   #pauseTransitions = new SerializedTransition();
@@ -179,7 +194,7 @@ export class AdvisorOrchestrator {
    *  advisor — matches upstream's single shared `yieldQueue` registration
    *  for the `"advisor"` key so nits from different advisors batch into one
    *  `<advisory>` block. */
-  #asideQueue: AdvisorNote[] = [];
+  #asideQueue: PendingAdvisorNote[] = [];
   #asideFlushScheduled = false;
   #syncBacklog: number | "off" = BACKLOG_CATCHUP_DEFAULT;
   #immuneTurns: number = ADVISOR_IMMUNE_TURNS_DEFAULT;
@@ -187,7 +202,7 @@ export class AdvisorOrchestrator {
    *  `/advisor status` reports `no_model` rather than hiding them entirely. */
   #noModelAdvisors: { name: string; status: AdvisorRuntimeStatus }[] = [];
 
-  constructor(host: OrchestratorHost) {
+  constructor(host: OrchestratorHost, private readonly createSession = createAgentSession) {
     this.#host = host;
   }
 
@@ -195,12 +210,12 @@ export class AdvisorOrchestrator {
     return this.#advisors.map(a => a.config.name);
   }
 
-  statusOverview(): { name: string; status: AdvisorRuntimeStatus; backlog: number }[] {
+  statusOverview(): { name: string; status: AdvisorRuntimeStatus; backlog: number; context?: ContextWindowStatus; includePrimaryThinking?: boolean }[] {
     // `backlog` is how many batches are waiting behind the one currently being
     // prompted — the honest "how far behind is this advisor" number, shown in
     // `/advisor status` rather than logged to stderr every time it happens.
     return [
-      ...this.#advisors.map(a => ({ name: a.config.name, status: a.status, backlog: a.queue.length })),
+      ...this.#advisors.map(a => ({ name: a.config.name, status: a.status, backlog: a.queue.length, context: a.memory.window.status, includePrimaryThinking: a.includeThinking })),
       ...this.#noModelAdvisors.map(a => ({ name: a.name, status: a.status, backlog: 0 })),
     ];
   }
@@ -250,7 +265,6 @@ export class AdvisorOrchestrator {
     this.#immuneTurns = configs.immuneTurns ?? ADVISOR_IMMUNE_TURNS_DEFAULT;
     this.#primaryTurnsCompleted = 0;
     this.#interruptImmuneTurnStart = undefined;
-    this.#autoResumeSuppressed = false;
 
     const watchdogBlocks = await discoverWatchdogFiles(ctx.cwd, agentDir);
     const roster = configs.advisors.length > 0 ? configs.advisors : [{ name: "default" }];
@@ -320,11 +334,11 @@ export class AdvisorOrchestrator {
     // The emission guard gates at the tool-call boundary (passed into
     // makeAdviseTool), not here — see advise-tool.ts for why gating
     // downstream of AdviseState silently strands deferred notes.
-    const routeAdvice = (note: string, severity: AdvisorSeverity | undefined) => {
-      this.#routeAdvice(sourceName, note, severity);
-    };
-    const { tool: adviseTool, state: adviseState } = await makeAdviseTool(routeAdvice, note =>
-      emissionGuard.accept(note),
+    const routeAdvice = (note: PendingAdvisorNote) => this.#routeAdvice(sourceName, note);
+    const { tool: adviseTool, controlTools, state: adviseState } = await makeAdviseTool(
+      routeAdvice, note => emissionGuard.accept(note), this.#pendingAccess(sourceName), undefined,
+      config.tools?.includes("request_stop") ? this.#stopAccess(sourceName) : undefined,
+      note => emissionGuard.remember(note),
     );
 
     const resourceLoader = new DefaultResourceLoader({
@@ -337,7 +351,7 @@ export class AdvisorOrchestrator {
 
     let session: Awaited<ReturnType<typeof createAgentSession>>["session"];
     try {
-      const created = await createAgentSession({
+      const created = await this.createSession({
         sessionManager: SessionManager.inMemory(ctx.cwd),
         modelRuntime,
         model,
@@ -345,7 +359,7 @@ export class AdvisorOrchestrator {
         ...(thinkingLevel ? { thinkingLevel } : {}),
         cwd: ctx.cwd,
         tools: resolvedToolNames,
-        customTools: [adviseTool],
+        customTools: [adviseTool, ...controlTools],
         resourceLoader,
       });
       session = created.session;
@@ -359,6 +373,7 @@ export class AdvisorOrchestrator {
       slug,
       sourceName,
       session,
+      memory: installAdvisorContextWindow(session.agent, config.contextTokens),
       emissionGuard,
       adviseState,
       pendingMessages: [],
@@ -366,8 +381,10 @@ export class AdvisorOrchestrator {
       queue: [],
       draining: false,
       disposed: false,
+      generation: 0,
+      contextNotice: "Observation begins here. Earlier session activity is not included in this fresh advisor context.",
       status: "running",
-      includeThinking: true,
+      includeThinking: config.includePrimaryThinking ?? false,
     };
   }
 
@@ -464,7 +481,12 @@ export class AdvisorOrchestrator {
     return this.#pauseTransitions.run(async () => {
       if (this.#paused === paused) return;
       this.#paused = paused;
-      if (!paused) return;
+      if (!paused) {
+        for (const advisor of this.#advisors) {
+          advisor.contextNotice = "Observation resumed. Activity while paused was not sent to you; your view has a gap.";
+        }
+        return;
+      }
 
       const asides = this.#asideQueue;
       this.#asideQueue = [];
@@ -476,7 +498,11 @@ export class AdvisorOrchestrator {
         advisor.pendingMessages = [];
         advisor.awaitingBatch = undefined;
         advisor.queue = [];
-        if (advisor.session.isStreaming) aborts.push(advisor.session.abort());
+        // Reviews use Agent.prompt directly, so AgentSession's separate run
+        // flag/idle waiter does not track them. Cancel at the same API layer.
+        advisor.generation++;
+        advisor.session.agent.abort();
+        aborts.push(advisor.session.agent.waitForIdle());
       }
       await Promise.allSettled(aborts);
     });
@@ -485,6 +511,7 @@ export class AdvisorOrchestrator {
   async disposeAll(): Promise<void> {
     for (const advisor of this.#advisors) {
       advisor.disposed = true;
+      advisor.memory.dispose();
       advisor.session.dispose();
     }
     this.#advisors = [];
@@ -512,7 +539,12 @@ export class AdvisorOrchestrator {
       advisor.awaitingBatch = undefined;
       advisor.queue = [];
       const oldSession = advisor.session;
+      const oldMemory = advisor.memory;
+      advisor.generation++;
+      advisor.contextNotice = "Your model context was rebuilt after a transcript change. Earlier history is not replayed; pending advice may refer to that older context.";
       try {
+        oldSession.agent.abort();
+        await oldSession.agent.waitForIdle();
         const resolvedModel = advisor.config.model ? this.#resolveModel(advisor.config.model, modelRuntime) : undefined;
         const model = resolvedModel?.model;
         const thinkingLevel = resolvedModel?.thinkingLevel;
@@ -532,26 +564,16 @@ export class AdvisorOrchestrator {
           ...ADVISOR_RESOURCE_ISOLATION,
         });
         await resourceLoader.reload();
-        const routeAdvice = (note: string, severity: AdvisorSeverity | undefined) => {
-          this.#routeAdvice(advisor.sourceName, note, severity);
-        };
-        // Rebuild the advise tool bound to the SAME AdviseState instance —
-        // makeAdviseTool always constructs a fresh AdviseState, so reuse the
-        // existing one's dedupe map by swapping its onAdvice callback isn't
-        // exposed; instead this reconstructs a tool with a fresh AdviseState
-        // deliberately reset in step with the fresh session's empty context.
-        // (Delivered-note dedupe living in AdviseState, not just the emission
-        // guard, is upstream-scoped per `AdvisorRuntime.reset()` call, which
-        // upstream's OWN `resetAllRuntimes` also does NOT reset — see
-        // upstream `runtime.ts`; only `#resetAdvisorSessionState` calls
-        // `resetDeliveredNotes()`. This port's rebuilt AdviseState losing
-        // that history on a within-conversation rewrite is a known, narrow
-        // deviation from upstream's finer-grained separation, traded for
-        // implementation simplicity — see PROVENANCE.md.)
-        const { tool: adviseTool, state: adviseState } = await makeAdviseTool(routeAdvice, note =>
-          advisor.emissionGuard.accept(note),
+        const routeAdvice = (note: PendingAdvisorNote) => this.#routeAdvice(advisor.sourceName, note);
+        // Context rebuilds preserve the outbox and its IDs. The next review
+        // receives a pending summary even though its model history is fresh.
+        const { tool: adviseTool, controlTools, state: adviseState } = await makeAdviseTool(
+          routeAdvice, note => advisor.emissionGuard.accept(note),
+          this.#pendingAccess(advisor.sourceName), advisor.adviseState,
+          advisor.config.tools?.includes("request_stop") ? this.#stopAccess(advisor.sourceName) : undefined,
+          note => advisor.emissionGuard.remember(note),
         );
-        const created = await createAgentSession({
+        const created = await this.createSession({
           sessionManager: SessionManager.inMemory(ctx.cwd),
           modelRuntime,
           model,
@@ -560,12 +582,14 @@ export class AdvisorOrchestrator {
           ...(thinkingLevel ? { thinkingLevel } : {}),
           cwd: ctx.cwd,
           tools: resolvedToolNames,
-          customTools: [adviseTool],
+          customTools: [adviseTool, ...controlTools],
           resourceLoader,
         });
         advisor.session = created.session;
+        advisor.memory = installAdvisorContextWindow(created.session.agent, advisor.config.contextTokens);
         advisor.adviseState = adviseState;
         advisor.status = "running";
+        oldMemory.dispose();
         oldSession.dispose();
       } catch (err) {
         advisor.status = "error";
@@ -580,6 +604,22 @@ export class AdvisorOrchestrator {
     for (const advisor of this.#advisors) {
       if (advisor.disposed) continue;
       advisor.pendingMessages.push(message);
+    }
+  }
+
+  /**
+   * Stop-enabled advisors receive the call before its result. Flush only their
+   * collected transcript, with compact runtime metadata; do not block execution
+   * or grant fuller tool outputs. Other advisors retain the original cadence.
+   */
+  onToolStart(toolActivity: PrimaryToolActivity): void {
+    if (this.#paused) return;
+    for (const advisor of this.#advisors) {
+      if (advisor.disposed || !advisor.config.tools?.includes("request_stop")) continue;
+      const batch = [...(advisor.awaitingBatch ?? []), ...advisor.pendingMessages];
+      advisor.awaitingBatch = undefined;
+      advisor.pendingMessages = [];
+      this.#dispatch(advisor, batch, true, toolActivity);
     }
   }
 
@@ -621,8 +661,8 @@ export class AdvisorOrchestrator {
     }
   }
 
-  #dispatch(advisor: ActiveAdvisor, batch: AgentMessage[], wip: boolean): void {
-    advisor.queue.push({ batch, wip });
+  #dispatch(advisor: ActiveAdvisor, batch: AgentMessage[], wip: boolean, toolActivity?: PrimaryToolActivity): void {
+    advisor.queue.push({ batch, wip, toolActivity });
     void this.#drainAdvisor(advisor);
   }
 
@@ -637,13 +677,13 @@ export class AdvisorOrchestrator {
     advisor.draining = true;
     try {
       while (advisor.queue.length > 0 && !advisor.disposed && !this.#paused) {
-        const { batch, wip } = advisor.queue.shift()!;
+        const { batch, wip, toolActivity } = advisor.queue.shift()!;
         // Deliberately not logged: an advisor running behind the primary is the
         // normal steady state, not an error, and upstream reports it through a
         // file logger rather than the user's session. Writing it to stderr put
         // a line of noise in the transcript for something nobody can act on.
         // Backlog is surfaced via `/advisor status` instead.
-        await this.#sendBatch(advisor, batch, wip);
+        await this.#sendBatch(advisor, batch, wip, toolActivity);
       }
     } finally {
       advisor.draining = false;
@@ -657,25 +697,33 @@ export class AdvisorOrchestrator {
    * this port approximates that with a single blanket retry-without-thinking
    * rather than reproducing the refusal classifier itself).
    */
-  async #sendBatch(advisor: ActiveAdvisor, batch: AgentMessage[], wip: boolean): Promise<void> {
+  async #sendBatch(advisor: ActiveAdvisor, batch: AgentMessage[], wip: boolean, toolActivity?: PrimaryToolActivity): Promise<void> {
     // Per-batch latch: `attempt` runs a second time on the thinking-stripped
     // retry, and the update bookkeeping below must happen exactly once per
     // batch — resetting the emission guard twice would hand one batch two
     // accepted notes instead of upstream's one-per-update budget.
     let updateBegun = false;
-    const attempt = async (includeThinking: boolean): Promise<void> => {
-      const chunks = renderAdvisorDeltaMessages(batch, { wip, includeThinking });
-      if (!chunks) return;
+    const reviewSession = advisor.session;
+    const reviewState = advisor.adviseState;
+    const memory = advisor.memory;
+    const generation = advisor.generation;
+    const contextNotice = advisor.contextNotice;
+    const attempt = async (includeThinking: boolean): Promise<boolean> => {
+      const chunks = renderAdvisorDeltaMessages(batch, { wip, includeThinking }) ?? [];
+      if (toolActivity) {
+        const activity = `### Primary tool activity (runtime metadata)\n${JSON.stringify(toolActivity)}\nThis call entered the execution lifecycle; it may still be in preflight. No result yet. Check current_tool before any stop request; this snapshot may be stale.`;
+        if (chunks.length === 0) chunks.push({ role: "user", text: activity });
+        else chunks[chunks.length - 1]!.text += `\n\n${activity}`;
+      }
+      if (chunks.length === 0) return false;
       if (!updateBegun) {
         updateBegun = true;
-        // Guard budget is reset before AdviseState's, so a WIP→final flush of
-        // deferred notes is never measured against the previous update's
-        // already-spent budget. The guard now gates at the tool boundary, so
-        // the flush itself is no longer re-gated at all — each deferred note
-        // already spent the budget of the update it was raised in.
         advisor.emissionGuard.beginUpdate();
-        advisor.adviseState.beginUpdate(wip);
+        reviewState.beginUpdate(wip);
       }
+      if (contextNotice) chunks[chunks.length - 1]!.text += `\n\n### Observation context\n${contextNotice}`;
+      const pendingSummary = reviewState.pendingSummary();
+      if (pendingSummary) chunks[chunks.length - 1]!.text += `\n\n${pendingSummary}`;
       const messages: AgentMessage[] = chunks.map(c => ({
         role: "user",
         content: [{ type: "text", text: c.text }],
@@ -686,21 +734,34 @@ export class AdvisorOrchestrator {
       // `AgentMessage | AgentMessage[]` directly, which is what lets this
       // send upstream's real one-user-message-per-source-message split
       // instead of collapsing it back into one string.
-      await advisor.session.agent.prompt(messages);
+      const previousMessageCount = reviewSession.agent.state.messages.length;
+      let lastAssistant: AssistantMessage | undefined;
+      try {
+        await reviewSession.agent.prompt(messages);
+        lastAssistant = reviewSession.agent.state.messages.slice(previousMessageCount).reverse().find(message => message.role === "assistant") as AssistantMessage | undefined;
+      } finally {
+        // Model-input trimming also runs between investigative tool calls. Once
+        // the Agent settles, expire the same material from retained history.
+        memory.trimRetainedHistory();
+      }
+      if (memory.interrupted || this.#paused || advisor.disposed || advisor.generation !== generation) return false;
+      // Resolved does not necessarily mean completed: length limits, provider
+      // deferral, errors, and aborts can all resolve without a finished review.
+      if (lastAssistant?.stopReason !== "stop") {
+        throw new Error(lastAssistant?.errorMessage ?? `Advisor review did not complete (${lastAssistant?.stopReason ?? "no response"})`);
+      }
+      reviewState.finishUpdate();
+      if (advisor.contextNotice === contextNotice) advisor.contextNotice = undefined;
+      return true;
     };
     try {
-      await attempt(advisor.includeThinking);
-      advisor.status = "running";
+      if (await attempt(advisor.includeThinking)) advisor.status = "running";
     } catch (err) {
-      if (this.#paused || advisor.disposed) {
-        advisor.status = "running";
-        return;
-      }
+      if (this.#paused || advisor.disposed || advisor.generation !== generation) return;
       if (advisor.includeThinking) {
         advisor.includeThinking = false;
         try {
-          await attempt(false);
-          advisor.status = "running";
+          if (await attempt(false)) advisor.status = "running";
           return;
         } catch (retryErr) {
           advisor.status = "error";
@@ -727,27 +788,60 @@ export class AdvisorOrchestrator {
     this.#interruptImmuneTurnStart = this.#primaryTurnsCompleted + 1;
   }
 
-  /** Set on a deliberate user interrupt; cleared on a user-driven resume. Wired from index.ts. */
-  setAutoResumeSuppressed(value: boolean): void {
-    this.#autoResumeSuppressed = value;
-  }
-
   /** Headless/print-mode callers set this so advisor notes never start a hidden primary turn. */
   setPreserveOnly(value: boolean): void {
     this.#preserveOnly = value;
   }
 
-  #routeAdvice(sourceName: string | undefined, note: string, severity: AdvisorSeverity | undefined): void {
-    const interrupting = isInterruptingSeverity(severity);
-    const channel = resolveAdvisorDeliveryChannel({
+  #stopAccess(sourceName: string | undefined): PrimaryStopAccess {
+    const allowed = () => !this.#paused && this.#advisors.some(advisor =>
+      !advisor.disposed && advisor.sourceName === sourceName && advisor.config.tools?.includes("request_stop"),
+    );
+    return {
+      currentTool: () => allowed() ? this.#host.currentTool() : { status: "disabled", activeCount: 0 },
+      requestStop: (targetId, reason) => allowed()
+        ? this.#host.requestStop(sourceName, targetId, reason)
+        : { requested: false, status: "disabled", message: "This advisor is paused, disabled, or no longer active. No cancellation requested." },
+    };
+  }
+
+  #pendingAccess(sourceName: string | undefined): PendingAdviceAccess {
+    return {
+      list: () => [
+        ...this.#asideQueue.filter(note => note.advisor === sourceName).map(note => ({ ...note })),
+        ...this.#host.pendingAdvice(sourceName),
+      ],
+      revise: (adviceId, note) => {
+        const index = this.#asideQueue.findIndex(item => item.adviceId === adviceId && item.advisor === sourceName);
+        if (index < 0) return this.#host.reviseAdvice(sourceName, adviceId, note);
+        this.#asideQueue[index] = { ...this.#asideQueue[index]!, note, updatedAt: Date.now() };
+        return true;
+      },
+      withdraw: adviceId => {
+        const index = this.#asideQueue.findIndex(item => item.adviceId === adviceId && item.advisor === sourceName);
+        if (index < 0) return this.#host.withdrawAdvice(sourceName, adviceId);
+        this.#asideQueue.splice(index, 1);
+        return true;
+      },
+    };
+  }
+
+  #deliveryChannel(severity: AdvisorSeverity | undefined) {
+    const streaming = this.#host.isStreaming();
+    return resolveAdvisorDeliveryChannel({
       severity,
-      autoResumeSuppressed: this.#autoResumeSuppressed,
+      autoResumeSuppressed: this.#host.isAutoResumeSuppressed(),
       preserveOnly: this.#preserveOnly,
-      streaming: this.#host.isStreaming(),
+      streaming,
       aborting: this.#host.isAborting(),
-      terminalAnswerNoQueuedWork: this.#host.isStreaming() ? false : !this.#host.hasQueuedWork(),
-      interruptImmuneTurnActive: interrupting && this.#isImmuneTurnActive(),
+      terminalAnswerNoQueuedWork: !streaming && !this.#host.hasQueuedWork(),
+      interruptImmuneTurnActive: isInterruptingSeverity(severity) && this.#isImmuneTurnActive(),
     });
+  }
+
+  #routeAdvice(sourceName: string | undefined, advice: PendingAdvisorNote): void {
+    const { note, severity } = advice;
+    const channel = this.#deliveryChannel(severity);
 
     if (DEBUG) {
       console.error(
@@ -756,7 +850,7 @@ export class AdvisorOrchestrator {
       );
     }
 
-    const noteRecord: AdvisorNote = { note, severity, advisor: sourceName };
+    const noteRecord: PendingAdvisorNote = { ...advice, advisor: sourceName };
 
     if (this.#paused) {
       this.#host.preserveAdvice(noteRecord);
@@ -776,15 +870,23 @@ export class AdvisorOrchestrator {
     this.#host.sendCustom(content, { notes: [noteRecord] }, { deliverAs: "steer", triggerTurn: true });
   }
 
-  #enqueueAside(note: AdvisorNote): void {
+  #enqueueAside(note: PendingAdvisorNote): void {
     this.#asideQueue.push(note);
     if (this.#asideFlushScheduled) return;
     this.#asideFlushScheduled = true;
     queueMicrotask(() => {
       this.#asideFlushScheduled = false;
       if (this.#paused || this.#asideQueue.length === 0) return;
-      const notes = this.#asideQueue;
+      const queued = this.#asideQueue;
       this.#asideQueue = [];
+      // The primary can finish or be stopped after enqueue but before handoff.
+      // Recheck preservation without upgrading an aside into an interruption.
+      const notes = queued.filter(note => {
+        if (this.#deliveryChannel(note.severity) !== "preserve") return true;
+        this.#host.preserveAdvice(note);
+        return false;
+      });
+      if (notes.length === 0) return;
       const content = formatAdvisorBatchContent(notes);
       this.#host.sendCustom(content, { notes }, { deliverAs: "steer" });
     });

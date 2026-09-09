@@ -1,4 +1,5 @@
-import type { AdvisorNote } from "./advise-logic.ts";
+import { randomUUID } from "node:crypto";
+import type { AdvisorNote, PendingAdvisorNote } from "./advise-logic.ts";
 
 export interface QueuedAdvisorNote extends AdvisorNote {
   id: number;
@@ -18,9 +19,34 @@ export class AdvisorInbox {
   }
 
   enqueue(note: AdvisorNote): QueuedAdvisorNote {
-    const item = { ...note, id: this.#nextId++ };
+    const item = { ...note, adviceId: note.adviceId ?? randomUUID(), id: this.#nextId++ };
     this.#items.push(item);
     return item;
+  }
+
+  /** Resolve menu snapshots at handoff, so a withdrawn/revised note never leaks stale text. */
+  select(ids: Iterable<number>): QueuedAdvisorNote[] {
+    const wanted = new Set(ids);
+    return this.#items.filter(item => wanted.has(item.id)).map(item => ({ ...item }));
+  }
+
+  pendingFor(advisor: string | undefined): PendingAdvisorNote[] {
+    return this.#items
+      .filter((item): item is QueuedAdvisorNote & PendingAdvisorNote => item.advisor === advisor && typeof item.adviceId === "string")
+      .map(({ id: _id, ...note }) => ({ ...note }));
+  }
+
+  revise(advisor: string | undefined, adviceId: string, note: string): boolean {
+    if (!note.trim()) return false;
+    const index = this.#items.findIndex(item => item.adviceId === adviceId && item.advisor === advisor);
+    if (index < 0) return false;
+    this.#items[index] = { ...this.#items[index]!, note, updatedAt: Date.now() };
+    return true;
+  }
+
+  withdraw(advisor: string | undefined, adviceId: string): boolean {
+    const item = this.#items.find(item => item.adviceId === adviceId && item.advisor === advisor);
+    return item ? this.dismiss(item.id) : false;
   }
 
   dismiss(id: number): boolean {
@@ -38,7 +64,7 @@ export class AdvisorInbox {
   }
 
   restore(items: readonly QueuedAdvisorNote[]): void {
-    this.#items = items.map(item => ({ ...item }));
+    this.#items = items.map(item => ({ ...item, adviceId: item.adviceId ?? randomUUID() }));
     this.#nextId = Math.max(0, ...items.map(item => item.id)) + 1;
   }
 

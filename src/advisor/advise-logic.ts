@@ -1,11 +1,11 @@
 /**
  * Ported from oh-my-pi `src/advisor/advise-tool.ts` (npm
  * `@oh-my-pi/pi-coding-agent@17.4.1`) — the pure, framework-agnostic
- * functions and the `AdviseTool`-equivalent state machine. Logic is
- * unchanged from upstream; only omp-internal type imports
- * (`@oh-my-pi/omptype`, `@oh-my-pi/pi-agent-core`, `@oh-my-pi/pi-utils`) are
- * replaced with local equivalents. See ../../PROVENANCE.md.
+ * functions and the `AdviseTool`-equivalent state machine. The port adds
+ * editable pending advice and releases deferred notes after review rather
+ * than before it. See ../../PROVENANCE.md.
  */
+import { randomUUID } from "node:crypto";
 
 export type AdvisorSeverity = "nit" | "concern" | "blocker";
 
@@ -21,6 +21,21 @@ export interface AdvisorNote {
   note: string;
   severity?: AdvisorSeverity;
   advisor?: string;
+  /** Stable receipt shared by deferred advice and the preserved inbox. */
+  adviceId?: string;
+  createdAt?: number;
+  updatedAt?: number;
+}
+
+export interface PendingAdvisorNote extends AdvisorNote {
+  adviceId: string;
+}
+
+/** Scoped by the host to one advisor; handed-off or removed IDs cannot be edited. */
+export interface PendingAdviceAccess {
+  list(): PendingAdvisorNote[];
+  revise(adviceId: string, note: string): boolean;
+  withdraw(adviceId: string): boolean;
 }
 
 function escapeXmlAttribute(value: string): string {
@@ -89,12 +104,12 @@ export function isAdvisorInterruptImmuneTurnActive(opts: {
  *
  * - A `preserveOnly` caller records every note that arrives while the
  *   primary is idle as a visible card and never starts a new primary turn.
- * - A non-interrupting `nit` always rides the non-interrupting aside queue.
+ * - During active work, a non-interrupting `nit` rides the aside queue.
  * - An interrupting `concern`/`blocker` is normally steered into the agent:
  *   into the live turn while one is streaming, or (when idle) a triggered
  *   turn so the advice is acted on immediately.
  * - If the primary tail is already a terminal text answer and there is no
- *   queued work, a late `concern` is preserved as a visible card instead of
+ *   queued work, a late `nit` or `concern` stays in the dismissible inbox instead of
  *   waking the primary to restate completion. A `blocker` is the exception:
  *   it means the agent handed off broken or unexercised work, so it still
  *   steers a triggered turn to force the primary to acknowledge and
@@ -123,11 +138,10 @@ export function resolveAdvisorDeliveryChannel(opts: {
   interruptImmuneTurnActive?: boolean;
   preserveOnly?: boolean;
 }): AdvisorDeliveryChannel {
-  if (opts.preserveOnly && !opts.streaming) return "preserve";
+  if (opts.aborting || (opts.preserveOnly && !opts.streaming)) return "preserve";
+  if (opts.autoResumeSuppressed && !opts.streaming) return "preserve";
+  if (opts.terminalAnswerNoQueuedWork && opts.severity !== "blocker" && !opts.streaming) return "preserve";
   if (!isInterruptingSeverity(opts.severity)) return "aside";
-  if (opts.autoResumeSuppressed && (opts.aborting || !opts.streaming)) return "preserve";
-  if (opts.terminalAnswerNoQueuedWork && opts.severity !== "blocker" && !opts.streaming && !opts.aborting)
-    return "preserve";
   if (opts.interruptImmuneTurnActive && opts.severity !== "blocker") return "aside";
   return "steer";
 }
@@ -171,84 +185,142 @@ export function advisorSeverityRank(severity: AdvisorSeverity | undefined): numb
  * registration/schema and calls into this.
  */
 export class AdviseState {
-  /**
-   * Highest delivered severity rank per normalized note. A new call passes
-   * through only when its rank strictly exceeds the recorded one (a real
-   * escalation: nit → concern → blocker), so an advisor cannot bypass
-   * dedupe by retagging the same text at a lower or equal severity.
-   */
   #deliveredNoteSeverities = new Map<string, number>();
   #inProgressUpdate = false;
-  /**
-   * Notes withheld while the primary was mid-turn, in arrival order.
-   * Flushed deterministically on the first `beginUpdate(false)` so delivery
-   * does not depend on the advisor model choosing to re-raise (it may not,
-   * since the tool previously returned "Recorded." for a note that was
-   * never routed). Cleared on `resetDeliveredNotes` alongside the
-   * delivered-rank map.
-   */
-  #deferredNotes: { key: string; note: string; severity?: AdvisorSeverity }[] = [];
+  #reviewing = false;
+  #deferredNotes: PendingAdvisorNote[] = [];
 
-  constructor(private readonly onAdvice: (note: string, severity: AdvisorSeverity | undefined) => void) {}
+  constructor(
+    private readonly onAdvice: (note: PendingAdvisorNote) => void,
+    private readonly pendingAccess?: PendingAdviceAccess,
+  ) {}
 
-  /**
-   * Mark whether the next advisor prompt reviews an in-progress primary
-   * turn. Non-blockers are withheld until a completed update so partial
-   * work does not interrupt the primary before it can finish its planned
-   * steps.
-   */
+  /** Begin review without releasing older notes before the model sees the update. */
   beginUpdate(inProgress: boolean): void {
-    const wasInProgress = this.#inProgressUpdate;
     this.#inProgressUpdate = inProgress;
-    if (wasInProgress && !inProgress && this.#deferredNotes.length > 0) {
-      const pending = this.#deferredNotes;
-      this.#deferredNotes = [];
-      for (const { note, severity } of pending) this.#deliver(note, severity);
+    this.#reviewing = true;
+  }
+
+  /** Release remaining deferred notes only after a successful final-update review. */
+  finishUpdate(): void {
+    this.#reviewing = false;
+    if (this.#inProgressUpdate) return;
+    // Remove each note after successful routing so a throwing host does not
+    // silently lose the remainder. An unsuccessful review never calls this.
+    while (this.#deferredNotes.length > 0) {
+      this.#deliver(this.#deferredNotes[0]!);
+      this.#deferredNotes.shift();
     }
   }
 
-  /** Clear delivered-note memory when the advisor starts a fresh conversation. */
+  /** Copies, not live records. External pending advice is scoped by the host. */
+  pendingAdvice(): (PendingAdvisorNote & { status: "deferred" | "queued" })[] {
+    return [
+      ...this.#deferredNotes.map(note => ({ ...note, status: "deferred" as const })),
+      ...(this.pendingAccess?.list() ?? []).map(note => ({ ...note, status: "queued" as const })),
+    ];
+  }
+
+  /** Replace content, not urgency; revisions neither create notes nor spend a new-note slot. */
+  revise(adviceId: string, note: string): { changed: boolean; text: string } {
+    if (!note.trim()) return { changed: false, text: "An empty revision is not advice. Use withdraw_advice to remove it." };
+    const pending = this.#deferredNotes.find(item => item.adviceId === adviceId);
+    if (pending) {
+      pending.note = note;
+      pending.updatedAt = Date.now();
+      return { changed: true, text: `Updated pending advice ${adviceId}.` };
+    }
+    const queued = this.pendingAccess?.list().find(item => item.adviceId === adviceId);
+    if (queued && this.pendingAccess!.revise(adviceId, note)) {
+      // This note was already routed to a queue. Its new text belongs in the
+      // delivered history too, even if the user later dismisses that queue item.
+      const key = advisorNoteDedupeKey(note);
+      this.#deliveredNoteSeverities.set(key, Math.max(
+        this.#deliveredNoteSeverities.get(key) ?? 0, advisorSeverityRank(queued.severity),
+      ));
+      return { changed: true, text: `Updated queued advice ${adviceId}.` };
+    }
+    return this.#notPending();
+  }
+
+  withdraw(adviceId: string): { changed: boolean; text: string } {
+    const index = this.#deferredNotes.findIndex(item => item.adviceId === adviceId);
+    if (index >= 0) {
+      this.#deferredNotes.splice(index, 1);
+      return { changed: true, text: `Withdrew pending advice ${adviceId}.` };
+    }
+    if (this.pendingAccess?.withdraw(adviceId)) {
+      return { changed: true, text: `Withdrew queued advice ${adviceId}.` };
+    }
+    return this.#notPending();
+  }
+
+  #notPending(): { changed: false; text: string } {
+    return {
+      changed: false,
+      text: "No editable advice with that ID. It may have been handed to Pi or removed; nothing was changed. Handed-off messages cannot be recalled.",
+    };
+  }
+
+  /** A bounded reminder, not another transcript or an instruction to always comment. */
+  pendingSummary(): string | undefined {
+    const pending = this.pendingAdvice();
+    if (pending.length === 0) return undefined;
+    const lines = pending.slice(0, 3).map(item => {
+      const preview = item.note.replace(/\s+/g, " ").slice(0, 180);
+      const age = item.createdAt === undefined ? "" : `, ${Math.max(0, Math.floor((Date.now() - item.createdAt) / 1000))}s old`;
+      return `${item.adviceId} (${item.severity ?? "nit"}, ${item.status}${age}): ${JSON.stringify(preview)}`;
+    });
+    return [
+      "### Your pending advice",
+      ...lines,
+      ...(pending.length > lines.length ? [`${pending.length - lines.length} more; pending_advice lists them.`] : []),
+      "These are still editable. New evidence may resolve an earlier concern; revise_advice or withdraw_advice can update it before handoff.",
+    ].join("\n");
+  }
+
+  /** Clear per-session state at a genuine conversation reset. */
   resetDeliveredNotes(): void {
     this.#deliveredNoteSeverities.clear();
     this.#inProgressUpdate = false;
+    this.#reviewing = false;
     this.#deferredNotes = [];
   }
 
-  /**
-   * Handle one `advise()` call. Returns the tool-result text plus whether
-   * the note was actually delivered (routed to `onAdvice`).
-   */
-  submit(note: string, severity: AdvisorSeverity | undefined): { text: string; delivered: boolean } {
-    if (this.#inProgressUpdate && severity !== "blocker") {
-      const key = advisorNoteDedupeKey(note);
-      const pending = this.#deferredNotes.find(item => item.key === key);
-      if (!pending) {
-        this.#deferredNotes.push({ key, note, severity });
-      } else if (advisorSeverityRank(severity) > advisorSeverityRank(pending.severity)) {
-        pending.severity = severity;
-      }
+  /** Returns an ID only for accepted advice, whether deferred or routed to the host. */
+  submit(note: string, severity: AdvisorSeverity | undefined): { text: string; delivered: boolean; adviceId?: string } {
+    const key = advisorNoteDedupeKey(note);
+    if ((this.#deliveredNoteSeverities.get(key) ?? 0) >= advisorSeverityRank(severity)) {
+      return { text: "Duplicate advice ignored.", delivered: false };
+    }
+    const existing = this.#deferredNotes.find(item => advisorNoteDedupeKey(item.note) === key);
+    const now = Date.now();
+    const record: PendingAdvisorNote = existing ?? { adviceId: randomUUID(), note, severity, createdAt: now, updatedAt: now };
+    if (existing && advisorSeverityRank(severity) > advisorSeverityRank(existing.severity)) existing.severity = severity;
+
+    if ((this.#inProgressUpdate || this.#reviewing) && severity !== "blocker") {
+      if (!existing) this.#deferredNotes.push(record);
       return {
-        text: "Deferred — primary is mid-turn; this note will be delivered automatically when the turn completes. Do not re-raise the same point.",
+        text: `Deferred advice ${record.adviceId}. It remains editable with revise_advice or withdraw_advice until released after a successful final-update review.`,
         delivered: false,
+        adviceId: record.adviceId,
       };
     }
-    const delivered = this.#deliver(note, severity);
-    return { text: delivered ? "Recorded." : "Duplicate advice ignored.", delivered };
+    const delivered = this.#deliver(record);
+    if (existing && delivered) this.#deferredNotes = this.#deferredNotes.filter(item => item !== existing);
+    return {
+      text: delivered ? `Recorded advice ${record.adviceId}. pending_advice shows whether it is still editable; handed-off messages cannot be recalled.` : "Duplicate advice ignored.",
+      delivered,
+      ...(delivered ? { adviceId: record.adviceId } : {}),
+    };
   }
 
-  /**
-   * Run one note through the escalation-rank dedupe and, if it passes,
-   * route it to the primary. Returns true when the note was actually
-   * delivered. Shared by the live path (`submit`) and the deferred flush
-   * (`beginUpdate(false)`).
-   */
-  #deliver(note: string, severity: AdvisorSeverity | undefined): boolean {
-    const key = advisorNoteDedupeKey(note);
-    const rank = advisorSeverityRank(severity);
-    const previousRank = this.#deliveredNoteSeverities.get(key) ?? 0;
-    if (rank <= previousRank) return false;
+  #deliver(note: PendingAdvisorNote): boolean {
+    const key = advisorNoteDedupeKey(note.note);
+    const rank = advisorSeverityRank(note.severity);
+    if (rank <= (this.#deliveredNoteSeverities.get(key) ?? 0)) return false;
+    this.onAdvice({ ...note });
     this.#deliveredNoteSeverities.set(key, rank);
-    this.onAdvice(note, severity);
     return true;
   }
 }

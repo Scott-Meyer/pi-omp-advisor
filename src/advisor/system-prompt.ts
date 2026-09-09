@@ -1,5 +1,5 @@
 /**
- * Assembles one advisor's system prompt from the byte-identical upstream
+ * Assembles one advisor's system prompt from the upstream-derived
  * prompt fragments (npm `@oh-my-pi/pi-coding-agent@17.4.1`,
  * `src/prompts/advisor/*.md`) plus config-driven additions. Ported template
  * substitution from `src/advisor/watchdog.ts`'s `formatActiveRepoWatchdogPrompt`
@@ -18,7 +18,7 @@ async function readPrompt(name: string): Promise<string> {
 
 /** `{{relativeRepoRoot}}` substitution for active-repo-watchdog.md. */
 function renderActiveRepoWatchdogPrompt(template: string, relativeRepoRoot: string): string {
-  return template.replaceAll("{{relativeRepoRoot}}", relativeRepoRoot).trim();
+  return template.replaceAll("{{relativeRepoRoot}}", () => relativeRepoRoot).trim();
 }
 
 /** `{{#each contextFiles}}...{{/each}}` substitution for context-files.md. */
@@ -28,9 +28,9 @@ function renderContextFilesPrompt(template: string, contextFiles: readonly { pat
   if (!match) return template.trim();
   const [whole, itemTemplate] = match;
   const rendered = contextFiles
-    .map(file => itemTemplate.replaceAll("{{path}}", file.path).replaceAll("{{content}}", file.content))
+    .map(file => itemTemplate.replaceAll("{{path}}", () => file.path).replaceAll("{{content}}", () => file.content))
     .join("");
-  return template.replace(whole, rendered).trim() || undefined;
+  return template.replace(whole, () => rendered).trim() || undefined;
 }
 
 /**
@@ -75,7 +75,7 @@ export interface BuildAdvisorSystemPromptOptions {
 }
 
 /**
- * Build one advisor's full system prompt: upstream `system.md` verbatim,
+ * Build one advisor's full system prompt: bundled `system.md`,
  * then (if applicable) the active-repo-watchdog attention block, then
  * project context files, then any discovered `WATCHDOG.md` attention
  * blocks, then shared + per-advisor instructions.

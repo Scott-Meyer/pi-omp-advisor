@@ -1,9 +1,8 @@
 /**
  * Ported from oh-my-pi `src/advisor/emission-guard.ts` (npm
- * `@oh-my-pi/pi-coding-agent@17.4.1`). Framework-agnostic — no changes
- * needed for pi; copied near-verbatim (comments trimmed of omp-internal
- * issue-tracker references where they'd be misleading out of context, logic
- * untouched). See ../../PROVENANCE.md.
+ * `@oh-my-pi/pi-coding-agent@17.4.1`). The filter and new-note allowance
+ * follow upstream; pending-note revisions also register replacement text in
+ * duplicate history without consuming that allowance. See ../../PROVENANCE.md.
  *
  * Per-session policy gate for advisor `advise()` calls.
  *
@@ -20,11 +19,9 @@
  * `enqueueAdvice` boundary so the primary stays clean even when the advisor
  * misbehaves.
  *
- * The gate is intentionally invisible to the advisor model — the `advise`
- * tool still returns "Recorded." for a suppressed call. Surfacing
- * "suppressed" back into advisor context risks the model rephrasing the
- * same useless note to bypass the dedupe ("Stop.", then "Halt.", then "Stop
- * now.").
+ * The tool does not expose the specific rejection reason: that can encourage
+ * rephrasing the same useless note to bypass the filter. A rejected submission
+ * gets a generic no-new-advice acknowledgment, with no editable receipt ID.
  */
 
 /**
@@ -114,8 +111,8 @@ const DEFAULT_HISTORY_CAPACITY = 4096;
  * never consume the per-update budget — a noise call doesn't burn the slot
  * for a real concern that follows in the same update.
  *
- * Reset on advisor reset (compaction, session switch, `/new`) via
- * {@link AdvisorEmissionGuard.reset}. Per-update gate is cleared at the
+ * Retained across within-session context rebuilds; a new advisor session gets
+ * a fresh guard. Per-update gate is cleared at the
  * start of every advisor prompt cycle via {@link AdvisorEmissionGuard.beginUpdate}.
  */
 export class AdvisorEmissionGuard {
@@ -130,11 +127,8 @@ export class AdvisorEmissionGuard {
   }
 
   /**
-   * Drop all dedupe and per-update state. Called whenever the advisor
-   * runtime is reset at a conversation boundary (`/new`, branch, session
-   * switch) — same boundary as clearing the aside/preserve queues — so a
-   * re-primed advisor can re-raise old issues (the primary transcript was
-   * rewritten).
+   * Drop all dedupe and per-update state when deliberately resetting the
+   * advisor's conversation. A mere model-context rebuild retains this guard.
    */
   reset(): void {
     this.#seen.clear();
@@ -167,12 +161,19 @@ export class AdvisorEmissionGuard {
     if (this.#seen.has(key)) return false;
     if (this.#consumedThisUpdate) return false;
     this.#consumedThisUpdate = true;
+    this.remember(note);
+    return true;
+  }
+
+  /** Remember a successful revision without consuming the new-note allowance. */
+  remember(note: string): void {
+    const key = normalizeAdvisorNote(note);
+    if (!key || this.#seen.has(key)) return;
     this.#seen.add(key);
     this.#seenOrder.push(key);
     if (this.#seenOrder.length > this.#capacity) {
       const stale = this.#seenOrder.shift();
       if (stale !== undefined) this.#seen.delete(stale);
     }
-    return true;
   }
 }

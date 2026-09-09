@@ -8,25 +8,19 @@ public git tags checked for this version — pinned by the exact npm package
 version installed at port time). License: MIT, Copyright (c) 2025 Mario
 Zechner, (c) 2025-2026 Can Bölük, (c) 2026 Stencil Labs, Inc. — see `LICENSE`.
 
-The following files are byte-identical copies of upstream source. They are copied
-rather than paraphrased deliberately: an advisor's behavior is a function of its
-exact prompt wording, so a rewrite would be a different system, not a port.
-Verified per file (`ATTRIBUTION.md` in this directory is ours, so a recursive
-`diff -r` of the whole directory intentionally reports it as extra):
-
-```sh
-for f in system advise-tool active-repo-watchdog context-files; do
-  diff "src/prompts/$f.md" "<upstream>/src/prompts/advisor/$f.md"
-done   # no output
-```
-
+The following prompt files were copied from upstream. `advise-tool.md` remains
+byte-identical. The other three now have small, explicit changes: limited-view
+and pending-advice context, a clarification of the peer role and user intent,
+and a repository hint that no longer claims more than its detector establishes.
+Their OMP structure and most wording are retained; this is not a wholesale persona
+rewrite. See `src/prompts/ATTRIBUTION.md` for copyright attribution.
 
 - `src/prompts/system.md` ← `src/prompts/advisor/system.md`
 - `src/prompts/advise-tool.md` ← `src/prompts/advisor/advise-tool.md`
 - `src/prompts/active-repo-watchdog.md` ← `src/prompts/advisor/active-repo-watchdog.md`
 - `src/prompts/context-files.md` ← `src/prompts/advisor/context-files.md`
 
-The following files are ports: same algorithm/behavior, rewritten against
+The following files are ports, with the deviations below, rewritten against
 pi's SDK types and primitives (`@earendil-works/pi-coding-agent`,
 `@earendil-works/pi-agent-core`, `@earendil-works/pi-ai`) instead of omp's
 internal packages (`@oh-my-pi/omptype`, `@oh-my-pi/pi-agent-core`,
@@ -66,7 +60,9 @@ copyright Scott Meyer, MIT (see `LICENSE`):
   `src/advisor/serialized-transition.ts`, and `src/index.ts`
 - `src/advisor-command.test.ts`, `src/advisor/config-roundtrip.test.ts`,
   `src/advisor/advisor-inbox.test.ts`, `src/advisor/advisor-message.test.ts`,
-  and `src/advisor/serialized-transition.test.ts` (not shipped in the npm tarball)
+  `src/advisor/serialized-transition.test.ts`, `src/advisor/pending-advice.test.ts`,
+  `src/advisor/orchestrator.test.ts`, and `src/advisor/system-prompt.test.ts`
+  (not shipped in the npm tarball)
 
 ## Known deviations from upstream (documented, not silent)
 
@@ -95,7 +91,9 @@ copyright Scott Meyer, MIT (see `LICENSE`):
    non-context session entry so reloads do not discard it. Uncancelled notes are
    appended immediately during `input`, before
    pi records the submitted user message, preserving card-above-prompt ordering
-   without forcing a turn.
+   without forcing a turn. Late ordinary notes, including nits, take this inbox
+   path before aside routing. A queued aside is checked again before handoff in
+   case the primary has completed or been stopped in the meantime.
 3. **Multi-message delta chunking** (omp's `delta-split.ts`, built for
    provider prompt-cache locality) IS ported (`src/advisor/delta-render.ts`,
    `renderAdvisorDeltaMessages`): each batch is split into one user message
@@ -107,8 +105,8 @@ copyright Scott Meyer, MIT (see `LICENSE`):
    message-boundary shape matches upstream.
 4. **Session-file transcript recording** (omp's `AdvisorTranscriptRecorder`,
    `__advisor.jsonl`, its own stats/usage system) has no pi equivalent and is
-   not ported — pi has its own session/transcript persistence that already
-   captures the advisor's live `AgentSession` messages.
+   not ported. Advisor sessions are in-memory; their full transcript and tool
+   log are not exposed or persisted by this extension.
 5. **Cursor-specific exec-channel tool bridging** (`CursorExecHandlers`,
    `bridgeToolMap`) is omp/Cursor-specific plumbing with no pi analog and is
    not ported.
@@ -151,12 +149,57 @@ copyright Scott Meyer, MIT (see `LICENSE`):
    `customType`. This port keeps pi's supported custom-message channel (the same
    channel used by asynchronous pi-intercom messages) and adds primary-system
    context identifying `<advisory>` messages as AI-advisor output, not
-   user-authored text. A second narrowly describes late-completion placement: a
-   response triggered after a completed answer should stand alone because it may
-   scroll that unread answer out of view. Neither dictates whether to accept the
+   user-authored text. It also describes the condensed, potentially delayed
+   view and late-completion placement: a response triggered after a completed
+   answer should stand alone because it may scroll that unread answer out of
+   view. This does not dictate whether to accept the
    advisor's technical claim. The TUI presentation also now diverges from
    upstream's collapsing rail: it is a full-width bordered card that never hides
    notes.
+11. **Editable pending advice.** `pending_advice`, `revise_advice`, and
+   `withdraw_advice` operate on this advisor's deferred notes and extension-held
+   queues only. Stable receipts and timestamps follow preserved notes into the
+   inbox; revision keeps urgency unchanged. Deferred notes flush after successful
+   final-update review, not before the model sees that update. Errors/aborts do
+   not flush them. Within-session context rebuilds retain the state and pending
+   IDs; a full reload retains only the persisted inbox. Tool feedback distinguishes
+   queued advice from a rejected new submission without inventing delivery.
+   Successful revisions register replacement text in duplicate tracking without
+   consuming the new-note allowance. No new investigative tools or fuller primary transcript are granted.
+12. **Prompt assembly and history-gap cues.** Dynamic template substitutions use
+   callbacks so literal `$&`, `$$`, and similar text in project instructions are
+   preserved. Brief startup/reset/resume cues describe missing history rather
+   than replaying it. The primary is told the advisor's digest may lag reality.
+13. **Explicit emergency-stop grant.** A `request_stop` tool grant adds
+   `current_tool` and `request_stop`, backed by the primary's supported
+   `ctx.abort()`. Because Pi cancels a whole active turn, the controller accepts
+   only a sole foreground call with an exact per-execution target token and a
+   recorded reason. It does not control detached jobs, roll back effects, or
+   restart the primary. A stop-enabled advisor receives compact tool-start
+   metadata before results; other advisors retain the original batch cadence.
+   `src/advisor/primary-stop.ts`, `stop-tools.ts`, and `primary-stop.test.ts`
+   are original to this project (Scott Meyer, MIT), not OMP features.
+14. **Bounded advisor model context.** `contextTokens` defaults to 32,000
+   estimated input tokens per advisor; `includePrimaryThinking` defaults to false.
+   A public `Agent.transformContext` hook applies the rolling window before every
+   model request, including investigative tool follow-ups. Retained Agent history
+   is trimmed after a review settles. Older context expires without a summary;
+   pending-note state remains separate. Originals and their shortened forms share
+   expiration state. Tool-call/result groups are evicted together, oversized
+   user/tool text is explicitly shortened, and an exchange
+   that cannot fit without altering assistant calls fails the review. Fixed
+   system/tool overhead and model headroom reduce the available history budget.
+   The character-based estimate is not an exact model-token guarantee.
+   `src/advisor/context-window.ts` and its tests are original to this project
+   (Scott Meyer, MIT); this deliberately changes OMP's observation-retention policy.
+15. **Primary-run interruption latch.** The public `agent_start` event supplies
+   `ctx.signal`, the primary Agent's AbortSignal. Observing its abort catches the
+   streaming-run Escape path without intercepting keys. A primary-owned latch
+   survives signal cleanup and advisor reconstruction, preventing late advice
+   from restarting the stopped run. Normal interactive/RPC prompts clear it;
+   extension-generated inputs do not. This does not observe separate retry or
+   compaction cancellation signals. `src/advisor/primary-interruption.ts` and
+   its tests are original to this project (Scott Meyer, MIT).
 
 ## Corrections made after the initial port
 
@@ -239,11 +282,12 @@ never executed before this):
   marking all N delivered while routing one. The guard now gates at the
   `advise` tool-call boundary (`src/advisor/advise-tool.ts`), which is what
   `emission-guard.ts`'s own docs describe as upstream's `enqueueAdvice`
-  boundary, and returns the same invisible `"Recorded."` on suppression.
+  boundary. Filtered submissions now return a short no-new-advice acknowledgment
+  without a receipt ID, rather than claiming an editable record exists.
 - **Per-update budget reset ordering.** `emissionGuard.beginUpdate()` ran
-  *after* `adviseState.beginUpdate(wip)`, whose WIP→final transition
-  synchronously flushes deferred notes — so the flush was judged against the
-  previous update's already-spent budget. Guard resets first now.
+  *after* `adviseState.beginUpdate(wip)`, whose WIP→final transition originally
+  flushed deferred notes — so the flush was judged against the previous update's
+  already-spent budget. Guard resets first; flushing now occurs after review.
 - **Retry reopening the budget.** Both `beginUpdate` calls sat inside
   `#sendBatch`'s `attempt` closure, which runs a second time on the
   thinking-stripped retry, granting one batch two accepted notes. Now latched

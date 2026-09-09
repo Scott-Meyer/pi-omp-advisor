@@ -179,7 +179,7 @@ Zero advisor messages there is *expected* in print mode and does not mean
 delivery failed. (Chasing that signal is what made a totally inert advisor look
 like five different bugs.)
 
-For an inbox/UI change, also test interactively: force a late `concern`, verify
+For an inbox/UI change, also test interactively: force a late `nit` or `concern`, verify
 the widget appears above the editor, open it with `Ctrl+Shift+A`, dismiss one
 note, then submit a normal prompt and verify every remaining advisor card renders
 above that user message. Pause with `Ctrl+Shift+R`, submit a prompt, and verify
@@ -215,6 +215,58 @@ roster is discovered and the orchestrator stays inactive. Compare like with
 like: the same prompt both times. A trivial prompt ("say ok") does not exercise
 the advisor at all and will pass even when something is badly broken.
 
+## Late-delivery and interruption checks
+
+Routing tests cover ordinary late notes, active-run delivery, and the blocker
+exception after natural completion. Orchestrator regressions read, dismiss, and
+clear real pending notes; hold the microtask handoff across completion/abort; and
+use a real SDK Agent abort to verify that a newly built advisor cannot restart a
+stopped primary after its signal disappears. A normal user resume restores the
+existing blocker behavior.
+
+These are not keyboard-automation tests. After reloading, separately exercise
+Escape during a primary run and a delayed advisory. The latch observes the
+Agent's public abort signal, not Escape used to close an editor/menu or cancel
+Pi's separate retry/compaction operations.
+
+## Bounded-context checks
+
+The advisor's memory budget applies at the public `Agent.transformContext` hook,
+not just at the incoming observation queue. `context-window.test.ts` uses a real
+SDK Agent with a controlled stream to inspect the next model request after a
+large investigative result. It also checks expiration, explicit shortening,
+complete tool exchanges, model headroom, failed partial-call recovery, and real
+parallel/sequential multi-call interruption. Request assertions run outside the
+SDK callback, where the SDK cannot swallow them as model errors; the orchestrator
+fixture also records callback assertion failures and fails its test afterward.
+Alias regressions alternate raw and shortened histories and exercise a context
+hook that evicts a shortened exchange. Revision regressions verify duplicate
+tracking and the new-note allowance before and after advisor reconstruction.
+
+The orchestrator tests load actual YAML, exercise the primary-reasoning default
+and opt-in, and verify that pending advice survives history eviction. These are
+mechanical checks, not proof that a smaller context improves model judgment.
+After `/reload`, inspect `/advisor status` and the config controls; use normal
+cooperative work to judge whether the advisor remains useful with the narrower
+view. No prior primary reasoning should be replayed merely to fill the budget.
+
+## Live cancellation check
+
+After `/reload`, confirm the advisor has the explicit `request_stop` grant.
+Agree on a harmless foreground sleep and ask the advisor to inspect `current_tool`
+and request cancellation of that exact `targetId` with a diagnostic reason.
+Leave a short tool boundary before the sleep so the agreement can reach it.
+The stop-enabled observer also receives the sleep's tool-start update.
+
+Look for the visible request reason, the real tool's abort result before its
+sleep finishes, and the runtime stop receipt. No note or claim by either model
+alone establishes that cancellation succeeded. Do not substitute a detached
+background sleep: this capability cancels the current primary turn, not detached
+jobs. A fallback timeout should be recorded separately from advisor cancellation.
+
+`primary-stop.test.ts` checks the scope guards and cancels a real SDK bash sleep;
+that protects the mechanics but does not replace this two-model session test.
+
 ## Traps already hit here
 
 - **`createAgentSession`'s `tools` option is an ALLOWLIST, not an additive
@@ -236,10 +288,21 @@ the advisor at all and will pass even when something is badly broken.
   telemetry timers — inside a throwaway watcher context. That is what made
   headless pi hang forever instead of exiting: nested MCP child processes kept
   the event loop alive past teardown.
-- **The emission guard must gate at the tool-call boundary**, not inside the
-  orchestrator's delivery callback. `AdviseState.#deliver` records a note as
-  delivered *before* invoking the callback, so gating downstream marks notes
-  delivered that were never routed and permanently dedupe-blocks them.
+- **The emission guard gates new notes at the tool-call boundary**, not during
+  a deferred flush. Each deferred note already spent its update's budget;
+  applying a fresh one-note budget to a batch would silently discard the rest.
+  Revisions edit a held note and do not create a new one.
+- **Review before release.** `beginUpdate` leaves deferred advice editable.
+  Only a completed final review calls `finishUpdate`; truncated/deferred
+  responses, errors, pauses, and stale runtime generations cannot flush it.
+  Context rebuilds reuse the pending state. Reviews call `Agent.prompt`
+  directly, so cancellation uses `Agent.abort` and `Agent.waitForIdle` too;
+  the `AgentSession` wrapper's separate streaming flag does not track that run.
+  The deterministic session-boundary tests in `orchestrator.test.ts` exercise
+  actual tool registration and delivery without a live provider.
+- **Handoff is the recall boundary, not model consumption.** Pending tools can
+  edit extension-held notes only. Resolve inbox menu snapshots against current
+  IDs just before sending, so revisions and withdrawals cannot leak stale text.
 - **Upstream defaults are in `settings-schema.ts`, not in prose.** Two were
   silently wrong here: `advisor.syncBacklog` defaults to `off` (this port had it
   hardcoded on at threshold 3) and `advisor.immuneTurns` defaults to `3` (this
