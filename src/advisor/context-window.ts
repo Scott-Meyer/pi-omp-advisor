@@ -2,7 +2,7 @@ import type { Agent, AgentMessage } from "@earendil-works/pi-agent-core";
 import { estimateTokens } from "@earendil-works/pi-coding-agent";
 import type { ToolResultMessage, UserMessage } from "@earendil-works/pi-ai";
 
-export const DEFAULT_ADVISOR_CONTEXT_TOKENS = 32_000;
+export const DEFAULT_ADVISOR_CONTEXT_TOKENS = 100_000;
 export const MIN_ADVISOR_CONTEXT_TOKENS = 2_048;
 
 const OMISSION = "\n[Content omitted by the advisor context budget.]\n";

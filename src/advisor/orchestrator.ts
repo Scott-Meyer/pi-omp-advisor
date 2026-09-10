@@ -44,8 +44,8 @@ import { SerializedTransition } from "./serialized-transition.ts";
 import { installAdvisorContextWindow, type ContextWindowStatus } from "./context-window.ts";
 import { ADVISOR_STOP_TOOLS } from "./stop-tools.ts";
 import type { CurrentToolResult, PrimaryStopAccess, PrimaryToolActivity, StopRequestResult } from "./primary-stop.ts";
-import type { AdvisorConfig } from "./watchdog-config.ts";
-import { discoverWatchdogFiles } from "./watchdog-config.ts";
+import type { AdvisorConfig, SyncBacklogConfig } from "./watchdog-config.ts";
+import { discoverWatchdogFiles, normalizeSyncBacklog } from "./watchdog-config.ts";
 import { buildAdvisorSystemPrompt } from "./system-prompt.ts";
 
 /**
@@ -196,7 +196,7 @@ export class AdvisorOrchestrator {
    *  `<advisory>` block. */
   #asideQueue: PendingAdvisorNote[] = [];
   #asideFlushScheduled = false;
-  #syncBacklog: number | "off" = BACKLOG_CATCHUP_DEFAULT;
+  #syncBacklog: SyncBacklogConfig = BACKLOG_CATCHUP_DEFAULT;
   #immuneTurns: number = ADVISOR_IMMUNE_TURNS_DEFAULT;
   /** Advisors skipped because their explicit `model:` did not resolve, kept so
    *  `/advisor status` reports `no_model` rather than hiding them entirely. */
@@ -231,17 +231,19 @@ export class AdvisorOrchestrator {
    */
   async waitForCatchup(): Promise<void> {
     if (this.#paused) return;
-    const threshold = this.#syncBacklog;
-    if (threshold === "off") return;
+    const thresholds = normalizeSyncBacklog(this.#syncBacklog);
+    if (!thresholds) return;
     const deadline = Date.now() + CATCHUP_TIMEOUT_MS;
     for (const advisor of this.#advisors) {
-      while (
-        advisor.queue.length >= threshold &&
-        !advisor.disposed &&
-        advisor.status === "running" &&
-        Date.now() < deadline
-      ) {
-        await new Promise(r => setTimeout(r, 100));
+      if (advisor.queue.length >= thresholds.pauseAt) {
+        while (
+          advisor.queue.length > thresholds.resumeAt &&
+          !advisor.disposed &&
+          advisor.status === "running" &&
+          Date.now() < deadline
+        ) {
+          await new Promise(r => setTimeout(r, 100));
+        }
       }
     }
   }
@@ -896,6 +898,6 @@ export class AdvisorOrchestrator {
 export interface DiscoveredAdvisorsLike {
   advisors: AdvisorConfig[];
   sharedInstructions: string | undefined;
-  syncBacklog?: number | "off";
+  syncBacklog?: SyncBacklogConfig;
   immuneTurns?: number;
 }

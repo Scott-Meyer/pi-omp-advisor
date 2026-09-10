@@ -18,13 +18,13 @@ const call = (id: string) => assistant([{ type: "toolCall", id, name: "read_file
 const result = (id: string, text: string): AgentMessage => ({ role: "toolResult", toolCallId: id, toolName: "read_file", content: [{ type: "text", text }], isError: false, timestamp: 3 });
 const body = (messages: AgentMessage[]) => JSON.stringify(messages);
 
-test("the default is a bounded 32k window, not a per-update limit", () => {
+test("the default is a bounded 100k window, not a per-update limit", () => {
   const window = new AdvisorContextWindow();
-  assert.equal(window.requestedTokens, 32_000);
-  const input = Array.from({ length: 12 }, (_, i) => user(`observation-${i}: ${"x".repeat(20_000)}`));
+  assert.equal(window.requestedTokens, 100_000);
+  const input = Array.from({ length: 25 }, (_, i) => user(`observation-${i}: ${"x".repeat(25_000)}`));
   const view = window.trim(input);
   assert.doesNotMatch(body(view), /observation-0:/);
-  assert.match(body(view), /observation-11:/);
+  assert.match(body(view), /observation-24:/);
   assert.ok(window.status.estimatedTokens <= DEFAULT_ADVISOR_CONTEXT_TOKENS);
   assert.ok(view.length < input.length);
 });

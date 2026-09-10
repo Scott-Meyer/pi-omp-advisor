@@ -107,6 +107,35 @@ describe("loadWatchdogConfigFile", () => {
     assert.equal((await loadWatchdogConfigFile(file)).syncBacklog, "off");
   });
 
+  it("round-trips hysteresis syncBacklog with pauseAt and resumeAt", async () => {
+    const content = [
+      "syncBacklog:",
+      "  pauseAt: 4",
+      "  resumeAt: 1",
+      "",
+    ].join("\n");
+    const file = await writeConfig("hysteresis.yml", content);
+    const loaded = await loadWatchdogConfigFile(file);
+    assert.deepEqual(loaded.syncBacklog, { pauseAt: 4, resumeAt: 1 });
+
+    const serialized = await serializeWatchdogConfig(loaded);
+    await fs.writeFile(file, serialized, "utf8");
+    const reloaded = await loadWatchdogConfigFile(file);
+    assert.deepEqual(reloaded.syncBacklog, { pauseAt: 4, resumeAt: 1 });
+  });
+
+  it("normalizes syncBacklog maxBehind alias into pauseAt and resumeAt", async () => {
+    const content = [
+      "syncBacklog:",
+      "  maxBehind: 5",
+      "  resumeAt: 2",
+      "",
+    ].join("\n");
+    const file = await writeConfig("alias.yml", content);
+    const loaded = await loadWatchdogConfigFile(file);
+    assert.deepEqual(loaded.syncBacklog, { pauseAt: 5, resumeAt: 2 });
+  });
+
   it("returns an empty document for a missing file", async () => {
     const loaded = await loadWatchdogConfigFile(path.join(dir, "does-not-exist.yml"));
     assert.deepEqual(loaded, { advisors: [] });

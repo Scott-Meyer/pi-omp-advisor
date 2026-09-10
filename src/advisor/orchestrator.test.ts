@@ -24,7 +24,7 @@ type Review = (text: string, call: (name: string, args?: Record<string, unknown>
 
 // Substitute only the model/session boundary: real batching, tools, state,
 // prompt assembly, resource isolation and host inbox remain in the exercise.
-async function harness(t: TestContext, review: Review, options?: { stop?: PrimaryStopAccess; contextTokens?: number; includePrimaryThinking?: boolean; primary?: { isStreaming(): boolean; isAborting(): boolean; isAutoResumeSuppressed(): boolean } }) {
+async function harness(t: TestContext, review: Review, options?: { stop?: PrimaryStopAccess; contextTokens?: number; includePrimaryThinking?: boolean; syncBacklog?: unknown; primary?: { isStreaming(): boolean; isAborting(): boolean; isAutoResumeSuppressed(): boolean } }) {
   const cwd = await mkdtemp(join(tmpdir(), "advisor-orchestrator-"));
   const agentDir = join(cwd, "agent-config");
   await mkdir(agentDir);
@@ -122,7 +122,12 @@ async function harness(t: TestContext, review: Review, options?: { stop?: Primar
     "main: true", "advisors:", "  - name: reviewer",
     ...(options?.stop ? ["    tools: [read, grep, glob, request_stop]"] : []),
     ...(options?.contextTokens !== undefined ? [`    contextTokens: ${options.contextTokens}`] : []),
-    ...(options?.includePrimaryThinking !== undefined ? [`    includePrimaryThinking: ${options.includePrimaryThinking}`] : []), "",
+    ...(options?.includePrimaryThinking !== undefined ? [`    includePrimaryThinking: ${options.includePrimaryThinking}`] : []),
+    ...(options?.syncBacklog !== undefined
+      ? [typeof options.syncBacklog === "object" && options.syncBacklog !== null
+          ? `syncBacklog:\n  pauseAt: ${(options.syncBacklog as { pauseAt: number }).pauseAt}\n  resumeAt: ${(options.syncBacklog as { resumeAt: number }).resumeAt}`
+          : `syncBacklog: ${options.syncBacklog}`]
+      : []), "",
   ].join("\n"));
   const discovered = await discoverAdvisorConfigs(cwd, agentDir);
   assert.equal(discovered.advisors[0]?.tools?.includes("request_stop") ?? false, Boolean(options?.stop), "the explicit YAML grant must survive discovery");
@@ -523,3 +528,75 @@ for (const boundary of ["completion", "abort"] as const) {
     assert.equal(inbox.items.length, 0);
   });
 }
+
+test("waitForCatchup pauses when queue reaches pauseAt and resumes when drained to resumeAt", async t => {
+  const allowTurn1 = deferred();
+  const allowTurn2 = deferred();
+  const allowTurn3 = deferred();
+  let turnCount = 0;
+
+  const { orchestrator } = await harness(t, async () => {
+    turnCount++;
+    if (turnCount === 1) await allowTurn1.promise;
+    else if (turnCount === 2) await allowTurn2.promise;
+    else if (turnCount === 3) await allowTurn3.promise;
+  }, {
+    syncBacklog: { pauseAt: 3, resumeAt: 1 },
+  });
+
+  // Turn 1 starts advisor processing batch 1 (which hangs on allowTurn1)
+  orchestrator.onMessage({ role: "user", content: "turn 1", timestamp: 1 });
+  orchestrator.onTurnEnd();
+  orchestrator.onTurnStart();
+
+  // Turn 2 is dispatched into advisor.queue (length 1)
+  orchestrator.onMessage({ role: "user", content: "turn 2", timestamp: 2 });
+  orchestrator.onTurnEnd();
+  orchestrator.onTurnStart();
+
+  // Queue is length 1; pauseAt is 3 -> waitForCatchup should NOT block
+  let catchupReturned = false;
+  let p = orchestrator.waitForCatchup().then(() => { catchupReturned = true; });
+  await new Promise(r => setTimeout(r, 20));
+  assert.equal(catchupReturned, true, "queue length 1 < pauseAt 3, so must not block");
+  await p;
+
+  // Turn 3 is dispatched into advisor.queue (length 2)
+  orchestrator.onMessage({ role: "user", content: "turn 3", timestamp: 3 });
+  orchestrator.onTurnEnd();
+  orchestrator.onTurnStart();
+
+  // Queue is length 2; pauseAt is 3 -> waitForCatchup still does NOT block
+  catchupReturned = false;
+  p = orchestrator.waitForCatchup().then(() => { catchupReturned = true; });
+  await new Promise(r => setTimeout(r, 20));
+  assert.equal(catchupReturned, true, "queue length 2 < pauseAt 3, so must not block");
+  await p;
+
+  // Turn 4 is dispatched into advisor.queue (length 3) -> hits pauseAt 3!
+  orchestrator.onMessage({ role: "user", content: "turn 4", timestamp: 4 });
+  orchestrator.onTurnEnd();
+  orchestrator.onTurnStart();
+
+  catchupReturned = false;
+  p = orchestrator.waitForCatchup().then(() => { catchupReturned = true; });
+  await new Promise(r => setTimeout(r, 50));
+  assert.equal(catchupReturned, false, "queue length 3 >= pauseAt 3, so MUST block");
+
+  // Let turn 1 complete. Advisor pops turn 2 from queue. Queue length is now 2.
+  // Since resumeAt is 1, queue length 2 > 1, so waitForCatchup must STILL be blocked!
+  allowTurn1.resolve();
+  await new Promise(r => setTimeout(r, 50));
+  assert.equal(catchupReturned, false, "queue length 2 > resumeAt 1, so must remain blocked");
+
+  // Let turn 2 complete. Advisor pops turn 3 from queue. Queue length is now 1.
+  // Since resumeAt is 1, queue length is now <= 1, so waitForCatchup should unblock!
+  allowTurn2.resolve();
+  await p;
+  assert.equal(catchupReturned, true, "queue length reached resumeAt 1, so unblocked");
+
+  // Clean up
+  allowTurn3.resolve();
+  await orchestrator.drainForExit(1000);
+});
+

@@ -17,6 +17,7 @@
  */
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, ImageContent, TextContent, ToolResultMessage } from "@earendil-works/pi-ai";
+import { truncateDiffLines } from "./file-diff.ts";
 
 export interface HistoryFormatOptions {
   /** Optional H1 prepended to the transcript. */
@@ -159,9 +160,10 @@ export function formatToolResultErrorPreview(content: string | readonly (TextCon
  * of the fence.
  */
 function fenceDiff(diff: string): string {
-  const longest = diff.match(/`+/g)?.reduce((m, run) => Math.max(m, run.length), 0) ?? 0;
+  const bounded = truncateDiffLines(diff.trim());
+  const longest = bounded.match(/`+/g)?.reduce((m, run) => Math.max(m, run.length), 0) ?? 0;
   const fence = "`".repeat(Math.max(3, longest + 1));
-  return `${fence}diff\n${diff}\n${fence}`;
+  return `${fence}diff\n${bounded}\n${fence}`;
 }
 
 /** One line per tool call: `→ read(src/foo.ts:50-80) ⇒ ok · 31 lines`. */

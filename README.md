@@ -199,12 +199,13 @@ advisor with the same name.
 ```yaml
 main: true         # run in normal pi sessions (default true)
 subagents: false   # run inside subagent processes too (default false; see note below)
+syncBacklog: off   # backpressure: off, number of batches, or { pauseAt: 4, resumeAt: 1 } hysteresis
 
 advisors:
   - name: advisor
     model: openai/gpt-5.1-codex-mini   # or provider/id:high for a thinking level
     tools: [read, grep, glob]     # default; `glob` maps to pi's `find`
-    contextTokens: 32000         # default estimated input ceiling; configurable, minimum 2048
+    contextTokens: 100000        # default estimated input ceiling; configurable, minimum 2048
     includePrimaryThinking: false  # default; independent of the advisor's own thinking level
     instructions: Pay extra attention to auth and data-loss risk.
     enabled: true
@@ -267,7 +268,7 @@ goes to a *second* vendor.
    | tool calls | name + one primary argument, truncated to 120 chars (so file paths, commands, grep patterns, URLs) |
    | successful tool results | status and size only — `⇒ ok · 31 lines`, **no body** |
    | failed tool results | status, size, and the **first line** of the error |
-   | `edit`/`write` results | fenced unified diff; subject to the context window and shortening |
+   | `edit`/`write` results | fenced unified diff (8 lines of context, max 200 lines); subject to the context window and shortening |
    | your `!` bash runs | command preview + exit status + line count, no output |
 
    So ordinary file reads and command output do **not** leave as content — but

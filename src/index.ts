@@ -53,6 +53,7 @@
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { ToolResultMessage } from "@earendil-works/pi-ai";
 import { Text, type AutocompleteItem } from "@earendil-works/pi-tui";
 import { formatAdvisorBatchContent, type AdvisorNote } from "./advisor/advise-logic.ts";
 import { AdvisorInbox, type QueuedAdvisorNote } from "./advisor/advisor-inbox.ts";
@@ -63,6 +64,7 @@ import { PrimaryStopController, formatStopReceipt } from "./advisor/primary-stop
 import { PrimaryInterruptionState } from "./advisor/primary-interruption.ts";
 import { formatToolCallPrimaryArg } from "./advisor/session-history-format.ts";
 import { DEFAULT_ADVISOR_CONTEXT_TOKENS, MIN_ADVISOR_CONTEXT_TOKENS, type ContextWindowStatus } from "./advisor/context-window.ts";
+import { FileMutationTracker } from "./advisor/file-diff.ts";
 import {
   discoverAdvisorConfigs,
   loadWatchdogConfigFile,
@@ -141,6 +143,7 @@ export default function (pi: ExtensionAPI) {
   let orchestrator: AdvisorOrchestrator | undefined;
   const inbox = new AdvisorInbox();
   const primaryInterruption = new PrimaryInterruptionState();
+  const fileMutationTracker = new FileMutationTracker();
   let sessionContext: ExtensionContext | undefined;
   let advisorContextNeeded = false;
   let advisorPaused = false;
@@ -587,20 +590,33 @@ export default function (pi: ExtensionAPI) {
     primaryInterruption.watch(ctx.signal);
   });
 
-  pi.on("tool_execution_start", (event, _ctx) => {
+  pi.on("tool_execution_start", async (event, ctx) => {
     const activity = primaryStop.toolStarted({
       toolCallId: event.toolCallId, toolName: event.toolName,
       summary: formatToolCallPrimaryArg(event.toolName, event.args), startedAt: Date.now(),
     });
-    if (isActive()) orchestrator!.onToolStart(activity);
+    if (isActive()) {
+      orchestrator!.onToolStart(activity);
+      await fileMutationTracker.onToolStart(event.toolCallId, event.toolName, event.args, ctx.cwd);
+    }
   });
   pi.on("tool_execution_end", (event, ctx) => {
     primaryStop.toolEnded(event.toolCallId, event.isError, ctx.signal?.aborted === true);
+    fileMutationTracker.onToolEnd(event.toolCallId, event.isError);
   });
 
   pi.on("message_end", async (event, _ctx) => {
     if (!isActive()) return;
-    orchestrator!.onMessage(event.message as AgentMessage);
+    let message = event.message as AgentMessage;
+    if (message.role === "toolResult") {
+      const tr = message as ToolResultMessage;
+      const diff = await fileMutationTracker.onToolResult(tr.toolCallId, tr.toolName, tr.isError);
+      if (diff) {
+        const details = (tr.details && typeof tr.details === "object") ? tr.details : {};
+        message = { ...tr, details: { ...details, diff } } as AgentMessage;
+      }
+    }
+    orchestrator!.onMessage(message);
   });
   pi.on("turn_start", async (_event, _ctx) => {
     if (!isActive()) return;
@@ -617,6 +633,7 @@ export default function (pi: ExtensionAPI) {
   });
   pi.on("agent_settled", async (_event, _ctx) => {
     publishStopReceipt();
+    fileMutationTracker.clear();
     if (!isActive()) return;
     orchestrator!.onAgentSettled();
   });
@@ -764,7 +781,15 @@ export default function (pi: ExtensionAPI) {
         `Shared instructions: ${doc.instructions ? `${doc.instructions.slice(0, 40)}…` : "(none)"}`,
         `Watch the main session by default: ${doc.main === true ? "on" : doc.main === false ? "off" : "on (unset, default)"}`,
         `Watch sub-agent sessions too: ${doc.subagents === true ? "on" : doc.subagents === false ? "off" : "off (unset)"}`,
-        `Backpressure: pause the primary when an advisor falls behind: ${doc.syncBacklog === undefined ? "off (default)" : doc.syncBacklog === "off" ? "off" : `${doc.syncBacklog} batches`}`,
+        `Backpressure: pause the primary when an advisor falls behind: ${
+          doc.syncBacklog === undefined
+            ? "off (default)"
+            : doc.syncBacklog === "off"
+            ? "off"
+            : typeof doc.syncBacklog === "object"
+            ? `pause at ${doc.syncBacklog.pauseAt}, resume at ${doc.syncBacklog.resumeAt}`
+            : `${doc.syncBacklog} batches`
+        }`,
         `Turns where later concerns stop interrupting: ${doc.immuneTurns ?? "3 (default)"}`,
         ...advisorLabels,
         "+ Add advisor",
@@ -811,15 +836,30 @@ export default function (pi: ExtensionAPI) {
         continue;
       }
       if (choice.startsWith("Backpressure: pause the primary when an advisor falls behind:")) {
-        // Matches upstream's `advisor.syncBacklog` values exactly. "off" means
+        // Matches upstream's `advisor.syncBacklog` values exactly, with support
+        // for hysteresis ({ pauseAt, resumeAt }) to avoid stutter. "off" means
         // the primary is never gated on a lagging advisor (upstream default).
         const picked = await ctx.ui.select(
-          "Pause the main agent for up to 30s when an advisor is this many batches behind",
-          ["off (never pause — default)", "1 batch", "3 batches", "5 batches"],
+          "Pause the main agent for up to 30s when an advisor falls behind",
+          [
+            "off (never pause — default)",
+            "1 batch",
+            "3 batches",
+            "5 batches",
+            "Hysteresis: pause at 3, resume at 1",
+            "Hysteresis: pause at 5, resume at 1",
+          ],
         );
         if (picked !== undefined) {
-          if (picked.startsWith("off")) delete doc.syncBacklog;
-          else doc.syncBacklog = Number.parseInt(picked, 10);
+          if (picked.startsWith("off")) {
+            delete doc.syncBacklog;
+          } else if (picked.includes("pause at 3, resume at 1")) {
+            doc.syncBacklog = { pauseAt: 3, resumeAt: 1 };
+          } else if (picked.includes("pause at 5, resume at 1")) {
+            doc.syncBacklog = { pauseAt: 5, resumeAt: 1 };
+          } else {
+            doc.syncBacklog = Number.parseInt(picked, 10);
+          }
         }
         continue;
       }

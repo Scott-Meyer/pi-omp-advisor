@@ -65,10 +65,59 @@ export interface AdvisorConfig {
   instructions?: string;
   /** Per-advisor on/off toggle (default `true`). */
   enabled?: boolean;
-  /** Estimated total model-input budget; defaults to 32,000 tokens. */
+  /** Estimated total model-input budget; defaults to 100,000 tokens. */
   contextTokens?: number;
   /** Include the primary's reasoning in observations; defaults to false. */
   includePrimaryThinking?: boolean;
+}
+
+export interface SyncBacklogThresholds {
+  pauseAt: number;
+  resumeAt: number;
+}
+
+export type SyncBacklogConfig = number | "off" | SyncBacklogThresholds;
+
+/**
+ * Normalizes any valid syncBacklog setting into explicit { pauseAt, resumeAt }
+ * thresholds, or undefined if syncBacklog is off / unset / invalid.
+ */
+export function normalizeSyncBacklog(setting: unknown): SyncBacklogThresholds | undefined {
+  if (setting === "off" || setting === false || setting === undefined || setting === null) {
+    return undefined;
+  }
+  if (typeof setting === "number" && Number.isFinite(setting) && setting > 0) {
+    const pauseAt = Math.floor(setting);
+    return { pauseAt, resumeAt: Math.max(0, pauseAt - 1) };
+  }
+  if (typeof setting === "string") {
+    const parsed = Number.parseInt(setting, 10);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return { pauseAt: parsed, resumeAt: Math.max(0, parsed - 1) };
+    }
+    return undefined;
+  }
+  if (typeof setting === "object" && setting !== null) {
+    const obj = setting as Record<string, unknown>;
+    const rawPause = typeof obj.pauseAt === "number"
+      ? obj.pauseAt
+      : typeof obj.maxBehind === "number"
+      ? obj.maxBehind
+      : undefined;
+    const rawResume = typeof obj.resumeAt === "number"
+      ? obj.resumeAt
+      : typeof obj.drainTo === "number"
+      ? obj.drainTo
+      : undefined;
+    if (rawPause !== undefined && Number.isFinite(rawPause) && rawPause > 0) {
+      const pauseAt = Math.floor(rawPause);
+      const resumeAt = rawResume !== undefined && Number.isFinite(rawResume) && rawResume >= 0
+        ? Math.min(pauseAt - 1, Math.floor(rawResume))
+        : Math.max(0, pauseAt - 1);
+      return { pauseAt, resumeAt };
+    }
+  }
+  return undefined;
 }
 
 export interface DiscoveredAdvisors {
@@ -95,15 +144,13 @@ export interface DiscoveredAdvisors {
    */
   mainEnabled: boolean | undefined;
   /**
-   * Upstream's `advisor.syncBacklog` setting (`off` | `1` | `3` | `5`),
+   * Upstream's `advisor.syncBacklog` setting (`off` | `1` | `3` | `5` or `{ pauseAt, resumeAt }`),
    * expressed here as a `WATCHDOG.yml` field because pi has no equivalent
    * settings-schema surface to register into. Pause the primary for up to 30s
-   * when an advisor is this many batches behind; `"off"` disables catch-up
-   * delays entirely. Upstream's default is `"off"` — the primary is never
-   * gated on an advisor unless you opt in — and `undefined` here means the
-   * same.
+   * when an advisor is behind; `"off"` disables catch-up delays entirely.
+   * Upstream's default is `"off"`. Supports hysteresis: pause at X batches, resume at Y.
    */
-  syncBacklog: number | "off" | undefined;
+  syncBacklog: SyncBacklogConfig | undefined;
   /**
    * Upstream's `advisor.immuneTurns` setting (default `3`). After a concern or
    * blocker interrupts, route further **concerns** non-interruptingly for this
@@ -338,7 +385,7 @@ export async function discoverAdvisorConfigs(cwd: string, agentDir?: string): Pr
   const sharedParts: string[] = [];
   let subagentsEnabled: boolean | undefined;
   let mainEnabled: boolean | undefined;
-  let syncBacklog: number | "off" | undefined;
+  let syncBacklog: SyncBacklogConfig | undefined;
   let immuneTurns: number | undefined;
   let parsedAnyConfig = false;
 
@@ -370,9 +417,13 @@ export async function discoverAdvisorConfigs(cwd: string, agentDir?: string): Pr
     } else if (typeof doc.syncBacklog === "string") {
       const parsed = Number.parseInt(doc.syncBacklog, 10);
       if (Number.isFinite(parsed) && parsed > 0) syncBacklog = parsed;
-      else console.error(`[pi-omp-advisor] advisor config ${item.path}: ignoring invalid "syncBacklog" (expected off, 1, 3, or 5)`);
+      else console.error(`[pi-omp-advisor] advisor config ${item.path}: ignoring invalid "syncBacklog" (expected off, number, or { pauseAt, resumeAt })`);
+    } else if (typeof doc.syncBacklog === "object" && doc.syncBacklog !== null) {
+      const thresholds = normalizeSyncBacklog(doc.syncBacklog);
+      if (thresholds) syncBacklog = thresholds;
+      else console.error(`[pi-omp-advisor] advisor config ${item.path}: ignoring invalid "syncBacklog" object (expected { pauseAt: number, resumeAt: number })`);
     } else if (doc.syncBacklog !== undefined) {
-      console.error(`[pi-omp-advisor] advisor config ${item.path}: ignoring invalid "syncBacklog" (expected off, 1, 3, or 5)`);
+      console.error(`[pi-omp-advisor] advisor config ${item.path}: ignoring invalid "syncBacklog" (expected off, number, or { pauseAt, resumeAt })`);
     }
     parsedAnyConfig = true;
     if (typeof doc.immuneTurns === "number" && Number.isFinite(doc.immuneTurns) && doc.immuneTurns >= 0) {
@@ -446,7 +497,7 @@ export interface WatchdogConfigDoc {
   /** pi-omp-advisor-specific; see {@link DiscoveredAdvisors.mainEnabled}. */
   main?: boolean;
   /** See {@link DiscoveredAdvisors.syncBacklog}. */
-  syncBacklog?: number | "off";
+  syncBacklog?: SyncBacklogConfig;
   /** See {@link DiscoveredAdvisors.immuneTurns}. */
   immuneTurns?: number;
 }
@@ -533,6 +584,9 @@ export async function loadWatchdogConfigFile(filePath: string): Promise<Watchdog
   } else if (typeof doc.syncBacklog === "string") {
     const parsed = Number.parseInt(doc.syncBacklog, 10);
     if (Number.isFinite(parsed) && parsed > 0) result.syncBacklog = parsed;
+  } else if (typeof doc.syncBacklog === "object" && doc.syncBacklog !== null) {
+    const thresholds = normalizeSyncBacklog(doc.syncBacklog);
+    if (thresholds) result.syncBacklog = thresholds;
   }
   if (typeof doc.immuneTurns === "number" && Number.isFinite(doc.immuneTurns) && doc.immuneTurns >= 0) {
     result.immuneTurns = Math.floor(doc.immuneTurns);
@@ -552,7 +606,13 @@ export async function serializeWatchdogConfig(doc: WatchdogConfigDoc): Promise<s
   if (doc.instructions?.trim()) plain.instructions = doc.instructions;
   if (doc.subagents !== undefined) plain.subagents = doc.subagents;
   if (doc.main !== undefined) plain.main = doc.main;
-  if (doc.syncBacklog !== undefined) plain.syncBacklog = doc.syncBacklog;
+  if (doc.syncBacklog !== undefined) {
+    if (typeof doc.syncBacklog === "object" && doc.syncBacklog !== null) {
+      plain.syncBacklog = { pauseAt: doc.syncBacklog.pauseAt, resumeAt: doc.syncBacklog.resumeAt };
+    } else {
+      plain.syncBacklog = doc.syncBacklog;
+    }
+  }
   if (doc.immuneTurns !== undefined) plain.immuneTurns = doc.immuneTurns;
 
   if (doc.advisors.length > 0) {
