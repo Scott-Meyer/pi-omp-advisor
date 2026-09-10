@@ -200,6 +200,8 @@ advisor with the same name.
 main: true         # run in normal pi sessions (default true)
 subagents: false   # run inside subagent processes too (default false; see note below)
 syncBacklog: off   # backpressure: off, number of batches, or { pauseAt: 4, resumeAt: 1 } hysteresis
+maxBehind: 3       # max batches waiting before coalescing into a single prompt (default 3, min 1)
+flushTimeoutMs: 3000 # flush in-flight tool calls if held longer than 3000ms (default 3000, min 100)
 
 advisors:
   - name: advisor
@@ -207,6 +209,8 @@ advisors:
     tools: [read, grep, glob]     # default; `glob` maps to pi's `find`
     contextTokens: 100000        # default estimated input ceiling; configurable, minimum 2048
     includePrimaryThinking: false  # default; independent of the advisor's own thinking level
+    maxBehind: 3          # per-advisor override for queue coalescing
+    flushTimeoutMs: 3000  # per-advisor override for in-flight tool flush
     instructions: Pay extra attention to auth and data-loss risk.
     enabled: true
 ```

@@ -45,7 +45,7 @@ import { installAdvisorContextWindow, type ContextWindowStatus } from "./context
 import { ADVISOR_STOP_TOOLS } from "./stop-tools.ts";
 import type { CurrentToolResult, PrimaryStopAccess, PrimaryToolActivity, StopRequestResult } from "./primary-stop.ts";
 import type { AdvisorConfig, SyncBacklogConfig } from "./watchdog-config.ts";
-import { discoverWatchdogFiles, normalizeSyncBacklog } from "./watchdog-config.ts";
+import { DEFAULT_FLUSH_TIMEOUT_MS, DEFAULT_MAX_BEHIND, discoverWatchdogFiles, normalizeSyncBacklog } from "./watchdog-config.ts";
 import { buildAdvisorSystemPrompt } from "./system-prompt.ts";
 
 /**
@@ -158,6 +158,20 @@ interface ActiveAdvisor {
    * This does not control the advisor model's own thinking level.
    */
   includeThinking: boolean;
+  maxBehind: number;
+  flushTimeoutMs: number;
+  flushTimer: NodeJS.Timeout | undefined;
+}
+
+export interface AdvisorStatusOverviewItem {
+  name: string;
+  status: AdvisorRuntimeStatus;
+  backlog: number;
+  backlogMessages: number;
+  maxBehind: number;
+  flushTimeoutMs: number;
+  context?: ContextWindowStatus;
+  includePrimaryThinking?: boolean;
 }
 
 export interface OrchestratorHost {
@@ -210,13 +224,29 @@ export class AdvisorOrchestrator {
     return this.#advisors.map(a => a.config.name);
   }
 
-  statusOverview(): { name: string; status: AdvisorRuntimeStatus; backlog: number; context?: ContextWindowStatus; includePrimaryThinking?: boolean }[] {
+  statusOverview(): AdvisorStatusOverviewItem[] {
     // `backlog` is how many batches are waiting behind the one currently being
     // prompted — the honest "how far behind is this advisor" number, shown in
     // `/advisor status` rather than logged to stderr every time it happens.
     return [
-      ...this.#advisors.map(a => ({ name: a.config.name, status: a.status, backlog: a.queue.length, context: a.memory.window.status, includePrimaryThinking: a.includeThinking })),
-      ...this.#noModelAdvisors.map(a => ({ name: a.name, status: a.status, backlog: 0 })),
+      ...this.#advisors.map(a => ({
+        name: a.config.name,
+        status: a.status,
+        backlog: a.queue.length,
+        backlogMessages: a.queue.reduce((sum, item) => sum + item.batch.length, 0),
+        maxBehind: a.maxBehind,
+        flushTimeoutMs: a.flushTimeoutMs,
+        context: a.memory.window.status,
+        includePrimaryThinking: a.includeThinking,
+      })),
+      ...this.#noModelAdvisors.map(a => ({
+        name: a.name,
+        status: a.status,
+        backlog: 0,
+        backlogMessages: 0,
+        maxBehind: DEFAULT_MAX_BEHIND,
+        flushTimeoutMs: DEFAULT_FLUSH_TIMEOUT_MS,
+      })),
     ];
   }
 
@@ -285,7 +315,7 @@ export class AdvisorOrchestrator {
 
     for (const config of roster) {
       if (config.enabled === false) continue;
-      const advisor = await this.#buildAdvisor(config, isLegacySingle, watchdogBlocks, configs.sharedInstructions, ctx, modelRuntime, agentDir, contextFiles);
+      const advisor = await this.#buildAdvisor(config, isLegacySingle, watchdogBlocks, configs.sharedInstructions, ctx, modelRuntime, agentDir, contextFiles, configs);
       if (advisor) this.#advisors.push(advisor);
     }
   }
@@ -299,6 +329,7 @@ export class AdvisorOrchestrator {
     modelRuntime: ModelRuntime,
     agentDir: string,
     contextFiles: { path: string; content: string }[],
+    configs?: DiscoveredAdvisorsLike,
   ): Promise<ActiveAdvisor | undefined> {
     const slug = config.name === "default" ? "" : config.name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "advisor";
     const sourceName = isLegacySingle ? undefined : config.name;
@@ -387,6 +418,9 @@ export class AdvisorOrchestrator {
       contextNotice: "Observation begins here. Earlier session activity is not included in this fresh advisor context.",
       status: "running",
       includeThinking: config.includePrimaryThinking ?? false,
+      maxBehind: config.maxBehind ?? configs?.maxBehind ?? DEFAULT_MAX_BEHIND,
+      flushTimeoutMs: config.flushTimeoutMs ?? configs?.flushTimeoutMs ?? DEFAULT_FLUSH_TIMEOUT_MS,
+      flushTimer: undefined,
     };
   }
 
@@ -496,6 +530,7 @@ export class AdvisorOrchestrator {
 
       const aborts: Promise<void>[] = [];
       for (const advisor of this.#advisors) {
+        this.#clearFlushTimer(advisor);
         if (advisor.disposed) continue;
         advisor.pendingMessages = [];
         advisor.awaitingBatch = undefined;
@@ -512,6 +547,7 @@ export class AdvisorOrchestrator {
 
   async disposeAll(): Promise<void> {
     for (const advisor of this.#advisors) {
+      this.#clearFlushTimer(advisor);
       advisor.disposed = true;
       advisor.memory.dispose();
       advisor.session.dispose();
@@ -536,6 +572,7 @@ export class AdvisorOrchestrator {
     if (!this.#buildInputs) return;
     const { ctx, modelRuntime, agentDir, watchdogBlocks, sharedInstructions, isLegacySingle, contextFiles } = this.#buildInputs;
     for (const advisor of this.#advisors) {
+      this.#clearFlushTimer(advisor);
       if (advisor.disposed) continue;
       advisor.pendingMessages = [];
       advisor.awaitingBatch = undefined;
@@ -609,6 +646,26 @@ export class AdvisorOrchestrator {
     }
   }
 
+  #clearFlushTimer(advisor: ActiveAdvisor): void {
+    if (advisor.flushTimer !== undefined) {
+      clearTimeout(advisor.flushTimer);
+      advisor.flushTimer = undefined;
+    }
+  }
+
+  #scheduleFlushTimer(advisor: ActiveAdvisor): void {
+    this.#clearFlushTimer(advisor);
+    if (advisor.flushTimeoutMs > 0 && !advisor.disposed && !this.#paused) {
+      advisor.flushTimer = setTimeout(() => {
+        advisor.flushTimer = undefined;
+        if (advisor.disposed || this.#paused || !advisor.awaitingBatch || advisor.awaitingBatch.length === 0) return;
+        const batch = advisor.awaitingBatch;
+        advisor.awaitingBatch = undefined;
+        this.#dispatch(advisor, batch, true);
+      }, advisor.flushTimeoutMs);
+    }
+  }
+
   /**
    * Stop-enabled advisors receive the call before its result. Flush only their
    * collected transcript, with compact runtime metadata; do not block execution
@@ -618,6 +675,7 @@ export class AdvisorOrchestrator {
     if (this.#paused) return;
     for (const advisor of this.#advisors) {
       if (advisor.disposed || !advisor.config.tools?.includes("request_stop")) continue;
+      this.#clearFlushTimer(advisor);
       const batch = [...(advisor.awaitingBatch ?? []), ...advisor.pendingMessages];
       advisor.awaitingBatch = undefined;
       advisor.pendingMessages = [];
@@ -629,6 +687,7 @@ export class AdvisorOrchestrator {
   onTurnStart(): void {
     if (this.#paused) return;
     for (const advisor of this.#advisors) {
+      this.#clearFlushTimer(advisor);
       if (advisor.disposed || !advisor.awaitingBatch) continue;
       const batch = advisor.awaitingBatch;
       advisor.awaitingBatch = undefined;
@@ -648,6 +707,7 @@ export class AdvisorOrchestrator {
       // normally happen — turn_start always resolves it first) is folded in
       // ahead of the new one rather than dropped.
       advisor.awaitingBatch = advisor.awaitingBatch ? [...advisor.awaitingBatch, ...batch] : batch;
+      this.#scheduleFlushTimer(advisor);
     }
   }
 
@@ -655,6 +715,7 @@ export class AdvisorOrchestrator {
   onAgentSettled(): void {
     if (this.#paused) return;
     for (const advisor of this.#advisors) {
+      this.#clearFlushTimer(advisor);
       if (advisor.disposed) continue;
       const batch = advisor.awaitingBatch ?? (advisor.pendingMessages.length > 0 ? advisor.pendingMessages : undefined);
       advisor.awaitingBatch = undefined;
@@ -664,7 +725,17 @@ export class AdvisorOrchestrator {
   }
 
   #dispatch(advisor: ActiveAdvisor, batch: AgentMessage[], wip: boolean, toolActivity?: PrimaryToolActivity): void {
-    advisor.queue.push({ batch, wip, toolActivity });
+    if (batch.length === 0 && !toolActivity) return;
+    const maxBehind = advisor.maxBehind;
+    if (advisor.queue.length >= maxBehind && advisor.queue.length > 0) {
+      // Coalesce into the tail of the queue
+      const last = advisor.queue[advisor.queue.length - 1]!;
+      last.batch = [...last.batch, ...batch];
+      last.wip = wip;
+      if (toolActivity) last.toolActivity = toolActivity;
+    } else {
+      advisor.queue.push({ batch, wip, toolActivity });
+    }
     void this.#drainAdvisor(advisor);
   }
 
@@ -900,4 +971,6 @@ export interface DiscoveredAdvisorsLike {
   sharedInstructions: string | undefined;
   syncBacklog?: SyncBacklogConfig;
   immuneTurns?: number;
+  maxBehind?: number;
+  flushTimeoutMs?: number;
 }

@@ -124,6 +124,39 @@ describe("loadWatchdogConfigFile", () => {
     assert.deepEqual(reloaded.syncBacklog, { pauseAt: 4, resumeAt: 1 });
   });
 
+  it("round-trips maxBehind and flushTimeoutMs settings", async () => {
+    const content = [
+      "maxBehind: 2",
+      "flushTimeoutMs: 1500",
+      "advisors:",
+      "  - name: reviewer",
+      "    maxBehind: 4",
+      "    flushTimeoutMs: 2500",
+      "",
+    ].join("\n");
+    const file = await writeConfig("cadence.yml", content);
+    const loaded = await loadWatchdogConfigFile(file);
+    assert.equal(loaded.maxBehind, 2);
+    assert.equal(loaded.flushTimeoutMs, 1500);
+    assert.equal(loaded.advisors[0]?.maxBehind, 4);
+    assert.equal(loaded.advisors[0]?.flushTimeoutMs, 2500);
+
+    const serialized = await serializeWatchdogConfig(loaded);
+    await fs.writeFile(file, serialized, "utf8");
+    const reloaded = await loadWatchdogConfigFile(file);
+    assert.equal(reloaded.maxBehind, 2);
+    assert.equal(reloaded.flushTimeoutMs, 1500);
+    assert.equal(reloaded.advisors[0]?.maxBehind, 4);
+    assert.equal(reloaded.advisors[0]?.flushTimeoutMs, 2500);
+  });
+
+  it("refuses invalid maxBehind and flushTimeoutMs in advisor entries", async () => {
+    for (const field of ["maxBehind: 0", "maxBehind: -1", "maxBehind: 1.5", "flushTimeoutMs: 50", "flushTimeoutMs: -100"]) {
+      const file = await writeConfig("invalid-cadence.yml", `advisors:\n  - name: reviewer\n    ${field}\n`);
+      await assert.rejects(() => loadWatchdogConfigFile(file), WatchdogConfigUnreadableError);
+    }
+  });
+
   it("normalizes syncBacklog maxBehind alias into pauseAt and resumeAt", async () => {
     const content = [
       "syncBacklog:",

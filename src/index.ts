@@ -57,7 +57,7 @@ import type { ToolResultMessage } from "@earendil-works/pi-ai";
 import { Text, type AutocompleteItem } from "@earendil-works/pi-tui";
 import { formatAdvisorBatchContent, type AdvisorNote } from "./advisor/advise-logic.ts";
 import { AdvisorInbox, type QueuedAdvisorNote } from "./advisor/advisor-inbox.ts";
-import { AdvisorOrchestrator, type OrchestratorHost } from "./advisor/orchestrator.ts";
+import { AdvisorOrchestrator, type AdvisorStatusOverviewItem, type OrchestratorHost } from "./advisor/orchestrator.ts";
 import { renderAdvisorMessage, type AdvisorMessageDetails } from "./advisor/advisor-message.ts";
 import { RequestedBooleanState, SerializedTransition } from "./advisor/serialized-transition.ts";
 import { PrimaryStopController, formatStopReceipt } from "./advisor/primary-stop.ts";
@@ -66,6 +66,8 @@ import { formatToolCallPrimaryArg } from "./advisor/session-history-format.ts";
 import { DEFAULT_ADVISOR_CONTEXT_TOKENS, MIN_ADVISOR_CONTEXT_TOKENS, type ContextWindowStatus } from "./advisor/context-window.ts";
 import { FileMutationTracker } from "./advisor/file-diff.ts";
 import {
+  DEFAULT_FLUSH_TIMEOUT_MS,
+  DEFAULT_MAX_BEHIND,
   discoverAdvisorConfigs,
   loadWatchdogConfigFile,
   resolveAdvisorConfigEditPath,
@@ -713,6 +715,8 @@ export default function (pi: ExtensionAPI) {
           `Tools: ${a.tools?.join(", ") ?? "(default: read, grep, glob)"}`,
           `Context budget: ${a.contextTokens ?? DEFAULT_ADVISOR_CONTEXT_TOKENS} estimated tokens${a.contextTokens === undefined ? " (default)" : ""}`,
           `Include primary reasoning: ${a.includePrimaryThinking === true ? "yes" : "no"}`,
+          `Max backlog before coalescing: ${a.maxBehind ?? "inherit"}`,
+          `In-flight tool flush timeout: ${a.flushTimeoutMs ? `${a.flushTimeoutMs}ms` : "inherit"}`,
           `Instructions: ${a.instructions ? `${a.instructions.slice(0, 60)}${a.instructions.length > 60 ? "…" : ""}` : "(none)"}`,
           `Enabled: ${a.enabled !== false}`,
           "Delete this advisor",
@@ -753,6 +757,30 @@ export default function (pi: ExtensionAPI) {
           a.includePrimaryThinking = a.includePrimaryThinking !== true;
           continue;
         }
+        if (choice.startsWith("Max backlog before coalescing:")) {
+          const text = await ctx.ui.input("Max queued batches waiting before merging (blank = inherit, min 1)", a.maxBehind?.toString() ?? "");
+          if (text !== undefined) {
+            if (text.trim() === "") delete a.maxBehind;
+            else {
+              const value = Number(text);
+              if (Number.isSafeInteger(value) && value >= 1) a.maxBehind = value;
+              else ctx.ui.notify("Use an integer >= 1. Unchanged.", "warning");
+            }
+          }
+          continue;
+        }
+        if (choice.startsWith("In-flight tool flush timeout:")) {
+          const text = await ctx.ui.input("Milliseconds a tool call waits before flushing to advisor (blank = inherit, min 100ms)", a.flushTimeoutMs?.toString() ?? "");
+          if (text !== undefined) {
+            if (text.trim() === "") delete a.flushTimeoutMs;
+            else {
+              const value = Number(text);
+              if (Number.isSafeInteger(value) && value >= 100) a.flushTimeoutMs = value;
+              else ctx.ui.notify("Use an integer >= 100. Unchanged.", "warning");
+            }
+          }
+          continue;
+        }
         if (choice.startsWith("Instructions:")) {
           const text = await ctx.ui.editor("This advisor's specialization instructions (blank = none)", a.instructions ?? "");
           if (text !== undefined) {
@@ -790,6 +818,8 @@ export default function (pi: ExtensionAPI) {
             ? `pause at ${doc.syncBacklog.pauseAt}, resume at ${doc.syncBacklog.resumeAt}`
             : `${doc.syncBacklog} batches`
         }`,
+        `Max backlog before coalescing: ${doc.maxBehind ?? `${DEFAULT_MAX_BEHIND} batches (default)`}`,
+        `In-flight tool flush timeout: ${doc.flushTimeoutMs ? `${doc.flushTimeoutMs}ms` : `${DEFAULT_FLUSH_TIMEOUT_MS}ms (default)`}`,
         `Turns where later concerns stop interrupting: ${doc.immuneTurns ?? "3 (default)"}`,
         ...advisorLabels,
         "+ Add advisor",
@@ -876,6 +906,40 @@ export default function (pi: ExtensionAPI) {
             const parsed = Number.parseInt(trimmed, 10);
             if (Number.isFinite(parsed) && parsed >= 0) doc.immuneTurns = parsed;
             else ctx.ui.notify("Not a non-negative number — unchanged.", "warning");
+          }
+        }
+        continue;
+      }
+      if (choice.startsWith("Max backlog before coalescing:")) {
+        const text = await ctx.ui.input(
+          "Max queued batches waiting before merging into a single catch-up batch (blank = 3, min 1)",
+          doc.maxBehind === undefined ? "" : String(doc.maxBehind),
+        );
+        if (text !== undefined) {
+          const trimmed = text.trim();
+          if (trimmed === "") {
+            delete doc.maxBehind;
+          } else {
+            const parsed = Number.parseInt(trimmed, 10);
+            if (Number.isFinite(parsed) && parsed >= 1) doc.maxBehind = parsed;
+            else ctx.ui.notify("Must be an integer >= 1 — unchanged.", "warning");
+          }
+        }
+        continue;
+      }
+      if (choice.startsWith("In-flight tool flush timeout:")) {
+        const text = await ctx.ui.input(
+          "Milliseconds a long-running tool call waits before flushing to the advisor (blank = 3000ms, min 100ms)",
+          doc.flushTimeoutMs === undefined ? "" : String(doc.flushTimeoutMs),
+        );
+        if (text !== undefined) {
+          const trimmed = text.trim();
+          if (trimmed === "") {
+            delete doc.flushTimeoutMs;
+          } else {
+            const parsed = Number.parseInt(trimmed, 10);
+            if (Number.isFinite(parsed) && parsed >= 100) doc.flushTimeoutMs = parsed;
+            else ctx.ui.notify("Must be an integer >= 100 — unchanged.", "warning");
           }
         }
         continue;
@@ -1113,8 +1177,13 @@ export default function (pi: ExtensionAPI) {
     // user hunting for a missing config file when the real problem is a model key
     // in the config they already have — so surface those first.
     const overview = orchestrator?.statusOverview() ?? [];
-    const describe = (s: { name: string; status: string; backlog: number; context?: ContextWindowStatus; includePrimaryThinking?: boolean }) =>
-      `${s.name}: ${s.status}${s.backlog > 0 ? ` (${s.backlog} batch(es) behind)` : ""}` +
+    const describe = (s: AdvisorStatusOverviewItem) =>
+      `${s.name}: ${s.status}` +
+      (s.backlog > 0
+        ? ` · backlog: ${s.backlog} batch(es) (${s.backlogMessages} message${s.backlogMessages === 1 ? "" : "s"})`
+        : " · caught up") +
+      ` · maxBehind: ${s.maxBehind}` +
+      ` · flushTimeout: ${s.flushTimeoutMs}ms` +
       (s.context ? `; context ~${s.context.estimatedTokens}/${s.context.limitTokens} tokens, ${s.context.retainedMessages} messages${s.context.trimmed ? " (older content expired/shortened)" : ""}; primary reasoning ${s.includePrimaryThinking ? "included" : "excluded"}` : "");
     const unusable = overview.filter(s => s.status === "no_model");
     const state = advisorPaused

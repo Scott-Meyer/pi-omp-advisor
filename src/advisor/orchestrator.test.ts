@@ -24,7 +24,7 @@ type Review = (text: string, call: (name: string, args?: Record<string, unknown>
 
 // Substitute only the model/session boundary: real batching, tools, state,
 // prompt assembly, resource isolation and host inbox remain in the exercise.
-async function harness(t: TestContext, review: Review, options?: { stop?: PrimaryStopAccess; contextTokens?: number; includePrimaryThinking?: boolean; syncBacklog?: unknown; primary?: { isStreaming(): boolean; isAborting(): boolean; isAutoResumeSuppressed(): boolean } }) {
+async function harness(t: TestContext, review: Review, options?: { stop?: PrimaryStopAccess; contextTokens?: number; includePrimaryThinking?: boolean; syncBacklog?: unknown; maxBehind?: number; flushTimeoutMs?: number; primary?: { isStreaming(): boolean; isAborting(): boolean; isAutoResumeSuppressed(): boolean } }) {
   const cwd = await mkdtemp(join(tmpdir(), "advisor-orchestrator-"));
   const agentDir = join(cwd, "agent-config");
   await mkdir(agentDir);
@@ -119,7 +119,10 @@ async function harness(t: TestContext, review: Review, options?: { stop?: Primar
     return { session } as unknown as Awaited<ReturnType<typeof createAgentSession>>;
   };
   await writeFile(join(cwd, "WATCHDOG.yml"), [
-    "main: true", "advisors:", "  - name: reviewer",
+    "main: true",
+    ...(options?.maxBehind !== undefined ? [`maxBehind: ${options.maxBehind}`] : []),
+    ...(options?.flushTimeoutMs !== undefined ? [`flushTimeoutMs: ${options.flushTimeoutMs}`] : []),
+    "advisors:", "  - name: reviewer",
     ...(options?.stop ? ["    tools: [read, grep, glob, request_stop]"] : []),
     ...(options?.contextTokens !== undefined ? [`    contextTokens: ${options.contextTokens}`] : []),
     ...(options?.includePrimaryThinking !== undefined ? [`    includePrimaryThinking: ${options.includePrimaryThinking}`] : []),
@@ -597,6 +600,110 @@ test("waitForCatchup pauses when queue reaches pauseAt and resumes when drained 
 
   // Clean up
   allowTurn3.resolve();
+  await orchestrator.drainForExit(1000);
+});
+
+test("coalesces waiting queue items when backlog reaches maxBehind", async t => {
+  const allowTurn1 = deferred();
+  const allowTurn2 = deferred();
+  const allowTurn3 = deferred();
+  let turnCount = 0;
+  const reviewedBatchSizes: number[] = [];
+
+  const { orchestrator } = await harness(t, async (text) => {
+    turnCount++;
+    const count = (text.match(/message-\d+/g) || []).length;
+    reviewedBatchSizes.push(count);
+    if (turnCount === 1) await allowTurn1.promise;
+    else if (turnCount === 2) await allowTurn2.promise;
+    else if (turnCount === 3) await allowTurn3.promise;
+  }, {
+    maxBehind: 2,
+  });
+
+  // Turn 1: advisor starts processing batch 1 (which hangs on allowTurn1)
+  orchestrator.onMessage({ role: "user", content: "message-1", timestamp: 1 });
+  orchestrator.onTurnEnd();
+  orchestrator.onTurnStart();
+
+  // Turn 2: queued as item 1 (queue length 1)
+  orchestrator.onMessage({ role: "user", content: "message-2", timestamp: 2 });
+  orchestrator.onTurnEnd();
+  orchestrator.onTurnStart();
+
+  // Turn 3: queued as item 2 (queue length 2 = maxBehind)
+  orchestrator.onMessage({ role: "user", content: "message-3", timestamp: 3 });
+  orchestrator.onTurnEnd();
+  orchestrator.onTurnStart();
+
+  let overview = orchestrator.statusOverview()[0]!;
+  assert.equal(overview.backlog, 2);
+  assert.equal(overview.backlogMessages, 2);
+
+  // Turn 4 arrives while queue is already at maxBehind (2).
+  // It should be COALESCED into item 2, NOT grow the queue to 3!
+  orchestrator.onMessage({ role: "user", content: "message-4", timestamp: 4 });
+  orchestrator.onTurnEnd();
+  orchestrator.onTurnStart();
+
+  overview = orchestrator.statusOverview()[0]!;
+  assert.equal(overview.backlog, 2, "backlog must remain capped at maxBehind");
+  assert.equal(overview.backlogMessages, 3, "messages from coalesced turn 4 must be preserved");
+
+  // Turn 5 arrives: also coalesced into item 2!
+  orchestrator.onMessage({ role: "user", content: "message-5", timestamp: 5 });
+  orchestrator.onTurnEnd();
+  orchestrator.onTurnStart();
+
+  overview = orchestrator.statusOverview()[0]!;
+  assert.equal(overview.backlog, 2, "backlog must remain capped at maxBehind");
+  assert.equal(overview.backlogMessages, 4, "messages from coalesced turn 5 must be preserved");
+
+  // Allow turn 1 to complete: advisor pops item 1 (message-2)
+  allowTurn1.resolve();
+  await new Promise(r => setTimeout(r, 50));
+
+  // Allow turn 2 to complete: advisor pops item 2 (which now contains message-3, 4, 5 combined!)
+  allowTurn2.resolve();
+  await new Promise(r => setTimeout(r, 50));
+
+  allowTurn3.resolve();
+  await orchestrator.drainForExit(1000);
+
+  // Cumulative message counts across turns:
+  // Turn 1 had 1 message (message-1)
+  // Turn 2 had 2 messages (message-1, message-2)
+  // Turn 3 had 5 messages (message-1, message-2, and message-3, 4, 5 coalesced together!)
+  assert.deepEqual(reviewedBatchSizes, [1, 2, 5]);
+});
+
+test("flushes in-flight held batch to advisor when flushTimeoutMs expires", async t => {
+  const reviewed = deferred();
+  let receivedText = "";
+
+  const { orchestrator } = await harness(t, async (text) => {
+    receivedText = text;
+    reviewed.resolve();
+  }, {
+    flushTimeoutMs: 150,
+  });
+
+  // Assistant emits a tool call message and turn_end fires
+  orchestrator.onMessage({
+    role: "assistant",
+    content: [{ type: "toolCall", id: "call-1", name: "bash", arguments: { command: "long-job" } }],
+    timestamp: 1,
+  } as unknown as AgentMessage);
+  orchestrator.onTurnEnd();
+
+  // Before flushTimeoutMs (150ms), advisor has not been called yet.
+  assert.equal(receivedText, "");
+
+  // Wait for flushTimeoutMs to fire:
+  await reviewed.promise;
+  assert.match(receivedText, /long-job/);
+  assert.match(receivedText, /in progress — more steps follow/);
+
   await orchestrator.drainForExit(1000);
 });
 

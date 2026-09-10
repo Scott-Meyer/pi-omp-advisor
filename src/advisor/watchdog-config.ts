@@ -58,6 +58,9 @@ import { MIN_ADVISOR_CONTEXT_TOKENS } from "./context-window.ts";
 
 const execFileAsync = promisify(execFile);
 
+export const DEFAULT_MAX_BEHIND = 3;
+export const DEFAULT_FLUSH_TIMEOUT_MS = 3000;
+
 export interface AdvisorConfig {
   name: string;
   model?: string;
@@ -69,6 +72,10 @@ export interface AdvisorConfig {
   contextTokens?: number;
   /** Include the primary's reasoning in observations; defaults to false. */
   includePrimaryThinking?: boolean;
+  /** Maximum queued batches waiting for this advisor before coalescing (default 3, min 1). */
+  maxBehind?: number;
+  /** In-flight tool flush timeout in milliseconds (default 3000, min 100). */
+  flushTimeoutMs?: number;
 }
 
 export interface SyncBacklogThresholds {
@@ -159,6 +166,10 @@ export interface DiscoveredAdvisors {
    * `severity !== "blocker"`. `undefined` means upstream's default.
    */
   immuneTurns: number | undefined;
+  /** Maximum queued batches waiting for an advisor before coalescing (default 3). */
+  maxBehind: number | undefined;
+  /** In-flight tool flush timeout in milliseconds (default 3000ms). */
+  flushTimeoutMs: number | undefined;
   /**
    * Whether at least one `WATCHDOG.yml`/`.yaml` was found **and parsed into a
    * valid mapping**, even if it declares no advisors. Upstream's activation
@@ -332,6 +343,8 @@ interface WatchdogYamlAdvisorEntry {
   enabled?: unknown;
   contextTokens?: unknown;
   includePrimaryThinking?: unknown;
+  maxBehind?: unknown;
+  flushTimeoutMs?: unknown;
 }
 interface WatchdogYamlDoc {
   instructions?: unknown;
@@ -342,6 +355,8 @@ interface WatchdogYamlDoc {
   immuneTurns?: unknown;
   /** pi-omp-advisor-specific; see {@link DiscoveredAdvisors.mainEnabled}. */
   main?: unknown;
+  maxBehind?: unknown;
+  flushTimeoutMs?: unknown;
 }
 
 function validateAdvisorEntry(entry: WatchdogYamlAdvisorEntry, sourcePath: string): AdvisorConfig | undefined {
@@ -368,6 +383,18 @@ function validateAdvisorEntry(entry: WatchdogYamlAdvisorEntry, sourcePath: strin
     }
     out.includePrimaryThinking = entry.includePrimaryThinking;
   }
+  if (entry.maxBehind !== undefined) {
+    if (typeof entry.maxBehind !== "number" || !Number.isSafeInteger(entry.maxBehind) || entry.maxBehind < 1) {
+      throw new WatchdogConfigUnreadableError(sourcePath, `advisor "${entry.name}" maxBehind must be an integer >= 1`);
+    }
+    out.maxBehind = entry.maxBehind;
+  }
+  if (entry.flushTimeoutMs !== undefined) {
+    if (typeof entry.flushTimeoutMs !== "number" || !Number.isSafeInteger(entry.flushTimeoutMs) || entry.flushTimeoutMs < 100) {
+      throw new WatchdogConfigUnreadableError(sourcePath, `advisor "${entry.name}" flushTimeoutMs must be an integer >= 100`);
+    }
+    out.flushTimeoutMs = entry.flushTimeoutMs;
+  }
   return out;
 }
 
@@ -387,6 +414,8 @@ export async function discoverAdvisorConfigs(cwd: string, agentDir?: string): Pr
   let mainEnabled: boolean | undefined;
   let syncBacklog: SyncBacklogConfig | undefined;
   let immuneTurns: number | undefined;
+  let maxBehind: number | undefined;
+  let flushTimeoutMs: number | undefined;
   let parsedAnyConfig = false;
 
   const yaml = items.length > 0 ? await requireYaml() : null;
@@ -431,6 +460,16 @@ export async function discoverAdvisorConfigs(cwd: string, agentDir?: string): Pr
     } else if (doc.immuneTurns !== undefined) {
       console.error(`[pi-omp-advisor] advisor config ${item.path}: ignoring invalid "immuneTurns" (expected a non-negative number)`);
     }
+    if (typeof doc.maxBehind === "number" && Number.isSafeInteger(doc.maxBehind) && doc.maxBehind >= 1) {
+      maxBehind = doc.maxBehind;
+    } else if (doc.maxBehind !== undefined) {
+      console.error(`[pi-omp-advisor] advisor config ${item.path}: ignoring invalid "maxBehind" (expected an integer >= 1)`);
+    }
+    if (typeof doc.flushTimeoutMs === "number" && Number.isSafeInteger(doc.flushTimeoutMs) && doc.flushTimeoutMs >= 100) {
+      flushTimeoutMs = doc.flushTimeoutMs;
+    } else if (doc.flushTimeoutMs !== undefined) {
+      console.error(`[pi-omp-advisor] advisor config ${item.path}: ignoring invalid "flushTimeoutMs" (expected an integer >= 100)`);
+    }
 
     if (Array.isArray(doc.advisors)) {
       for (const raw of doc.advisors) {
@@ -456,6 +495,8 @@ export async function discoverAdvisorConfigs(cwd: string, agentDir?: string): Pr
           enabled: entry.enabled,
           contextTokens: entry.contextTokens,
           includePrimaryThinking: entry.includePrimaryThinking,
+          maxBehind: entry.maxBehind ?? maxBehind,
+          flushTimeoutMs: entry.flushTimeoutMs ?? flushTimeoutMs,
         });
       }
     }
@@ -468,6 +509,8 @@ export async function discoverAdvisorConfigs(cwd: string, agentDir?: string): Pr
     mainEnabled,
     syncBacklog,
     immuneTurns,
+    maxBehind,
+    flushTimeoutMs,
     configFound: parsedAnyConfig,
   };
 }
@@ -500,6 +543,10 @@ export interface WatchdogConfigDoc {
   syncBacklog?: SyncBacklogConfig;
   /** See {@link DiscoveredAdvisors.immuneTurns}. */
   immuneTurns?: number;
+  /** Maximum queued batches waiting for an advisor before coalescing (default 3, min 1). */
+  maxBehind?: number;
+  /** In-flight tool flush timeout in milliseconds (default 3000ms, min 100). */
+  flushTimeoutMs?: number;
 }
 
 export function advisorConfigFilePath(scope: AdvisorConfigScope, dirs: { projectDir: string; agentDir: string }): string {
@@ -591,6 +638,12 @@ export async function loadWatchdogConfigFile(filePath: string): Promise<Watchdog
   if (typeof doc.immuneTurns === "number" && Number.isFinite(doc.immuneTurns) && doc.immuneTurns >= 0) {
     result.immuneTurns = Math.floor(doc.immuneTurns);
   }
+  if (typeof doc.maxBehind === "number" && Number.isSafeInteger(doc.maxBehind) && doc.maxBehind >= 1) {
+    result.maxBehind = doc.maxBehind;
+  }
+  if (typeof doc.flushTimeoutMs === "number" && Number.isSafeInteger(doc.flushTimeoutMs) && doc.flushTimeoutMs >= 100) {
+    result.flushTimeoutMs = doc.flushTimeoutMs;
+  }
   return result;
 }
 
@@ -614,6 +667,8 @@ export async function serializeWatchdogConfig(doc: WatchdogConfigDoc): Promise<s
     }
   }
   if (doc.immuneTurns !== undefined) plain.immuneTurns = doc.immuneTurns;
+  if (doc.maxBehind !== undefined) plain.maxBehind = doc.maxBehind;
+  if (doc.flushTimeoutMs !== undefined) plain.flushTimeoutMs = doc.flushTimeoutMs;
 
   if (doc.advisors.length > 0) {
     plain.advisors = doc.advisors.map(a => {
@@ -624,6 +679,8 @@ export async function serializeWatchdogConfig(doc: WatchdogConfigDoc): Promise<s
       if (a.enabled !== undefined) entry.enabled = a.enabled;
       if (a.contextTokens !== undefined) entry.contextTokens = a.contextTokens;
       if (a.includePrimaryThinking !== undefined) entry.includePrimaryThinking = a.includePrimaryThinking;
+      if (a.maxBehind !== undefined) entry.maxBehind = a.maxBehind;
+      if (a.flushTimeoutMs !== undefined) entry.flushTimeoutMs = a.flushTimeoutMs;
       return entry;
     });
   }
