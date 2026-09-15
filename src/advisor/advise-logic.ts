@@ -180,13 +180,22 @@ export function advisorSeverityRank(severity: AdvisorSeverity | undefined): numb
 
 /**
  * State machine backing the `advise` tool: escalation-rank dedupe plus
- * mid-turn deferral. One instance per advisor. Framework-agnostic — the pi
+ * intra-review deferral. One instance per advisor. Framework-agnostic — the pi
  * `defineTool` wrapper (./advise-tool.ts) owns the actual tool
  * registration/schema and calls into this.
+ *
+ * Non-blocker notes are held while `#reviewing` is true so the advisor can
+ * investigate with its granted tools and revise or withdraw them before handoff.
+ * When `finishUpdate()` is called upon successful review completion, accepted
+ * notes are released to the host delivery routing (`resolveAdvisorDeliveryChannel`).
+ * Parking notes across updates during an active run would strand them (violating
+ * the active-run delivery contract described in {@link resolveAdvisorDeliveryChannel},
+ * where withholding notes dumps them as one burst at settle); releasing them at
+ * review completion ensures active-run concerns steer immediately, nits queue as
+ * asides, and only post-settle notes enter the preserved inbox.
  */
 export class AdviseState {
   #deliveredNoteSeverities = new Map<string, number>();
-  #inProgressUpdate = false;
   #reviewing = false;
   #deferredNotes: PendingAdvisorNote[] = [];
 
@@ -196,21 +205,27 @@ export class AdviseState {
   ) {}
 
   /** Begin review without releasing older notes before the model sees the update. */
-  beginUpdate(inProgress: boolean): void {
-    this.#inProgressUpdate = inProgress;
+  beginUpdate(_inProgress?: boolean): void {
     this.#reviewing = true;
   }
 
-  /** Release remaining deferred notes only after a successful final-update review. */
+  /** Release remaining deferred notes after this review completes successfully. */
   finishUpdate(): void {
     this.#reviewing = false;
-    if (this.#inProgressUpdate) return;
     // Remove each note after successful routing so a throwing host does not
     // silently lose the remainder. An unsuccessful review never calls this.
     while (this.#deferredNotes.length > 0) {
       this.#deliver(this.#deferredNotes[0]!);
       this.#deferredNotes.shift();
     }
+  }
+
+  /** Discard any unreleased notes from a cancelled, aborted, or failed review and return them. */
+  discardDeferredNotes(): PendingAdvisorNote[] {
+    this.#reviewing = false;
+    const discarded = this.#deferredNotes;
+    this.#deferredNotes = [];
+    return discarded;
   }
 
   /** Copies, not live records. External pending advice is scoped by the host. */
@@ -222,13 +237,14 @@ export class AdviseState {
   }
 
   /** Replace content, not urgency; revisions neither create notes nor spend a new-note slot. */
-  revise(adviceId: string, note: string): { changed: boolean; text: string } {
+  revise(adviceId: string, note: string): { changed: boolean; text: string; oldNote?: string } {
     if (!note.trim()) return { changed: false, text: "An empty revision is not advice. Use withdraw_advice to remove it." };
     const pending = this.#deferredNotes.find(item => item.adviceId === adviceId);
     if (pending) {
+      const oldNote = pending.note;
       pending.note = note;
       pending.updatedAt = Date.now();
-      return { changed: true, text: `Updated pending advice ${adviceId}.` };
+      return { changed: true, text: `Updated pending advice ${adviceId}.`, oldNote };
     }
     const queued = this.pendingAccess?.list().find(item => item.adviceId === adviceId);
     if (queued && this.pendingAccess!.revise(adviceId, note)) {
@@ -243,11 +259,11 @@ export class AdviseState {
     return this.#notPending();
   }
 
-  withdraw(adviceId: string): { changed: boolean; text: string } {
+  withdraw(adviceId: string): { changed: boolean; text: string; withdrawnNote?: string } {
     const index = this.#deferredNotes.findIndex(item => item.adviceId === adviceId);
     if (index >= 0) {
-      this.#deferredNotes.splice(index, 1);
-      return { changed: true, text: `Withdrew pending advice ${adviceId}.` };
+      const [removed] = this.#deferredNotes.splice(index, 1);
+      return { changed: true, text: `Withdrew pending advice ${adviceId}.`, withdrawnNote: removed?.note };
     }
     if (this.pendingAccess?.withdraw(adviceId)) {
       return { changed: true, text: `Withdrew queued advice ${adviceId}.` };
@@ -282,7 +298,6 @@ export class AdviseState {
   /** Clear per-session state at a genuine conversation reset. */
   resetDeliveredNotes(): void {
     this.#deliveredNoteSeverities.clear();
-    this.#inProgressUpdate = false;
     this.#reviewing = false;
     this.#deferredNotes = [];
   }
@@ -298,10 +313,10 @@ export class AdviseState {
     const record: PendingAdvisorNote = existing ?? { adviceId: randomUUID(), note, severity, createdAt: now, updatedAt: now };
     if (existing && advisorSeverityRank(severity) > advisorSeverityRank(existing.severity)) existing.severity = severity;
 
-    if ((this.#inProgressUpdate || this.#reviewing) && severity !== "blocker") {
+    if (this.#reviewing && severity !== "blocker") {
       if (!existing) this.#deferredNotes.push(record);
       return {
-        text: `Deferred advice ${record.adviceId}. It remains editable with revise_advice or withdraw_advice until released after a successful final-update review.`,
+        text: `Deferred advice ${record.adviceId}. It remains editable with revise_advice or withdraw_advice until review completes (or while queued in the inbox).`,
         delivered: false,
         adviceId: record.adviceId,
       };

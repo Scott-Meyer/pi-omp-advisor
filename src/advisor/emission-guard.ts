@@ -176,4 +176,13 @@ export class AdvisorEmissionGuard {
       if (stale !== undefined) this.#seen.delete(stale);
     }
   }
+
+  /** Forget a note that was discarded before delivery so it can be re-raised in a future review. */
+  forget(note: string): void {
+    const key = normalizeAdvisorNote(note);
+    if (!key || !this.#seen.has(key)) return;
+    this.#seen.delete(key);
+    const idx = this.#seenOrder.indexOf(key);
+    if (idx >= 0) this.#seenOrder.splice(idx, 1);
+  }
 }

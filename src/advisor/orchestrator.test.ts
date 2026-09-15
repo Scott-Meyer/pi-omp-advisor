@@ -24,7 +24,7 @@ type Review = (text: string, call: (name: string, args?: Record<string, unknown>
 
 // Substitute only the model/session boundary: real batching, tools, state,
 // prompt assembly, resource isolation and host inbox remain in the exercise.
-async function harness(t: TestContext, review: Review, options?: { stop?: PrimaryStopAccess; contextTokens?: number; includePrimaryThinking?: boolean; syncBacklog?: unknown; maxBehind?: number; flushTimeoutMs?: number; primary?: { isStreaming(): boolean; isAborting(): boolean; isAutoResumeSuppressed(): boolean } }) {
+async function harness(t: TestContext, review: Review, options?: { stop?: PrimaryStopAccess; contextTokens?: number; includePrimaryThinking?: boolean; syncBacklog?: unknown; maxBehind?: number; flushTimeoutMs?: number; primary?: { isStreaming(): boolean; isAborting(): boolean; isAutoResumeSuppressed(): boolean; hasQueuedWork?(): boolean } }) {
   const cwd = await mkdtemp(join(tmpdir(), "advisor-orchestrator-"));
   const agentDir = join(cwd, "agent-config");
   await mkdir(agentDir);
@@ -49,7 +49,7 @@ async function harness(t: TestContext, review: Review, options?: { stop?: Primar
     isStreaming: () => options?.primary?.isStreaming() ?? false,
     isAborting: () => options?.primary?.isAborting() ?? false,
     isAutoResumeSuppressed: () => options?.primary?.isAutoResumeSuppressed() ?? false,
-    hasQueuedWork: () => false,
+    hasQueuedWork: () => options?.primary?.hasQueuedWork?.() ?? false,
     setStatus: () => {},
   };
   let sessionCount = 0;
@@ -147,37 +147,41 @@ function update(orchestrator: AdvisorOrchestrator, final: boolean) {
   else orchestrator.onTurnStart();
 }
 
-test("real review tools revise/withdraw deferred notes before final review releases them", async t => {
-  let turn = 0;
+test("real review tools revise/withdraw deferred notes before review releases them", async t => {
   let firstId = "";
-  let secondId = "";
-  const reviewingFinal = deferred();
-  const finishFinal = deferred();
-  const { orchestrator, inbox } = await harness(t, async (text, call) => {
-    turn++;
-    if (turn === 1) firstId = (await call("advise", { note: "Check tag policy", severity: "concern" })).adviceId;
-    else if (turn === 2) secondId = (await call("advise", { note: "Login pending", severity: "concern" })).adviceId;
-    else {
-      assert.match(text, /Your pending advice/);
-      const pending = await call("pending_advice");
-      assert.deepEqual(pending.pending.map((note: any) => note.adviceId), [firstId, secondId]);
-      assert.equal((await call("revise_advice", { adviceId: firstId, note: "Check tag rule type" })).changed, true);
-      assert.equal((await call("withdraw_advice", { adviceId: secondId })).changed, true);
-      reviewingFinal.resolve();
-      await finishFinal.promise;
-    }
+  const reviewing = deferred();
+  const finishReview = deferred();
+  const { orchestrator, inbox } = await harness(t, async (_text, call) => {
+    firstId = (await call("advise", { note: "Check tag policy", severity: "concern" })).adviceId;
+    const pending = await call("pending_advice");
+    assert.deepEqual(pending.pending.map((note: any) => note.adviceId), [firstId]);
+    assert.equal((await call("revise_advice", { adviceId: firstId, note: "Check tag rule type" })).changed, true);
+    reviewing.resolve();
+    await finishReview.promise;
   });
-  update(orchestrator, false);
-  assert.equal(await orchestrator.drainForExit(1000), true);
-  update(orchestrator, false);
-  assert.equal(await orchestrator.drainForExit(1000), true);
   update(orchestrator, true);
-  await reviewingFinal.promise;
-  assert.equal(inbox.items.length, 0, "still held while final review is running");
-  finishFinal.resolve();
+  await reviewing.promise;
+  assert.equal(inbox.items.length, 0, "still held while review is running");
+  finishReview.resolve();
   assert.equal(await orchestrator.drainForExit(1000), true);
   assert.deepEqual(inbox.items.map(note => note.note), ["Check tag rule type"]);
   assert.equal(inbox.items[0]!.adviceId, firstId);
+});
+
+test("real review tools can withdraw deferred notes before review releases them", async t => {
+  const reviewing = deferred();
+  const finishReview = deferred();
+  const { orchestrator, inbox } = await harness(t, async (_text, call) => {
+    const note = await call("advise", { note: "Login pending", severity: "concern" });
+    assert.equal((await call("withdraw_advice", { adviceId: note.adviceId })).changed, true);
+    reviewing.resolve();
+    await finishReview.promise;
+  });
+  update(orchestrator, true);
+  await reviewing.promise;
+  finishReview.resolve();
+  assert.equal(await orchestrator.drainForExit(1000), true);
+  assert.deepEqual(inbox.items, []);
 });
 
 test("pending IDs survive a model-context rebuild and remain withdrawable", async t => {
@@ -201,24 +205,19 @@ test("pending IDs survive a model-context rebuild and remain withdrawable", asyn
   assert.deepEqual(inbox.items, []);
 });
 
-test("pausing during final review does not release notes even when an aborted prompt resolves", async t => {
+test("pausing during review does not release notes even when an aborted prompt resolves", async t => {
   let turn = 0;
-  const reviewingFinal = deferred();
+  const reviewing = deferred();
   const { orchestrator, inbox, sent } = await harness(t, async (_text, call, signal) => {
-    if (++turn === 1) await call("advise", { note: "Needs a second look", severity: "concern" });
-    else if (turn === 2) {
-      reviewingFinal.resolve();
+    turn++;
+    if (turn === 1) {
+      await call("advise", { note: "Needs a second look", severity: "concern" });
+      reviewing.resolve();
       await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
-    } else {
-      const pending = await call("pending_advice");
-      assert.equal(pending.pending[0].note, "Needs a second look");
-      await call("withdraw_advice", { adviceId: pending.pending[0].adviceId });
     }
   });
-  update(orchestrator, false);
-  await orchestrator.drainForExit(1000);
   update(orchestrator, true);
-  await reviewingFinal.promise;
+  await reviewing.promise;
   await orchestrator.setPaused(true);
   assert.deepEqual(inbox.items, []);
   assert.deepEqual(sent, []);
@@ -228,57 +227,49 @@ test("pausing during final review does not release notes even when an aborted pr
   assert.deepEqual(inbox.items, []);
 });
 
-test("a provider error that resolves normally does not count as final review", async t => {
+test("a provider error that resolves normally does not count as a completed review", async t => {
   t.mock.method(console, "error", () => {});
   const recovered = deferred();
   let turn = 0;
   const { orchestrator, inbox } = await harness(t, async (_text, call) => {
     turn++;
-    if (turn === 1) await call("advise", { note: "Check before shipping", severity: "concern" });
-    else if (turn === 2 || turn === 3) return "error";
+    if (turn === 1) {
+      await call("advise", { note: "Check before shipping", severity: "concern" });
+      return "error";
+    } else if (turn === 2) return "error";
     else {
       const pending = await call("pending_advice");
-      assert.equal(pending.pending.length, 1, "failed review retains its editable note");
-      await call("withdraw_advice", { adviceId: pending.pending[0].adviceId });
+      assert.equal(pending.pending.length, 0, "failed review notes were discarded");
       recovered.resolve();
     }
   }, { includePrimaryThinking: true });
-  update(orchestrator, false);
-  await orchestrator.drainForExit(1000);
   update(orchestrator, true);
   await orchestrator.drainForExit(1000);
-  assert.equal(turn, 3, "existing thinking-stripped retry was exercised");
+  assert.equal(turn, 2, "existing thinking-stripped retry was exercised");
   assert.equal(inbox.items.length, 0);
   update(orchestrator, true);
   await recovered.promise;
-  assert.equal(turn, 4);
+  assert.equal(turn, 3);
   assert.equal(inbox.items.length, 0);
 });
 
 for (const action of ["pause/resume", "reset"] as const) {
   test(`${action} waits for the directly prompted Agent before proceeding`, { timeout: 5000 }, async t => {
     let turn = 0;
-    let id = "";
     const reviewingFinal = deferred();
     const aborted = deferred();
     const finishCleanup = deferred();
     t.after(() => finishCleanup.resolve());
     const { orchestrator, inbox, sent, sessionCount } = await harness(t, async (_text, call, signal) => {
       turn++;
-      if (turn === 1) id = (await call("advise", { note: "Check this assumption", severity: "concern" })).adviceId;
-      else if (turn === 2) {
+      if (turn === 1) {
+        await call("advise", { note: "Check this assumption", severity: "concern" });
         reviewingFinal.resolve();
         await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
         aborted.resolve();
         await finishCleanup.promise;
-      } else {
-        const pending = await call("pending_advice");
-        assert.equal(pending.pending[0].adviceId, id);
-        await call("withdraw_advice", { adviceId: id });
       }
     });
-    update(orchestrator, false);
-    await orchestrator.drainForExit(1000);
     update(orchestrator, true);
     await reviewingFinal.promise;
 
@@ -385,19 +376,18 @@ for (const reason of ["length", "deferred"] as const) {
     let id = "";
     const { orchestrator, inbox, whenPreserved } = await harness(t, async (_text, call) => {
       turn++;
-      if (turn === 1) id = (await call("advise", { note: "Reconsider this", severity: "concern" })).adviceId;
-      else if (turn === 2 || turn === 3) return reason;
+      if (turn === 1) {
+        await call("advise", { note: "Reconsider this", severity: "concern" });
+        return reason;
+      } else if (turn === 2) return "error";
       else {
-        const pending = await call("pending_advice");
-        assert.equal(pending.pending[0].adviceId, id);
-        // Successful reconsideration retains this note for normal release.
+        const result = await call("advise", { note: "Reconsider this", severity: "concern" });
+        id = result.adviceId;
       }
     }, { includePrimaryThinking: true });
-    update(orchestrator, false);
-    await orchestrator.drainForExit(1000);
     update(orchestrator, true);
     await orchestrator.drainForExit(1000);
-    assert.equal(turn, 3);
+    assert.equal(turn, 2);
     assert.equal(inbox.items.length, 0);
     update(orchestrator, true);
     await whenPreserved;
@@ -440,18 +430,31 @@ test("revision duplicate tracking stays wired before and after a model-context r
       id = (await call("advise", { note: "Original observation", severity: "concern" })).adviceId;
       return;
     }
-    const text = `Updated observation ${turn}`;
-    assert.equal((await call("revise_advice", { adviceId: id, note: text })).changed, true);
-    assert.equal((await call("advise", { note: text.toUpperCase(), severity: "concern" })).suppressed, true);
-    assert.equal((await call("advise", { note: `Independent observation ${turn}`, severity: "nit" })).suppressed, false);
+    if (turn <= 3) {
+      const text = `Updated observation ${turn}`;
+      assert.equal((await call("revise_advice", { adviceId: id, note: text })).changed, true);
+      assert.equal((await call("advise", { note: text.toUpperCase(), severity: "concern" })).suppressed, true);
+      assert.equal((await call("advise", { note: `Independent observation ${turn}`, severity: "nit" })).suppressed, false);
+      return;
+    }
+    if (turn === 4) {
+      const temp = await call("advise", { note: "Temporary post-rebuild note", severity: "concern" });
+      assert.equal((await call("withdraw_advice", { adviceId: temp.adviceId })).changed, true);
+      return;
+    }
+    if (turn === 5) {
+      const reRaised = await call("advise", { note: "Temporary post-rebuild note", severity: "concern" });
+      assert.equal(reRaised.suppressed, false, "withdrawn note post-rebuild must not be permanently blocked");
+      return;
+    }
   });
-  for (let step = 1; step <= 3; step++) {
+  for (let step = 1; step <= 5; step++) {
     if (step === 3) await orchestrator.resetRuntimesOnly();
     update(orchestrator, true);
     assert.equal(await orchestrator.drainForExit(1000), true);
   }
   assert.equal(sessionCount(), 2);
-  assert.deepEqual(inbox.items.map(note => note.note), ["Updated observation 3", "Independent observation 2", "Independent observation 3"]);
+  assert.deepEqual(inbox.items.map(note => note.note), ["Updated observation 3", "Independent observation 2", "Independent observation 3", "Temporary post-rebuild note"]);
   assert.equal(inbox.items[0]!.adviceId, id);
 });
 
@@ -705,5 +708,123 @@ test("flushes in-flight held batch to advisor when flushTimeoutMs expires", asyn
   assert.match(receivedText, /in progress — more steps follow/);
 
   await orchestrator.drainForExit(1000);
+});
+
+test("healthy active-run concern steers live into streaming primary", async t => {
+  let id = "";
+  const { orchestrator, inbox, sent } = await harness(t, async (_text, call) => {
+    const result = await call("advise", { note: "Wrong test target", severity: "concern" });
+    id = result.adviceId;
+  }, { primary: {
+    isStreaming: () => true,
+    isAborting: () => false,
+    isAutoResumeSuppressed: () => false,
+  } });
+  update(orchestrator, false);
+  assert.equal(await orchestrator.drainForExit(1000), true);
+  assert.equal(inbox.items.length, 0, "active-run concern must not go to inbox");
+  assert.equal(sent.length, 1, "active-run concern must steer into live primary");
+  assert.equal(sent[0]!.options.deliverAs, "steer");
+  assert.equal(sent[0]!.options.triggerTurn, true);
+  assert.match(sent[0]!.content, /Wrong test target/);
+  assert.ok(id);
+});
+
+test("healthy active-run nit delivers as aside to streaming primary", async t => {
+  const { orchestrator, inbox, sent } = await harness(t, async (_text, call) => {
+    await call("advise", { note: "Style nit", severity: "nit" });
+  }, { primary: {
+    isStreaming: () => true,
+    isAborting: () => false,
+    isAutoResumeSuppressed: () => false,
+  } });
+  update(orchestrator, false);
+  assert.equal(await orchestrator.drainForExit(1000), true);
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(inbox.items.length, 0, "active-run nit must not go to inbox");
+  assert.equal(sent.length, 1, "active-run nit must deliver as aside");
+  assert.equal(sent[0]!.options.deliverAs, "steer");
+  assert.equal(sent[0]!.options.triggerTurn, undefined);
+  assert.match(sent[0]!.content, /Style nit/);
+});
+
+test("settled primary review preserves concern to inbox when no queued work", async t => {
+  let id = "";
+  const { orchestrator, inbox, sent } = await harness(t, async (_text, call) => {
+    const result = await call("advise", { note: "Late concern", severity: "concern" });
+    id = result.adviceId;
+  }, { primary: {
+    isStreaming: () => false,
+    isAborting: () => false,
+    isAutoResumeSuppressed: () => false,
+    hasQueuedWork: () => false,
+  } });
+  update(orchestrator, true);
+  assert.equal(await orchestrator.drainForExit(1000), true);
+  assert.equal(sent.length, 0, "settled concern must not steer");
+  assert.equal(inbox.items.length, 1, "settled concern must preserve to inbox");
+  assert.equal(inbox.items[0]!.adviceId, id);
+  assert.equal(inbox.items[0]!.note, "Late concern");
+});
+
+test("settled primary review steers concern when queued work exists", async t => {
+  let id = "";
+  const { orchestrator, inbox, sent } = await harness(t, async (_text, call) => {
+    const result = await call("advise", { note: "Work in queue concern", severity: "concern" });
+    id = result.adviceId;
+  }, { primary: {
+    isStreaming: () => false,
+    isAborting: () => false,
+    isAutoResumeSuppressed: () => false,
+    hasQueuedWork: () => true,
+  } });
+  update(orchestrator, true);
+  assert.equal(await orchestrator.drainForExit(1000), true);
+  assert.equal(inbox.items.length, 0, "must not preserve when queued work exists");
+  assert.equal(sent.length, 1, "must steer when queued work exists");
+  assert.equal(sent[0]!.options.deliverAs, "steer");
+  assert.equal(sent[0]!.options.triggerTurn, true);
+  assert.match(sent[0]!.content, /Work in queue concern/);
+  assert.ok(id);
+});
+
+test("settled primary review steers blocker even when idle and no queued work", async t => {
+  let id = "";
+  const { orchestrator, inbox, sent } = await harness(t, async (_text, call) => {
+    const result = await call("advise", { note: "Critical handoff failure", severity: "blocker" });
+    id = result.adviceId;
+  }, { primary: {
+    isStreaming: () => false,
+    isAborting: () => false,
+    isAutoResumeSuppressed: () => false,
+    hasQueuedWork: () => false,
+  } });
+  update(orchestrator, true);
+  assert.equal(await orchestrator.drainForExit(1000), true);
+  assert.equal(inbox.items.length, 0, "blocker must not preserve to inbox");
+  assert.equal(sent.length, 1, "blocker must steer into primary");
+  assert.equal(sent[0]!.options.deliverAs, "steer");
+  assert.equal(sent[0]!.options.triggerTurn, true);
+  assert.match(sent[0]!.content, /Critical handoff failure/);
+  assert.ok(id);
+});
+
+test("settled primary review preserves nit to inbox", async t => {
+  let id = "";
+  const { orchestrator, inbox, sent } = await harness(t, async (_text, call) => {
+    const result = await call("advise", { note: "Late nit", severity: "nit" });
+    id = result.adviceId;
+  }, { primary: {
+    isStreaming: () => false,
+    isAborting: () => false,
+    isAutoResumeSuppressed: () => false,
+    hasQueuedWork: () => false,
+  } });
+  update(orchestrator, true);
+  assert.equal(await orchestrator.drainForExit(1000), true);
+  assert.equal(sent.length, 0, "settled nit must not steer");
+  assert.equal(inbox.items.length, 1, "settled nit must preserve to inbox");
+  assert.equal(inbox.items[0]!.adviceId, id);
+  assert.equal(inbox.items[0]!.note, "Late nit");
 });
 

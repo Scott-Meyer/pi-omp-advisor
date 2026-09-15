@@ -160,12 +160,14 @@ copyright Scott Meyer, MIT (see `LICENSE`):
    `withdraw_advice` operate on this advisor's deferred notes and extension-held
    queues only. Stable receipts and timestamps follow preserved notes into the
    inbox; revision keeps urgency unchanged. Deferred notes flush after successful
-   final-update review, not before the model sees that update. Errors/aborts do
+   review completion, not before the model completes that review. Errors/aborts do
    not flush them. Within-session context rebuilds retain the state and pending
    IDs; a full reload retains only the persisted inbox. Tool feedback distinguishes
    queued advice from a rejected new submission without inventing delivery.
    Successful revisions register replacement text in duplicate tracking without
-   consuming the new-note allowance. No new investigative tools or fuller primary transcript are granted.
+   consuming the new-note allowance, and withdrawn notes or previous revision drafts
+   forget their text in the emission guard so retracted ideas are not permanently blackholed.
+   No new investigative tools or fuller primary transcript are granted.
 12. **Prompt assembly and history-gap cues.** Dynamic template substitutions use
    callbacks so literal `$&`, `$$`, and similar text in project instructions are
    preserved. Brief startup/reset/resume cues describe missing history rather

@@ -27,6 +27,7 @@ export async function makeAdviseTool(
   existingState?: AdviseState,
   stopAccess?: PrimaryStopAccess,
   rememberRevision: (note: string) => void = () => {},
+  forgetNote: (note: string) => void = () => {},
 ): Promise<{ tool: ReturnType<typeof defineTool>; controlTools: ReturnType<typeof defineTool>[]; state: AdviseState }> {
   const fs = await import("node:fs/promises");
   const description = await fs.readFile(adviseDescription, "utf8");
@@ -86,7 +87,10 @@ export async function makeAdviseTool(
     }),
     async execute(_id, params) {
       const result = state.revise(params.adviceId, params.note);
-      if (result.changed) rememberRevision(params.note);
+      if (result.changed) {
+        if (result.oldNote) forgetNote(result.oldNote);
+        rememberRevision(params.note);
+      }
       return { content: [{ type: "text", text: result.text }], details: result };
     },
   });
@@ -97,6 +101,9 @@ export async function makeAdviseTool(
     parameters: Type.Object({ adviceId: Type.String({ description: "The adviceId returned by advise or pending_advice." }) }),
     async execute(_id, params) {
       const result = state.withdraw(params.adviceId);
+      if (result.changed && result.withdrawnNote) {
+        forgetNote(result.withdrawnNote);
+      }
       return { content: [{ type: "text", text: result.text }], details: result };
     },
   });

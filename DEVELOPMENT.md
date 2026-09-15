@@ -293,13 +293,18 @@ that protects the mechanics but does not replace this two-model session test.
   applying a fresh one-note budget to a batch would silently discard the rest.
   Revisions edit a held note and do not create a new one.
 - **Review before release.** `beginUpdate` leaves deferred advice editable.
-  Only a completed final review calls `finishUpdate`; truncated/deferred
-  responses, errors, pauses, and stale runtime generations cannot flush it.
-  Context rebuilds reuse the pending state. Reviews call `Agent.prompt`
-  directly, so cancellation uses `Agent.abort` and `Agent.waitForIdle` too;
-  the `AgentSession` wrapper's separate streaming flag does not track that run.
-  The deterministic session-boundary tests in `orchestrator.test.ts` exercise
-  actual tool registration and delivery without a live provider.
+  A completed review calls `finishUpdate` to release accepted notes into the
+  delivery channels (steer for concerns during active work, aside for nits,
+  and preserve to inbox only after primary settlement). Truncated/deferred
+  responses, errors, pauses, and stale runtime generations cannot flush them
+  and forget their discarded text in the emission guard so retracted or failed
+  notes are not permanently blackholed.
+  Context rebuilds reuse the pending state and wire the forget callback.
+  Reviews call `Agent.prompt` directly, so cancellation uses `Agent.abort` and
+  `Agent.waitForIdle` too; the `AgentSession` wrapper's separate streaming flag
+  does not track that run. The deterministic session-boundary tests in
+  `orchestrator.test.ts` exercise actual tool registration and delivery without
+  a live provider.
 - **Handoff is the recall boundary, not model consumption.** Pending tools can
   edit extension-held notes only. Resolve inbox menu snapshots against current
   IDs just before sending, so revisions and withdrawals cannot leak stale text.

@@ -372,6 +372,7 @@ export class AdvisorOrchestrator {
       routeAdvice, note => emissionGuard.accept(note), this.#pendingAccess(sourceName), undefined,
       config.tools?.includes("request_stop") ? this.#stopAccess(sourceName) : undefined,
       note => emissionGuard.remember(note),
+      note => emissionGuard.forget(note),
     );
 
     const resourceLoader = new DefaultResourceLoader({
@@ -535,6 +536,8 @@ export class AdvisorOrchestrator {
         advisor.pendingMessages = [];
         advisor.awaitingBatch = undefined;
         advisor.queue = [];
+        const discarded = advisor.adviseState.discardDeferredNotes();
+        for (const note of discarded) advisor.emissionGuard.forget(note.note);
         // Reviews use Agent.prompt directly, so AgentSession's separate run
         // flag/idle waiter does not track them. Cancel at the same API layer.
         advisor.generation++;
@@ -577,6 +580,8 @@ export class AdvisorOrchestrator {
       advisor.pendingMessages = [];
       advisor.awaitingBatch = undefined;
       advisor.queue = [];
+      const discarded = advisor.adviseState.discardDeferredNotes();
+      for (const note of discarded) advisor.emissionGuard.forget(note.note);
       const oldSession = advisor.session;
       const oldMemory = advisor.memory;
       advisor.generation++;
@@ -611,6 +616,7 @@ export class AdvisorOrchestrator {
           this.#pendingAccess(advisor.sourceName), advisor.adviseState,
           advisor.config.tools?.includes("request_stop") ? this.#stopAccess(advisor.sourceName) : undefined,
           note => advisor.emissionGuard.remember(note),
+          note => advisor.emissionGuard.forget(note),
         );
         const created = await this.createSession({
           sessionManager: SessionManager.inMemory(ctx.cwd),
@@ -837,6 +843,8 @@ export class AdvisorOrchestrator {
           if (await attempt(false)) advisor.status = "running";
           return;
         } catch (retryErr) {
+          const discarded = advisor.adviseState.discardDeferredNotes();
+          for (const note of discarded) advisor.emissionGuard.forget(note.note);
           advisor.status = "error";
           console.error(
             `[pi-omp-advisor:${advisor.config.name}] advisor turn failed after thinking-stripped retry: ${retryErr instanceof Error ? retryErr.message : String(retryErr)}`,
@@ -844,6 +852,8 @@ export class AdvisorOrchestrator {
           return;
         }
       }
+      const discarded = advisor.adviseState.discardDeferredNotes();
+      for (const note of discarded) advisor.emissionGuard.forget(note.note);
       advisor.status = "error";
       console.error(`[pi-omp-advisor:${advisor.config.name}] advisor turn failed: ${err instanceof Error ? err.message : String(err)}`);
     }

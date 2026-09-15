@@ -13,24 +13,20 @@ function access(inbox: AdvisorInbox, advisor: string): PendingAdviceAccess {
   };
 }
 
-test("final review can revise and withdraw old notes before any are released", () => {
+test("review can revise and withdraw notes before they are released upon completion", () => {
   const sent: PendingAdvisorNote[] = [];
   const state = new AdviseState(note => sent.push(note));
-  state.beginUpdate(true);
+  state.beginUpdate();
   const first = state.submit("Check the tag policy", "concern");
   const second = state.submit("Login is pending", "nit");
-  state.finishUpdate();
-  assert.equal(sent.length, 0);
-
-  state.beginUpdate(false);
-  assert.equal(sent.length, 0, "starting final review must not release stale notes");
+  assert.equal(sent.length, 0, "notes are held deferred during active review");
   assert.equal(state.pendingAdvice().length, 2);
   assert.equal(state.revise(first.adviceId!, "The tag policy exists; check its type").changed, true);
   assert.equal(state.withdraw(second.adviceId!).changed, true);
-  assert.equal(sent.length, 0);
+  assert.equal(sent.length, 0, "withdrawn notes are not sent before review settles");
   state.finishUpdate();
 
-  assert.equal(sent.length, 1);
+  assert.equal(sent.length, 1, "completed review releases accepted notes");
   assert.equal(sent[0]!.adviceId, first.adviceId);
   assert.equal(sent[0]!.note, "The tag policy exists; check its type");
   assert.equal(sent[0]!.severity, "concern");
@@ -86,7 +82,7 @@ for (const deferred of [false, true]) {
     const inbox = new AdvisorInbox();
     const guard = new AdvisorEmissionGuard();
     const tools = await makeAdviseTool(note => inbox.enqueue({ ...note, advisor: "a" }), note => guard.accept(note),
-      access(inbox, "a"), undefined, undefined, note => guard.remember(note));
+      access(inbox, "a"), undefined, undefined, note => guard.remember(note), note => guard.forget(note));
     const invoke = async (tool: typeof tools.tool, args: Record<string, unknown>) =>
       (await tool.execute("fixture", args as any, undefined, undefined, {} as any)).details as any;
     if (deferred) tools.state.beginUpdate(true);
@@ -110,6 +106,76 @@ for (const deferred of [false, true]) {
       "a rejected revision does not reserve its proposed text");
   });
 }
+
+test("withdrawing a deferred note forgets it so it can be re-raised later", async () => {
+  const inbox = new AdvisorInbox();
+  const guard = new AdvisorEmissionGuard();
+  const tools = await makeAdviseTool(
+    note => inbox.enqueue({ ...note, advisor: "a" }),
+    note => guard.accept(note),
+    access(inbox, "a"),
+    undefined,
+    undefined,
+    note => guard.remember(note),
+    note => guard.forget(note),
+  );
+  const invoke = async (tool: typeof tools.tool, args: Record<string, unknown>) =>
+    (await tool.execute("fixture", args as any, undefined, undefined, {} as any)).details as any;
+
+  tools.state.beginUpdate();
+  guard.beginUpdate();
+  const original = await invoke(tools.tool, { note: "Temporary concern", severity: "concern" });
+  assert.equal(original.suppressed, false);
+
+  const withdrawn = await invoke(tools.controlTools.find(tool => tool.name === "withdraw_advice")!, { adviceId: original.adviceId });
+  assert.equal(withdrawn.changed, true);
+  tools.state.finishUpdate();
+  assert.equal(inbox.items.length, 0);
+
+  // In a future review update, the withdrawn text is not blocked by emissionGuard
+  tools.state.beginUpdate();
+  guard.beginUpdate();
+  const reRaised = await invoke(tools.tool, { note: "Temporary concern", severity: "concern" });
+  assert.equal(reRaised.suppressed, false, "withdrawn note text must not be permanently blocked");
+  tools.state.finishUpdate();
+  assert.equal(inbox.items.length, 1);
+});
+
+test("revising a deferred note forgets the old text so it can be re-raised later", async () => {
+  const inbox = new AdvisorInbox();
+  const guard = new AdvisorEmissionGuard();
+  const tools = await makeAdviseTool(
+    note => inbox.enqueue({ ...note, advisor: "a" }),
+    note => guard.accept(note),
+    access(inbox, "a"),
+    undefined,
+    undefined,
+    note => guard.remember(note),
+    note => guard.forget(note),
+  );
+  const invoke = async (tool: typeof tools.tool, args: Record<string, unknown>) =>
+    (await tool.execute("fixture", args as any, undefined, undefined, {} as any)).details as any;
+
+  tools.state.beginUpdate();
+  guard.beginUpdate();
+  const original = await invoke(tools.tool, { note: "Draft wording", severity: "concern" });
+  assert.equal(original.suppressed, false);
+
+  const revised = await invoke(tools.controlTools.find(tool => tool.name === "revise_advice")!, {
+    adviceId: original.adviceId,
+    note: "Final polished wording",
+  });
+  assert.equal(revised.changed, true);
+  tools.state.finishUpdate();
+  assert.equal(inbox.items.length, 1);
+  assert.equal(inbox.items[0]!.note, "Final polished wording");
+
+  // In a future review update, the old text is not blocked by emissionGuard
+  tools.state.beginUpdate();
+  guard.beginUpdate();
+  const oldTextReUsed = await invoke(tools.tool, { note: "Draft wording", severity: "concern" });
+  assert.equal(oldTextReUsed.suppressed, false, "old revised text must not be permanently blocked");
+});
 
 test("advisor tools see and edit only their own queued notes", async () => {
   const inbox = new AdvisorInbox();
