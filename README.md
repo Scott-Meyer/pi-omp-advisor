@@ -84,10 +84,11 @@ does not get a fresh review of that new prompt before those notes are handed off
 
 ### A limited memory, not a second full transcript
 
-Each advisor has a rolling context budget. Older observations and investigative
-exchanges expire instead of being compressed into an accumulating summary.
-Pending advice is stored separately, so expiration does not remove its IDs or
-prevent revision/withdrawal.
+Each advisor has a bounded context budget. Its prefix grows unchanged for
+prompt-cache reuse until a new review would cross the ceiling; then all history
+before that review expires at once. Nothing summarizes or replays the reasoning
+path that filled the old context. Pending advice is stored separately, so a reset
+does not remove its IDs or prevent revision/withdrawal.
 
 The limit applies before **every model request**, including follow-ups after the
 advisor's own tool calls. It counts estimated system/tool overhead as well as
@@ -106,8 +107,9 @@ Standing system/project instructions are not silently cut to make room.
 
 Use `/advisor config` to change each advisor's budget and primary-reasoning setting.
 `/advisor status` shows the effective estimated budget, retained message count,
-and whether content has expired or been shortened. Changing this extension still
-requires `/reload` before the new policy is active.
+whole-history reset count, advisor wakes/model requests/tool calls, and pending
+turn batch. Changing this extension still requires `/reload` before the new
+policy is active.
 
 ### Optional emergency stop
 
@@ -120,9 +122,13 @@ advisors:
 ```
 
 That advisor also gets `current_tool`, which returns the exact execution
-`targetId` and a compact call summary. It receives tool-start updates before
-results, so it can notice a dangerous foreground operation while it is in flight.
-The transcript remains compact; reviews can still lag behind the primary.
+`targetId` and a compact call summary. Tool lifecycle events update this host-side
+state but never wake the advisor model. A normally batched review samples the
+live state immediately before prompting. Separately, the oldest-message timeout
+can review a finalized assistant tool-call message while its tool is still
+running; the default is intentionally four minutes, including when `maxBehind`
+is 1. This makes cancellation a rare fallback rather than one model request per
+tool start.
 
 `request_stop(targetId, reason)` uses Pi's supported **active-turn abort**, not
 arbitrary process control. It accepts only a sole in-flight foreground call and
@@ -199,18 +205,18 @@ advisor with the same name.
 ```yaml
 main: true         # run in normal pi sessions (default true)
 subagents: false   # run inside subagent processes too (default false; see note below)
-syncBacklog: off   # backpressure: off, number of batches, or { pauseAt: 4, resumeAt: 1 } hysteresis
-maxBehind: 3       # max batches waiting before coalescing into a single prompt (default 3, min 1)
-flushTimeoutMs: 3000 # flush in-flight tool calls if held longer than 3000ms (default 3000, min 100)
+syncBacklog: off   # backpressure: off, queued turns, or { pauseAt: 4, resumeAt: 1 } hysteresis
+maxBehind: 3       # completed primary turns accumulated per advisor wake (default 3, min 1)
+flushTimeoutMs: 240000 # maximum age of the oldest unseen message (default 4 minutes, min 100ms)
 
 advisors:
   - name: advisor
     model: openai/gpt-5.1-codex-mini   # or provider/id:high for a thinking level
     tools: [read, grep, glob]     # default; `glob` maps to pi's `find`
-    contextTokens: 100000        # default estimated input ceiling; configurable, minimum 2048
+    contextTokens: 32000         # default estimated input ceiling; configurable, minimum 2048
     includePrimaryThinking: false  # default; independent of the advisor's own thinking level
-    maxBehind: 3          # per-advisor override for queue coalescing
-    flushTimeoutMs: 3000  # per-advisor override for in-flight tool flush
+    maxBehind: 3          # per-advisor turn-batch override
+    flushTimeoutMs: 240000 # per-advisor maximum wait for a partial batch
     instructions: Pay extra attention to auth and data-loss risk.
     enabled: true
 ```

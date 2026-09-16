@@ -177,15 +177,19 @@ copyright Scott Meyer, MIT (see `LICENSE`):
    `ctx.abort()`. Because Pi cancels a whole active turn, the controller accepts
    only a sole foreground call with an exact per-execution target token and a
    recorded reason. It does not control detached jobs, roll back effects, or
-   restart the primary. A stop-enabled advisor receives compact tool-start
-   metadata before results; other advisors retain the original batch cadence.
+   restart the primary. Tool events only update host-side state. A scheduled
+   advisor review samples that state immediately before prompting, while the
+   oldest-message deadline can expose a still-running long call without waking
+   the model on every tool start.
    `src/advisor/primary-stop.ts`, `stop-tools.ts`, and `primary-stop.test.ts`
    are original to this project (Scott Meyer, MIT), not OMP features.
 14. **Bounded advisor model context.** `contextTokens` defaults to 32,000
    estimated input tokens per advisor; `includePrimaryThinking` defaults to false.
-   A public `Agent.transformContext` hook applies the rolling window before every
-   model request, including investigative tool follow-ups. Retained Agent history
-   is trimmed after a review settles. Older context expires without a summary;
+   A public `Agent.transformContext` hook applies the bound before every model
+   request, including investigative tool follow-ups. The prefix grows unchanged
+   for cache reuse until an update would overflow, then all pre-update history
+   expires in one reset. Retained Agent history is trimmed after a review settles.
+   Older context expires without a summary;
    pending-note state remains separate. Originals and their shortened forms share
    expiration state. Tool-call/result groups are evicted together, oversized
    user/tool text is explicitly shortened, and an exchange

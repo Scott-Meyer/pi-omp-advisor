@@ -120,7 +120,7 @@ async function harness(t: TestContext, review: Review, options?: { stop?: Primar
   };
   await writeFile(join(cwd, "WATCHDOG.yml"), [
     "main: true",
-    ...(options?.maxBehind !== undefined ? [`maxBehind: ${options.maxBehind}`] : []),
+    `maxBehind: ${options?.maxBehind ?? 1}`,
     ...(options?.flushTimeoutMs !== undefined ? [`flushTimeoutMs: ${options.flushTimeoutMs}`] : []),
     "advisors:", "  - name: reviewer",
     ...(options?.stop ? ["    tools: [read, grep, glob, request_stop]"] : []),
@@ -253,7 +253,7 @@ test("a provider error that resolves normally does not count as a completed revi
   assert.equal(inbox.items.length, 0);
 });
 
-for (const action of ["pause/resume", "reset"] as const) {
+for (const action of ["pause/resume", "reset", "dispose"] as const) {
   test(`${action} waits for the directly prompted Agent before proceeding`, { timeout: 5000 }, async t => {
     let turn = 0;
     const reviewingFinal = deferred();
@@ -275,23 +275,49 @@ for (const action of ["pause/resume", "reset"] as const) {
 
     const transition = action === "reset"
       ? orchestrator.resetRuntimesOnly()
-      : Promise.all([orchestrator.setPaused(true), orchestrator.setPaused(false)]);
+      : action === "dispose"
+        ? orchestrator.disposeAll()
+        : Promise.all([orchestrator.setPaused(true), orchestrator.setPaused(false)]);
     let transitioned = false;
     const completed = transition.then(() => { transitioned = true; });
     await aborted.promise;
     assert.equal(transitioned, false, "Agent cancellation cleanup is still in flight");
-    assert.equal(sessionCount(), 1, "reset cannot build the replacement session early");
+    assert.equal(sessionCount(), 1, "a transition cannot build or leak a replacement session early");
     assert.equal(inbox.items.length, 0);
     assert.equal(sent.length, 0);
     finishCleanup.resolve();
     await completed;
-    assert.equal(inbox.items.length, 0, "the cancelled final review cannot flush after resume/reset");
-    update(orchestrator, true);
-    assert.equal(await orchestrator.drainForExit(1000), true);
-    assert.equal(inbox.items.length, 0);
+    assert.equal(inbox.items.length, 0, "the cancelled final review cannot flush after the transition");
+    if (action !== "dispose") {
+      update(orchestrator, true);
+      assert.equal(await orchestrator.drainForExit(1000), true);
+      assert.equal(inbox.items.length, 0);
+    }
     assert.equal(sessionCount(), action === "reset" ? 2 : 1);
   });
 }
+
+test("dispose racing a reset cannot create an orphan replacement runtime", { timeout: 5000 }, async t => {
+  const reviewing = deferred();
+  const aborted = deferred();
+  const finishCleanup = deferred();
+  t.after(() => finishCleanup.resolve());
+  const { orchestrator, sessionCount } = await harness(t, async (_text, _call, signal) => {
+    reviewing.resolve();
+    await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+    aborted.resolve();
+    await finishCleanup.promise;
+  });
+  update(orchestrator, true);
+  await reviewing.promise;
+  const reset = orchestrator.resetRuntimesOnly();
+  await aborted.promise;
+  const dispose = orchestrator.disposeAll();
+  finishCleanup.resolve();
+  await Promise.all([reset, dispose]);
+  assert.equal(sessionCount(), 1, "reset observed disposal before constructing a replacement");
+  assert.deepEqual(orchestrator.statusOverview(), []);
+});
 
 for (const includePrimaryThinking of [undefined, true, false]) {
   test(`primary reasoning is ${includePrimaryThinking === true ? "included on explicit opt-in" : "excluded"} (${String(includePrimaryThinking)})`, async t => {
@@ -340,18 +366,17 @@ test("pending advice survives history eviction and remains withdrawable", async 
   assert.equal(status.context?.trimmed, true);
 });
 
-test("stop-enabled advisors see a tool start before its result or turn end", async t => {
-  const reviewed = deferred();
+test("tool lifecycle never wakes an advisor, while a scheduled wake gets live stop metadata", async t => {
   const activity = { targetId: "execution-1", toolCallId: "primary-sleep-1", toolName: "bash", summary: "sleep 180", startedAt: Date.now() };
   const calls: string[] = [];
+  let reviews = 0;
   const { orchestrator } = await harness(t, async (text, call) => {
-    assert.match(text, /Primary tool activity/);
+    reviews++;
+    assert.match(text, /Current primary tool state/);
     assert.match(text, /primary-sleep-1/);
-    const current = await call("current_tool");
-    assert.equal(current.tool.toolCallId, activity.toolCallId);
+    assert.match(text, /execution-1/);
     const result = await call("request_stop", { targetId: activity.targetId, reason: "Explicit user-requested sleep cancellation test" });
     assert.equal(result.requested, true);
-    reviewed.resolve();
   }, {
     stop: {
       currentTool: () => ({ status: "ready", tool: activity, activeCount: 1 }),
@@ -362,11 +387,17 @@ test("stop-enabled advisors see a tool start before its result or turn end", asy
       },
     },
   });
+
+  // The host controller may observe any number of starts; none is an advisor
+  // scheduler event. Only the ordinary turn boundary below causes a review.
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(reviews, 0);
   orchestrator.onMessage({ role: "user", content: "Observe this call and stop the diagnostic sleep", timestamp: Date.now() });
-  orchestrator.onToolStart(activity);
-  await reviewed.promise;
-  assert.deepEqual(calls, [activity.targetId]);
+  orchestrator.onTurnEnd();
+  orchestrator.onAgentSettled();
   assert.equal(await orchestrator.drainForExit(1000), true);
+  assert.equal(reviews, 1);
+  assert.deepEqual(calls, [activity.targetId]);
 });
 
 for (const reason of ["length", "deferred"] as const) {
@@ -535,17 +566,47 @@ for (const boundary of ["completion", "abort"] as const) {
   });
 }
 
-test("waitForCatchup pauses when queue reaches pauseAt and resumes when drained to resumeAt", async t => {
+test("three continuing primary turns produce one advisor wake with one combined delta", async t => {
+  const reviews: string[] = [];
+  const { orchestrator } = await harness(t, async text => { reviews.push(text); }, { maxBehind: 3 });
+  for (let turn = 1; turn <= 3; turn++) {
+    orchestrator.onMessage({ role: "user", content: `batched-turn-${turn}`, timestamp: turn });
+    orchestrator.onTurnEnd();
+    orchestrator.onTurnStart();
+    if (turn < 3) assert.equal(reviews.length, 0);
+  }
+  assert.equal(await orchestrator.drainForExit(1000), true);
+  assert.equal(reviews.length, 1);
+  for (let turn = 1; turn <= 3; turn++) assert.match(reviews[0]!, new RegExp(`batched-turn-${turn}`));
+  const status = orchestrator.statusOverview()[0]!;
+  assert.equal(status.wakes, 1);
+  assert.equal(status.modelRequests, 1);
+});
+
+test("settlement does not wake short runs before the shared turn threshold", async t => {
+  const reviews: string[] = [];
+  const { orchestrator } = await harness(t, async text => { reviews.push(text); }, { maxBehind: 3 });
+  for (let run = 1; run <= 3; run++) {
+    orchestrator.onMessage({ role: "user", content: `short-run-${run}`, timestamp: run });
+    orchestrator.onTurnEnd();
+    orchestrator.onAgentSettled();
+    if (run < 3) assert.equal(reviews.length, 0, "settlement preserves the economical cross-run batch");
+  }
+  assert.equal(await orchestrator.drainForExit(1000), true);
+  assert.equal(reviews.length, 1);
+  for (let run = 1; run <= 3; run++) assert.match(reviews[0]!, new RegExp(`short-run-${run}`));
+  assert.doesNotMatch(reviews[0]!, /in progress — more steps follow/);
+});
+
+test("waitForCatchup pauses when queued turns reach pauseAt and resumes when the merged successor starts", async t => {
   const allowTurn1 = deferred();
-  const allowTurn2 = deferred();
-  const allowTurn3 = deferred();
+  const allowCatchup = deferred();
   let turnCount = 0;
 
   const { orchestrator } = await harness(t, async () => {
     turnCount++;
     if (turnCount === 1) await allowTurn1.promise;
-    else if (turnCount === 2) await allowTurn2.promise;
-    else if (turnCount === 3) await allowTurn3.promise;
+    else if (turnCount === 2) await allowCatchup.promise;
   }, {
     syncBacklog: { pauseAt: 3, resumeAt: 1 },
   });
@@ -589,98 +650,64 @@ test("waitForCatchup pauses when queue reaches pauseAt and resumes when drained 
   await new Promise(r => setTimeout(r, 50));
   assert.equal(catchupReturned, false, "queue length 3 >= pauseAt 3, so MUST block");
 
-  // Let turn 1 complete. Advisor pops turn 2 from queue. Queue length is now 2.
-  // Since resumeAt is 1, queue length 2 > 1, so waitForCatchup must STILL be blocked!
+  // Completing the active review moves the single coalesced successor (turns
+  // 2-4) into the active slot atomically. No queued turns remain, so the
+  // primary may resume while that catch-up review runs.
   allowTurn1.resolve();
-  await new Promise(r => setTimeout(r, 50));
-  assert.equal(catchupReturned, false, "queue length 2 > resumeAt 1, so must remain blocked");
-
-  // Let turn 2 complete. Advisor pops turn 3 from queue. Queue length is now 1.
-  // Since resumeAt is 1, queue length is now <= 1, so waitForCatchup should unblock!
-  allowTurn2.resolve();
   await p;
-  assert.equal(catchupReturned, true, "queue length reached resumeAt 1, so unblocked");
+  assert.equal(catchupReturned, true, "the merged successor left the waiting queue");
+  assert.equal(orchestrator.statusOverview()[0]!.backlog, 0);
 
-  // Clean up
-  allowTurn3.resolve();
+  allowCatchup.resolve();
   await orchestrator.drainForExit(1000);
 });
 
-test("coalesces waiting queue items when backlog reaches maxBehind", async t => {
-  const allowTurn1 = deferred();
-  const allowTurn2 = deferred();
-  const allowTurn3 = deferred();
-  let turnCount = 0;
+test("batches turns while keeping at most one merged successor behind a busy advisor", async t => {
+  const allowFirst = deferred();
+  const allowSecond = deferred();
+  let reviewCount = 0;
   const reviewedBatchSizes: number[] = [];
 
-  const { orchestrator } = await harness(t, async (text) => {
-    turnCount++;
-    const count = (text.match(/message-\d+/g) || []).length;
-    reviewedBatchSizes.push(count);
-    if (turnCount === 1) await allowTurn1.promise;
-    else if (turnCount === 2) await allowTurn2.promise;
-    else if (turnCount === 3) await allowTurn3.promise;
-  }, {
-    maxBehind: 2,
-  });
+  const { orchestrator } = await harness(t, async text => {
+    reviewCount++;
+    reviewedBatchSizes.push((text.match(/message-\d+/g) || []).length);
+    if (reviewCount === 1) await allowFirst.promise;
+    else if (reviewCount === 2) await allowSecond.promise;
+  }, { maxBehind: 2 });
 
-  // Turn 1: advisor starts processing batch 1 (which hangs on allowTurn1)
-  orchestrator.onMessage({ role: "user", content: "message-1", timestamp: 1 });
-  orchestrator.onTurnEnd();
-  orchestrator.onTurnStart();
+  const primaryTurn = (number: number) => {
+    orchestrator.onMessage({ role: "user", content: `message-${number}`, timestamp: number });
+    orchestrator.onTurnEnd();
+    orchestrator.onTurnStart();
+  };
 
-  // Turn 2: queued as item 1 (queue length 1)
-  orchestrator.onMessage({ role: "user", content: "message-2", timestamp: 2 });
-  orchestrator.onTurnEnd();
-  orchestrator.onTurnStart();
+  primaryTurn(1);
+  assert.equal(reviewCount, 0, "one turn is below the two-turn wake threshold");
+  primaryTurn(2);
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(reviewCount, 1, "turns 1-2 produce one active review");
 
-  // Turn 3: queued as item 2 (queue length 2 = maxBehind)
-  orchestrator.onMessage({ role: "user", content: "message-3", timestamp: 3 });
-  orchestrator.onTurnEnd();
-  orchestrator.onTurnStart();
+  primaryTurn(3);
+  primaryTurn(4); // one successor containing turns 3-4
+  primaryTurn(5);
+  primaryTurn(6); // merged into that same successor
 
-  let overview = orchestrator.statusOverview()[0]!;
-  assert.equal(overview.backlog, 2);
-  assert.equal(overview.backlogMessages, 2);
+  const overview = orchestrator.statusOverview()[0]!;
+  assert.equal(overview.backlog, 4, "four primary turns are waiting behind the active review");
+  assert.equal(overview.backlogMessages, 4);
+  assert.equal(overview.pendingTurns, 0);
+  assert.equal(overview.wakes, 3, "two threshold flushes merged into one successor");
 
-  // Turn 4 arrives while queue is already at maxBehind (2).
-  // It should be COALESCED into item 2, NOT grow the queue to 3!
-  orchestrator.onMessage({ role: "user", content: "message-4", timestamp: 4 });
-  orchestrator.onTurnEnd();
-  orchestrator.onTurnStart();
-
-  overview = orchestrator.statusOverview()[0]!;
-  assert.equal(overview.backlog, 2, "backlog must remain capped at maxBehind");
-  assert.equal(overview.backlogMessages, 3, "messages from coalesced turn 4 must be preserved");
-
-  // Turn 5 arrives: also coalesced into item 2!
-  orchestrator.onMessage({ role: "user", content: "message-5", timestamp: 5 });
-  orchestrator.onTurnEnd();
-  orchestrator.onTurnStart();
-
-  overview = orchestrator.statusOverview()[0]!;
-  assert.equal(overview.backlog, 2, "backlog must remain capped at maxBehind");
-  assert.equal(overview.backlogMessages, 4, "messages from coalesced turn 5 must be preserved");
-
-  // Allow turn 1 to complete: advisor pops item 1 (message-2)
-  allowTurn1.resolve();
-  await new Promise(r => setTimeout(r, 50));
-
-  // Allow turn 2 to complete: advisor pops item 2 (which now contains message-3, 4, 5 combined!)
-  allowTurn2.resolve();
-  await new Promise(r => setTimeout(r, 50));
-
-  allowTurn3.resolve();
-  await orchestrator.drainForExit(1000);
-
-  // Cumulative message counts across turns:
-  // Turn 1 had 1 message (message-1)
-  // Turn 2 had 2 messages (message-1, message-2)
-  // Turn 3 had 5 messages (message-1, message-2, and message-3, 4, 5 coalesced together!)
-  assert.deepEqual(reviewedBatchSizes, [1, 2, 5]);
+  allowFirst.resolve();
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal(reviewCount, 2);
+  allowSecond.resolve();
+  assert.equal(await orchestrator.drainForExit(1000), true);
+  assert.deepEqual(reviewedBatchSizes, [2, 6], "second provider view contains the prior context plus one four-turn delta");
+  assert.equal(orchestrator.statusOverview()[0]!.modelRequests, 2);
 });
 
-test("flushes in-flight held batch to advisor when flushTimeoutMs expires", async t => {
+test("flushes the oldest partial turn when its unchanged deadline expires", async t => {
   const reviewed = deferred();
   let receivedText = "";
 
@@ -688,17 +715,24 @@ test("flushes in-flight held batch to advisor when flushTimeoutMs expires", asyn
     receivedText = text;
     reviewed.resolve();
   }, {
+    maxBehind: 3,
     flushTimeoutMs: 150,
+    primary: {
+      isStreaming: () => true,
+      isAborting: () => false,
+      isAutoResumeSuppressed: () => false,
+    },
   });
 
-  // Assistant emits a tool call message and turn_end fires
+  // Assistant emits a tool call as an ordinary primary turn.
   orchestrator.onMessage({
     role: "assistant",
     content: [{ type: "toolCall", id: "call-1", name: "bash", arguments: { command: "long-job" } }],
     timestamp: 1,
   } as unknown as AgentMessage);
-  orchestrator.onTurnEnd();
 
+  // No turn_end yet: the primary tool represented by that finalized assistant
+  // message may still be running. The deadline is based on message arrival.
   // Before flushTimeoutMs (150ms), advisor has not been called yet.
   assert.equal(receivedText, "");
 
@@ -707,6 +741,9 @@ test("flushes in-flight held batch to advisor when flushTimeoutMs expires", asyn
   assert.match(receivedText, /long-job/);
   assert.match(receivedText, /in progress — more steps follow/);
 
+  // The eventual primary boundary cannot dispatch the same message again.
+  orchestrator.onTurnEnd();
+  orchestrator.onAgentSettled();
   await orchestrator.drainForExit(1000);
 });
 

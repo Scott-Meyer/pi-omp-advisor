@@ -2,7 +2,7 @@ import type { Agent, AgentMessage } from "@earendil-works/pi-agent-core";
 import { estimateTokens } from "@earendil-works/pi-coding-agent";
 import type { ToolResultMessage, UserMessage } from "@earendil-works/pi-ai";
 
-export const DEFAULT_ADVISOR_CONTEXT_TOKENS = 100_000;
+export const DEFAULT_ADVISOR_CONTEXT_TOKENS = 32_000;
 export const MIN_ADVISOR_CONTEXT_TOKENS = 2_048;
 
 const OMISSION = "\n[Content omitted by the advisor context budget.]\n";
@@ -14,6 +14,8 @@ export interface ContextWindowStatus {
   limitTokens: number;
   retainedMessages: number;
   trimmed: boolean;
+  /** Whole-history resets performed at an update boundary. */
+  resets: number;
 }
 
 export class AdvisorContextBudgetError extends Error {
@@ -96,25 +98,31 @@ function shortenMessage(message: AgentMessage, limit: number): AgentMessage | un
 }
 
 /**
- * A rolling model-input window, independent of pending-note state. Evicted or
- * shortened objects stay that way for this session, including repeated context
- * transforms inside one tool-using review. No summary carries the old narrative.
+ * A bounded model-input memory, independent of pending-note state. History
+ * grows with a stable cacheable prefix until the next update would overflow;
+ * then all pre-update history expires at once. The current update and its tool
+ * exchanges remain, so the advisor gets a fresh perspective without replaying
+ * or summarizing the reasoning path that filled the old context.
  */
 export class AdvisorContextWindow {
   // Originals and every shortened form share one lifecycle. Callers may
   // alternate raw Agent history and previously returned views.
   #retention = new WeakMap<AgentMessage, { current: AgentMessage; expired: boolean }>();
   #trimmed = false;
+  #resets = 0;
+  #lastCurrentStart = 0;
   #status: ContextWindowStatus;
 
   constructor(readonly requestedTokens = DEFAULT_ADVISOR_CONTEXT_TOKENS) {
     if (!Number.isSafeInteger(requestedTokens) || requestedTokens < MIN_ADVISOR_CONTEXT_TOKENS) {
       throw new AdvisorContextBudgetError(`contextTokens must be an integer of at least ${MIN_ADVISOR_CONTEXT_TOKENS}.`);
     }
-    this.#status = { estimatedTokens: 0, limitTokens: requestedTokens, retainedMessages: 0, trimmed: false };
+    this.#status = { estimatedTokens: 0, limitTokens: requestedTokens, retainedMessages: 0, trimmed: false, resets: 0 };
   }
 
   get status(): ContextWindowStatus { return { ...this.#status }; }
+  /** Current-update cursor in the most recent returned view. */
+  get lastCurrentStart(): number { return this.#lastCurrentStart; }
 
   #stateFor(message: AgentMessage) {
     let state = this.#retention.get(message);
@@ -151,7 +159,7 @@ export class AdvisorContextWindow {
     }
   }
 
-  trim(messages: AgentMessage[], fixedTokens = 0, modelContextWindow = 0): AgentMessage[] {
+  trim(messages: AgentMessage[], fixedTokens = 0, modelContextWindow = 0, currentUpdateStart?: number): AgentMessage[] {
     // Leave reply/protocol headroom on small models. This is an estimated input
     // ceiling, not an exact provider-token guarantee or an output-token setting.
     const reserve = Math.min(8_192, Math.floor(modelContextWindow / 4));
@@ -159,6 +167,9 @@ export class AdvisorContextWindow {
     const noticeTokens = estimateContextMessageTokens(this.notice());
     const budget = limit - fixedTokens - noticeTokens;
     if (budget < 128) throw new AdvisorContextBudgetError("The advisor's fixed instructions/tools leave no usable context budget. Increase contextTokens or reduce those instructions.");
+    const explicitCurrent = currentUpdateStart === undefined
+      ? undefined
+      : new Set(messages.slice(Math.max(0, Math.min(currentUpdateStart, messages.length))));
     const originals = messages.filter(message => {
       if (this.#stateFor(message).expired) return false;
       // The Agent can retain a partial tool call from a failed provider stream;
@@ -172,24 +183,37 @@ export class AdvisorContextWindow {
     });
     const input = originals.map(message => this.#stateFor(message).current);
     const units = conversationUnits(input, originals);
-    let latestUser = -1;
-    for (let i = units.length - 1; i >= 0; i--) {
-      if (units[i]!.messages[0]!.role === "user") { latestUser = i; break; }
+    let currentUnitStart = explicitCurrent
+      ? units.findIndex(unit => unit.originals.some(original => explicitCurrent.has(original)))
+      : -1;
+    if (explicitCurrent && currentUnitStart < 0) {
+      // A cursor at the end means the prior transform is about to append the
+      // update. Under pressure, clear all history before invoking that hook.
+      currentUnitStart = units.length;
+    } else if (currentUnitStart < 0) {
+      // Direct users of AdvisorContextWindow can omit a cursor. Treat the last
+      // contiguous user-message group and everything after it as one update.
+      let latestUser = -1;
+      for (let i = units.length - 1; i >= 0; i--) {
+        if (units[i]!.messages[0]!.role === "user") { latestUser = i; break; }
+      }
+      currentUnitStart = latestUser;
+      while (currentUnitStart > 0 && units[currentUnitStart - 1]!.messages[0]!.role === "user") currentUnitStart--;
     }
-    const last = units.length - 1;
-    const lastRole = units[last]?.messages.at(-1)?.role;
-    const required = new Set([latestUser, ...(lastRole === "user" || lastRole === "toolResult" ? [last] : [])]);
+    if (currentUnitStart < 0) currentUnitStart = Math.max(0, units.length - 1);
     let tokens = units.reduce((sum, unit) => sum + unit.tokens, 0);
     const retained = new Set(units);
-    // Expire the oldest optional exchanges first. The current observation and
-    // current tool exchange remain available for the next model response.
-    for (let i = 0; i < units.length && tokens > budget; i++) {
-      if (required.has(i)) continue;
-      const unit = units[i]!;
-      retained.delete(unit);
-      tokens -= unit.tokens;
-      for (const original of unit.originals) this.#stateFor(original).expired = true;
+    // Reset atomically at the explicit update boundary. Removing only enough
+    // old units to fit would shift the cached prefix on nearly every request.
+    if (tokens > budget && currentUnitStart > 0) {
+      for (let i = 0; i < currentUnitStart; i++) {
+        const unit = units[i]!;
+        retained.delete(unit);
+        tokens -= unit.tokens;
+        for (const original of unit.originals) this.#stateFor(original).expired = true;
+      }
       this.#trimmed = true;
+      this.#resets++;
     }
     if (tokens > budget) {
       const candidates = [...retained].flatMap(unit => unit.messages.map((message, index) => ({ unit, message, index })))
@@ -212,8 +236,20 @@ export class AdvisorContextWindow {
     if (tokens > budget) {
       throw new AdvisorContextBudgetError("The latest advisor exchange cannot fit the context budget without breaking tool-call pairing. No completed review can be inferred from this failure.");
     }
-    const result = units.filter(unit => retained.has(unit)).flatMap(unit => unit.messages);
-    this.#status = { estimatedTokens: fixedTokens + noticeTokens + tokens, limitTokens: limit, retainedMessages: result.length, trimmed: this.#trimmed };
+    const retainedUnits = units.filter(unit => retained.has(unit));
+    const result = retainedUnits.flatMap(unit => unit.messages);
+    const currentUnit = units[currentUnitStart];
+    const retainedCurrentIndex = currentUnit ? retainedUnits.indexOf(currentUnit) : 0;
+    this.#lastCurrentStart = retainedCurrentIndex < 0
+      ? 0
+      : retainedUnits.slice(0, retainedCurrentIndex).reduce((count, unit) => count + unit.messages.length, 0);
+    this.#status = {
+      estimatedTokens: fixedTokens + noticeTokens + tokens,
+      limitTokens: limit,
+      retainedMessages: result.length,
+      trimmed: this.#trimmed,
+      resets: this.#resets,
+    };
     return result;
   }
 
@@ -231,7 +267,7 @@ export function installAdvisorContextWindow(agent: Agent, requestedTokens?: numb
 } {
   const window = new AdvisorContextWindow(requestedTokens);
   let runSignal: AbortSignal | undefined;
-  let runStart = 0;
+  let runStart = agent.state.messages.length;
   const unsubscribe = agent.subscribe((event, signal) => {
     if (event.type === "agent_start") {
       runSignal = signal;
@@ -242,14 +278,16 @@ export function installAdvisorContextWindow(agent: Agent, requestedTokens?: numb
   const fixedTokens = () => Math.ceil((agent.state.systemPrompt.length + JSON.stringify(agent.state.tools.map(tool => ({
     name: tool.name, description: tool.description, parameters: tool.parameters,
   }))).length) / 4) + 256;
-  const trim = (messages: AgentMessage[]) => window.trim(messages, fixedTokens(), agent.state.model?.contextWindow ?? 0);
+  const trim = (messages: AgentMessage[], currentStart?: number) =>
+    window.trim(messages, fixedTokens(), agent.state.model?.contextWindow ?? 0, currentStart);
   const transform: NonNullable<Agent["transformContext"]> = async (messages, signal) => {
     if (signal?.aborted) throw new AdvisorContextBudgetError("Advisor review was interrupted before the next model request.");
     // Trim original objects before the SDK's cloning context event, so objects
     // evicted mid-review cannot reappear on the next tool-followup request.
-    const retained = trim(messages);
+    const retained = trim(messages, runStart);
+    const transformedCurrentStart = window.lastCurrentStart;
     const transformed = priorTransform ? await priorTransform.call(agent, retained, signal) : retained;
-    return [window.notice(), ...trim(transformed)];
+    return [window.notice(), ...trim(transformed, transformedCurrentStart)];
   };
   agent.transformContext = transform;
   return {
@@ -258,7 +296,7 @@ export function installAdvisorContextWindow(agent: Agent, requestedTokens?: numb
     // Called only after Agent.prompt settles, not while its event loop is live.
     trimRetainedHistory: () => {
       if (runSignal?.aborted) window.forgetInterruptedExchanges(agent.state.messages, runStart);
-      agent.state.messages = trim(agent.state.messages);
+      agent.state.messages = trim(agent.state.messages, runStart);
     },
     dispose: () => {
       unsubscribe();

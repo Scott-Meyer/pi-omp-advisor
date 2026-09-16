@@ -549,7 +549,7 @@ export default function (pi: ExtensionAPI) {
     // sessions are not drained: the user is quitting and should not be made to
     // wait on a watcher.
     if (orchestrator && lastMode !== undefined && isHeadlessMode(lastMode)) {
-      const drained = await orchestrator.drainForExit(HEADLESS_ADVISOR_DRAIN_TIMEOUT_MS);
+      const drained = await orchestrator.drainForExit(HEADLESS_ADVISOR_DRAIN_TIMEOUT_MS, true);
       if (!drained) {
         console.error(
           `[pi-omp-advisor] exited with advisor work still queued after ${Math.round(HEADLESS_ADVISOR_DRAIN_TIMEOUT_MS / 1000)}s — some advice was not delivered`,
@@ -593,12 +593,11 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("tool_execution_start", async (event, ctx) => {
-    const activity = primaryStop.toolStarted({
+    primaryStop.toolStarted({
       toolCallId: event.toolCallId, toolName: event.toolName,
       summary: formatToolCallPrimaryArg(event.toolName, event.args), startedAt: Date.now(),
     });
     if (isActive()) {
-      orchestrator!.onToolStart(activity);
       await fileMutationTracker.onToolStart(event.toolCallId, event.toolName, event.args, ctx.cwd);
     }
   });
@@ -715,8 +714,8 @@ export default function (pi: ExtensionAPI) {
           `Tools: ${a.tools?.join(", ") ?? "(default: read, grep, glob)"}`,
           `Context budget: ${a.contextTokens ?? DEFAULT_ADVISOR_CONTEXT_TOKENS} estimated tokens${a.contextTokens === undefined ? " (default)" : ""}`,
           `Include primary reasoning: ${a.includePrimaryThinking === true ? "yes" : "no"}`,
-          `Max backlog before coalescing: ${a.maxBehind ?? "inherit"}`,
-          `In-flight tool flush timeout: ${a.flushTimeoutMs ? `${a.flushTimeoutMs}ms` : "inherit"}`,
+          `Primary turns per advisor wake: ${a.maxBehind ?? "inherit"}`,
+          `Maximum wait for a partial batch: ${a.flushTimeoutMs ? `${a.flushTimeoutMs}ms` : "inherit"}`,
           `Instructions: ${a.instructions ? `${a.instructions.slice(0, 60)}${a.instructions.length > 60 ? "…" : ""}` : "(none)"}`,
           `Enabled: ${a.enabled !== false}`,
           "Delete this advisor",
@@ -757,8 +756,8 @@ export default function (pi: ExtensionAPI) {
           a.includePrimaryThinking = a.includePrimaryThinking !== true;
           continue;
         }
-        if (choice.startsWith("Max backlog before coalescing:")) {
-          const text = await ctx.ui.input("Max queued batches waiting before merging (blank = inherit, min 1)", a.maxBehind?.toString() ?? "");
+        if (choice.startsWith("Primary turns per advisor wake:")) {
+          const text = await ctx.ui.input("Completed primary turns to accumulate per advisor wake (blank = inherit, min 1)", a.maxBehind?.toString() ?? "");
           if (text !== undefined) {
             if (text.trim() === "") delete a.maxBehind;
             else {
@@ -769,8 +768,8 @@ export default function (pi: ExtensionAPI) {
           }
           continue;
         }
-        if (choice.startsWith("In-flight tool flush timeout:")) {
-          const text = await ctx.ui.input("Milliseconds a tool call waits before flushing to advisor (blank = inherit, min 100ms)", a.flushTimeoutMs?.toString() ?? "");
+        if (choice.startsWith("Maximum wait for a partial batch:")) {
+          const text = await ctx.ui.input("Maximum age of the oldest accumulated turn before an advisor wake (blank = inherit, min 100ms)", a.flushTimeoutMs?.toString() ?? "");
           if (text !== undefined) {
             if (text.trim() === "") delete a.flushTimeoutMs;
             else {
@@ -816,10 +815,10 @@ export default function (pi: ExtensionAPI) {
             ? "off"
             : typeof doc.syncBacklog === "object"
             ? `pause at ${doc.syncBacklog.pauseAt}, resume at ${doc.syncBacklog.resumeAt}`
-            : `${doc.syncBacklog} batches`
+            : `${doc.syncBacklog} queued turns`
         }`,
-        `Max backlog before coalescing: ${doc.maxBehind ?? `${DEFAULT_MAX_BEHIND} batches (default)`}`,
-        `In-flight tool flush timeout: ${doc.flushTimeoutMs ? `${doc.flushTimeoutMs}ms` : `${DEFAULT_FLUSH_TIMEOUT_MS}ms (default)`}`,
+        `Primary turns per advisor wake: ${doc.maxBehind ?? `${DEFAULT_MAX_BEHIND} turns (default)`}`,
+        `Maximum wait for a partial batch: ${doc.flushTimeoutMs ? `${doc.flushTimeoutMs}ms` : `${DEFAULT_FLUSH_TIMEOUT_MS}ms (default)`}`,
         `Turns where later concerns stop interrupting: ${doc.immuneTurns ?? "3 (default)"}`,
         ...advisorLabels,
         "+ Add advisor",
@@ -873,9 +872,9 @@ export default function (pi: ExtensionAPI) {
           "Pause the main agent for up to 30s when an advisor falls behind",
           [
             "off (never pause — default)",
-            "1 batch",
-            "3 batches",
-            "5 batches",
+            "1 queued turn",
+            "3 queued turns",
+            "5 queued turns",
             "Hysteresis: pause at 3, resume at 1",
             "Hysteresis: pause at 5, resume at 1",
           ],
@@ -910,9 +909,9 @@ export default function (pi: ExtensionAPI) {
         }
         continue;
       }
-      if (choice.startsWith("Max backlog before coalescing:")) {
+      if (choice.startsWith("Primary turns per advisor wake:")) {
         const text = await ctx.ui.input(
-          "Max queued batches waiting before merging into a single catch-up batch (blank = 3, min 1)",
+          "Completed primary turns to accumulate per advisor wake (blank = 3, min 1)",
           doc.maxBehind === undefined ? "" : String(doc.maxBehind),
         );
         if (text !== undefined) {
@@ -927,9 +926,9 @@ export default function (pi: ExtensionAPI) {
         }
         continue;
       }
-      if (choice.startsWith("In-flight tool flush timeout:")) {
+      if (choice.startsWith("Maximum wait for a partial batch:")) {
         const text = await ctx.ui.input(
-          "Milliseconds a long-running tool call waits before flushing to the advisor (blank = 3000ms, min 100ms)",
+          `Maximum age of the oldest accumulated turn before an advisor wake (blank = ${DEFAULT_FLUSH_TIMEOUT_MS}ms, min 100ms)`,
           doc.flushTimeoutMs === undefined ? "" : String(doc.flushTimeoutMs),
         );
         if (text !== undefined) {
@@ -1180,11 +1179,12 @@ export default function (pi: ExtensionAPI) {
     const describe = (s: AdvisorStatusOverviewItem) =>
       `${s.name}: ${s.status}` +
       (s.backlog > 0
-        ? ` · backlog: ${s.backlog} batch(es) (${s.backlogMessages} message${s.backlogMessages === 1 ? "" : "s"})`
+        ? ` · backlog: ${s.backlog} turn(s) (${s.backlogMessages} message${s.backlogMessages === 1 ? "" : "s"})`
         : " · caught up") +
-      ` · maxBehind: ${s.maxBehind}` +
-      ` · flushTimeout: ${s.flushTimeoutMs}ms` +
-      (s.context ? `; context ~${s.context.estimatedTokens}/${s.context.limitTokens} tokens, ${s.context.retainedMessages} messages${s.context.trimmed ? " (older content expired/shortened)" : ""}; primary reasoning ${s.includePrimaryThinking ? "included" : "excluded"}` : "");
+      ` · pending batch: ${s.pendingTurns}/${s.wakeEveryTurns} turn(s)` +
+      ` · maxWait: ${s.flushTimeoutMs}ms` +
+      ` · wakes/requests/tools: ${s.wakes}/${s.modelRequests}/${s.toolCalls}` +
+      (s.context ? `; context ~${s.context.estimatedTokens}/${s.context.limitTokens} tokens, ${s.context.retainedMessages} messages, ${s.context.resets} reset(s)${s.context.trimmed ? " (older content expired/shortened)" : ""}; primary reasoning ${s.includePrimaryThinking ? "included" : "excluded"}` : "");
     const unusable = overview.filter(s => s.status === "no_model");
     const state = advisorPaused
       ? `paused — ${inbox.items.length} queued ${inbox.items.length === 1 ? "advisory" : "advisories"} retained; no new advisor work will start`

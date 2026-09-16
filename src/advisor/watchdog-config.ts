@@ -59,7 +59,7 @@ import { MIN_ADVISOR_CONTEXT_TOKENS } from "./context-window.ts";
 const execFileAsync = promisify(execFile);
 
 export const DEFAULT_MAX_BEHIND = 3;
-export const DEFAULT_FLUSH_TIMEOUT_MS = 3000;
+export const DEFAULT_FLUSH_TIMEOUT_MS = 4 * 60_000;
 
 export interface AdvisorConfig {
   name: string;
@@ -68,13 +68,13 @@ export interface AdvisorConfig {
   instructions?: string;
   /** Per-advisor on/off toggle (default `true`). */
   enabled?: boolean;
-  /** Estimated total model-input budget; defaults to 100,000 tokens. */
+  /** Estimated total model-input budget; defaults to 32,000 tokens. */
   contextTokens?: number;
   /** Include the primary's reasoning in observations; defaults to false. */
   includePrimaryThinking?: boolean;
-  /** Maximum queued batches waiting for this advisor before coalescing (default 3, min 1). */
+  /** Completed delta-bearing primary turns per advisor wake (default 3, min 1). */
   maxBehind?: number;
-  /** In-flight tool flush timeout in milliseconds (default 3000, min 100). */
+  /** Maximum age of the oldest accumulated turn in milliseconds (default 240000, min 100). */
   flushTimeoutMs?: number;
 }
 
@@ -155,7 +155,7 @@ export interface DiscoveredAdvisors {
    * expressed here as a `WATCHDOG.yml` field because pi has no equivalent
    * settings-schema surface to register into. Pause the primary for up to 30s
    * when an advisor is behind; `"off"` disables catch-up delays entirely.
-   * Upstream's default is `"off"`. Supports hysteresis: pause at X batches, resume at Y.
+   * Upstream's default is `"off"`. Supports hysteresis: pause at X queued turns, resume at Y.
    */
   syncBacklog: SyncBacklogConfig | undefined;
   /**
@@ -166,9 +166,9 @@ export interface DiscoveredAdvisors {
    * `severity !== "blocker"`. `undefined` means upstream's default.
    */
   immuneTurns: number | undefined;
-  /** Maximum queued batches waiting for an advisor before coalescing (default 3). */
+  /** Completed delta-bearing primary turns per advisor wake (default 3). */
   maxBehind: number | undefined;
-  /** In-flight tool flush timeout in milliseconds (default 3000ms). */
+  /** Maximum age of the oldest accumulated turn (default 240000ms). */
   flushTimeoutMs: number | undefined;
   /**
    * Whether at least one `WATCHDOG.yml`/`.yaml` was found **and parsed into a
@@ -543,9 +543,9 @@ export interface WatchdogConfigDoc {
   syncBacklog?: SyncBacklogConfig;
   /** See {@link DiscoveredAdvisors.immuneTurns}. */
   immuneTurns?: number;
-  /** Maximum queued batches waiting for an advisor before coalescing (default 3, min 1). */
+  /** Completed delta-bearing primary turns per advisor wake (default 3, min 1). */
   maxBehind?: number;
-  /** In-flight tool flush timeout in milliseconds (default 3000ms, min 100). */
+  /** Maximum age of the oldest accumulated turn (default 240000ms, min 100). */
   flushTimeoutMs?: number;
 }
 

@@ -9,13 +9,15 @@
  * upstream's version wires into omp-internal session/telemetry/session-store
  * plumbing that has no pi equivalent; see PROVENANCE.md items 4-5).
  *
- * Batching/cadence: pi's extension API doesn't expose omp's `willContinue`
- * flag directly, so WIP-vs-final is inferred from the surrounding event
- * sequence: a batch closed at `turn_end` is held (not yet sent) until either
- * another `turn_start` arrives (confirms it was mid-run — sent as `wip:
- * true`) or `agent_settled` arrives (confirms it was the run's last turn —
- * sent as `wip: false`). This reproduces the same WIP semantics upstream
- * gets from its own agent-core loop, one event later.
+ * Batching/cadence: completed primary turns accumulate into one observation.
+ * A continuing run wakes the advisor after `maxBehind` turns, while
+ * `flushTimeoutMs` bounds how long the oldest unseen message may wait. Short
+ * settled runs keep accumulating across prompts; settlement flushes only when
+ * the turn threshold is reached. Activity that arrives while the advisor is
+ * reviewing is folded into one catch-up observation.
+ * Tool lifecycle events never wake the model; the primary-stop controller
+ * tracks them independently and a live snapshot is attached to a normally
+ * scheduled review when that capability is granted.
  */
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createAgentSession, DefaultResourceLoader, loadProjectContextFiles, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
@@ -43,7 +45,7 @@ import { renderAdvisorDeltaMessages } from "./delta-render.ts";
 import { SerializedTransition } from "./serialized-transition.ts";
 import { installAdvisorContextWindow, type ContextWindowStatus } from "./context-window.ts";
 import { ADVISOR_STOP_TOOLS } from "./stop-tools.ts";
-import type { CurrentToolResult, PrimaryStopAccess, PrimaryToolActivity, StopRequestResult } from "./primary-stop.ts";
+import type { CurrentToolResult, PrimaryStopAccess, StopRequestResult } from "./primary-stop.ts";
 import type { AdvisorConfig, SyncBacklogConfig } from "./watchdog-config.ts";
 import { DEFAULT_FLUSH_TIMEOUT_MS, DEFAULT_MAX_BEHIND, discoverWatchdogFiles, normalizeSyncBacklog } from "./watchdog-config.ts";
 import { buildAdvisorSystemPrompt } from "./system-prompt.ts";
@@ -116,7 +118,7 @@ function withAdviseTool(toolNames: string[]): string[] {
  *  up before the session gives up and moves on (upstream: 30_000ms). */
 const CATCHUP_TIMEOUT_MS = 30_000;
 /**
- * Backlog threshold (batches queued during the advisor's last prompt call)
+ * Backlog threshold (primary turns queued during the advisor's current review)
  * past which the primary pauses for the advisor to catch up. Upstream exposes
  * this as the `advisor.syncBacklog` setting with values `off | 1 | 3 | 5` and a
  * default of **`off`** — the primary is never gated on an advisor unless the
@@ -139,19 +141,21 @@ interface ActiveAdvisor {
   adviseState: ReturnType<typeof makeAdviseTool> extends Promise<{ state: infer S }> ? S : never;
   pendingMessages: AgentMessage[];
   awaitingBatch: AgentMessage[] | undefined;
+  /** Completed primary turns represented by `awaitingBatch`. */
+  awaitingTurns: number;
   /**
-   * Send queue: batches waiting to be prompted, in arrival order. `#dispatch`
-   * always pushes here rather than calling `prompt()` directly, so activity
-   * that arrives while a previous batch's advisor turn is still running is
-   * preserved and drained in order instead of being dropped (upstream:
-   * `AdvisorRuntime`'s own `#pending`/`#drain` single-flight loop).
+   * At most one catch-up observation waits behind the active review. New work
+   * is merged into that item, matching upstream's single pending delta rather
+   * than creating one paid model request per primary turn.
    */
-  queue: { batch: AgentMessage[]; wip: boolean; toolActivity?: PrimaryToolActivity }[];
+  queue: { batch: AgentMessage[]; turns: number; wip: boolean }[];
   draining: boolean;
   disposed: boolean;
   generation: number;
   contextNotice?: string;
   status: AdvisorRuntimeStatus;
+  /** A reset failure invalidates this runtime; ordinary provider errors remain retryable. */
+  halted: boolean;
   /**
    * Whether to include the primary's reasoning in observations. Off by
    * default; an explicit opt-in can still fall back to text-only on error.
@@ -161,6 +165,9 @@ interface ActiveAdvisor {
   maxBehind: number;
   flushTimeoutMs: number;
   flushTimer: NodeJS.Timeout | undefined;
+  wakeCount: number;
+  modelRequestCount: number;
+  toolCallCount: number;
 }
 
 export interface AdvisorStatusOverviewItem {
@@ -168,8 +175,12 @@ export interface AdvisorStatusOverviewItem {
   status: AdvisorRuntimeStatus;
   backlog: number;
   backlogMessages: number;
-  maxBehind: number;
+  pendingTurns: number;
+  wakeEveryTurns: number;
   flushTimeoutMs: number;
+  wakes: number;
+  modelRequests: number;
+  toolCalls: number;
   context?: ContextWindowStatus;
   includePrimaryThinking?: boolean;
 }
@@ -225,17 +236,21 @@ export class AdvisorOrchestrator {
   }
 
   statusOverview(): AdvisorStatusOverviewItem[] {
-    // `backlog` is how many batches are waiting behind the one currently being
-    // prompted — the honest "how far behind is this advisor" number, shown in
+    // `backlog` is how many primary turns are waiting behind the one currently
+    // being prompted — the honest "how far behind is this advisor" number, shown in
     // `/advisor status` rather than logged to stderr every time it happens.
     return [
       ...this.#advisors.map(a => ({
         name: a.config.name,
         status: a.status,
-        backlog: a.queue.length,
+        backlog: a.queue.reduce((sum, item) => sum + item.turns, 0),
         backlogMessages: a.queue.reduce((sum, item) => sum + item.batch.length, 0),
-        maxBehind: a.maxBehind,
+        pendingTurns: a.awaitingTurns,
+        wakeEveryTurns: a.maxBehind,
         flushTimeoutMs: a.flushTimeoutMs,
+        wakes: a.wakeCount,
+        modelRequests: a.modelRequestCount,
+        toolCalls: a.toolCallCount,
         context: a.memory.window.status,
         includePrimaryThinking: a.includeThinking,
       })),
@@ -244,8 +259,12 @@ export class AdvisorOrchestrator {
         status: a.status,
         backlog: 0,
         backlogMessages: 0,
-        maxBehind: DEFAULT_MAX_BEHIND,
+        pendingTurns: 0,
+        wakeEveryTurns: DEFAULT_MAX_BEHIND,
         flushTimeoutMs: DEFAULT_FLUSH_TIMEOUT_MS,
+        wakes: 0,
+        modelRequests: 0,
+        toolCalls: 0,
       })),
     ];
   }
@@ -265,9 +284,9 @@ export class AdvisorOrchestrator {
     if (!thresholds) return;
     const deadline = Date.now() + CATCHUP_TIMEOUT_MS;
     for (const advisor of this.#advisors) {
-      if (advisor.queue.length >= thresholds.pauseAt) {
+      if (this.#queuedTurns(advisor) >= thresholds.pauseAt) {
         while (
-          advisor.queue.length > thresholds.resumeAt &&
+          this.#queuedTurns(advisor) > thresholds.resumeAt &&
           !advisor.disposed &&
           advisor.status === "running" &&
           Date.now() < deadline
@@ -412,16 +431,21 @@ export class AdvisorOrchestrator {
       adviseState,
       pendingMessages: [],
       awaitingBatch: undefined,
+      awaitingTurns: 0,
       queue: [],
       draining: false,
       disposed: false,
       generation: 0,
       contextNotice: "Observation begins here. Earlier session activity is not included in this fresh advisor context.",
       status: "running",
+      halted: false,
       includeThinking: config.includePrimaryThinking ?? false,
       maxBehind: config.maxBehind ?? configs?.maxBehind ?? DEFAULT_MAX_BEHIND,
       flushTimeoutMs: config.flushTimeoutMs ?? configs?.flushTimeoutMs ?? DEFAULT_FLUSH_TIMEOUT_MS,
       flushTimer: undefined,
+      wakeCount: 0,
+      modelRequestCount: 0,
+      toolCallCount: 0,
     };
   }
 
@@ -488,10 +512,11 @@ export class AdvisorOrchestrator {
    * quota-exhausted, or halted runtime: its backlog will never drain and the
    * caller would burn the whole budget.
    */
-  async drainForExit(timeoutMs: number): Promise<boolean> {
+  async drainForExit(timeoutMs: number, flushPending = false): Promise<boolean> {
     const deadline = Date.now() + timeoutMs;
     let drained = true;
     for (const advisor of this.#advisors) {
+      if (flushPending) this.#flushAwaiting(advisor, false);
       while (
         !advisor.disposed &&
         advisor.status === "running" &&
@@ -535,6 +560,7 @@ export class AdvisorOrchestrator {
         if (advisor.disposed) continue;
         advisor.pendingMessages = [];
         advisor.awaitingBatch = undefined;
+        advisor.awaitingTurns = 0;
         advisor.queue = [];
         const discarded = advisor.adviseState.discardDeferredNotes();
         for (const note of discarded) advisor.emissionGuard.forget(note.note);
@@ -549,13 +575,28 @@ export class AdvisorOrchestrator {
   }
 
   async disposeAll(): Promise<void> {
-    for (const advisor of this.#advisors) {
+    const retiring = this.#advisors;
+    this.#advisors = [];
+    for (const advisor of retiring) {
       this.#clearFlushTimer(advisor);
       advisor.disposed = true;
-      advisor.memory.dispose();
-      advisor.session.dispose();
+      advisor.generation++;
+      advisor.pendingMessages = [];
+      advisor.awaitingBatch = undefined;
+      advisor.awaitingTurns = 0;
+      advisor.queue = [];
+      advisor.session.agent.abort();
     }
-    this.#advisors = [];
+    await Promise.allSettled(retiring.map(async advisor => {
+      try {
+        // Reviews are prompted through Agent directly, so Session.dispose()
+        // alone is not an awaitable cancellation barrier.
+        await advisor.session.agent.waitForIdle();
+      } finally {
+        advisor.memory.dispose();
+        advisor.session.dispose();
+      }
+    }));
   }
 
   /**
@@ -579,16 +620,18 @@ export class AdvisorOrchestrator {
       if (advisor.disposed) continue;
       advisor.pendingMessages = [];
       advisor.awaitingBatch = undefined;
+      advisor.awaitingTurns = 0;
       advisor.queue = [];
       const discarded = advisor.adviseState.discardDeferredNotes();
       for (const note of discarded) advisor.emissionGuard.forget(note.note);
       const oldSession = advisor.session;
       const oldMemory = advisor.memory;
-      advisor.generation++;
+      const rebuildGeneration = ++advisor.generation;
       advisor.contextNotice = "Your model context was rebuilt after a transcript change. Earlier history is not replayed; pending advice may refer to that older context.";
       try {
         oldSession.agent.abort();
         await oldSession.agent.waitForIdle();
+        if (advisor.disposed || advisor.generation !== rebuildGeneration) continue;
         const resolvedModel = advisor.config.model ? this.#resolveModel(advisor.config.model, modelRuntime) : undefined;
         const model = resolvedModel?.model;
         const thinkingLevel = resolvedModel?.thinkingLevel;
@@ -630,25 +673,40 @@ export class AdvisorOrchestrator {
           customTools: [adviseTool, ...controlTools],
           resourceLoader,
         });
+        if (advisor.disposed || advisor.generation !== rebuildGeneration) {
+          created.session.dispose();
+          continue;
+        }
         advisor.session = created.session;
         advisor.memory = installAdvisorContextWindow(created.session.agent, advisor.config.contextTokens);
         advisor.adviseState = adviseState;
         advisor.status = "running";
+        advisor.halted = false;
         oldMemory.dispose();
         oldSession.dispose();
       } catch (err) {
+        if (advisor.disposed || advisor.generation !== rebuildGeneration) continue;
         advisor.status = "error";
+        advisor.halted = true;
         console.error(`[pi-omp-advisor:${advisor.config.name}] failed to rebuild advisor session on context reset: ${String(err)}`);
       }
     }
   }
 
-  /** Feed one finalized primary message into every advisor's pending buffer. */
+  /**
+   * Feed one finalized primary message into every advisor's pending buffer.
+   * The oldest-message deadline starts here—not at turn_end—so a finalized
+   * assistant tool call can trigger a rare timeout review while its tool is
+   * still running, without making tool lifecycle events special scheduler
+   * inputs.
+   */
   onMessage(message: AgentMessage): void {
     if (this.#paused) return;
     for (const advisor of this.#advisors) {
-      if (advisor.disposed) continue;
+      if (advisor.disposed || advisor.halted) continue;
+      const hadPendingActivity = advisor.pendingMessages.length > 0 || Boolean(advisor.awaitingBatch);
       advisor.pendingMessages.push(message);
+      if (!hadPendingActivity) this.#scheduleFlushTimer(advisor);
     }
   }
 
@@ -659,94 +717,104 @@ export class AdvisorOrchestrator {
     }
   }
 
+  /** Arm one deadline for the oldest accumulated turn. Later turns do not move it. */
   #scheduleFlushTimer(advisor: ActiveAdvisor): void {
+    if (
+      advisor.flushTimer !== undefined || advisor.flushTimeoutMs <= 0 ||
+      advisor.disposed || advisor.halted || this.#paused
+    ) return;
+    advisor.flushTimer = setTimeout(() => {
+      advisor.flushTimer = undefined;
+      if (advisor.disposed || advisor.halted || this.#paused) return;
+      const batch = [
+        ...(advisor.awaitingBatch ?? []),
+        ...advisor.pendingMessages,
+      ];
+      const turns = advisor.awaitingTurns + (advisor.pendingMessages.length > 0 ? 1 : 0);
+      advisor.awaitingBatch = undefined;
+      advisor.awaitingTurns = 0;
+      advisor.pendingMessages = [];
+      if (batch.length > 0) this.#dispatch(advisor, batch, turns, this.#host.isStreaming());
+    }, advisor.flushTimeoutMs);
+  }
+
+  #flushAwaiting(advisor: ActiveAdvisor, wip: boolean): void {
     this.#clearFlushTimer(advisor);
-    if (advisor.flushTimeoutMs > 0 && !advisor.disposed && !this.#paused) {
-      advisor.flushTimer = setTimeout(() => {
-        advisor.flushTimer = undefined;
-        if (advisor.disposed || this.#paused || !advisor.awaitingBatch || advisor.awaitingBatch.length === 0) return;
-        const batch = advisor.awaitingBatch;
-        advisor.awaitingBatch = undefined;
-        this.#dispatch(advisor, batch, true);
-      }, advisor.flushTimeoutMs);
-    }
+    const batch = advisor.awaitingBatch;
+    const turns = advisor.awaitingTurns;
+    advisor.awaitingBatch = undefined;
+    advisor.awaitingTurns = 0;
+    if (batch && batch.length > 0) this.#dispatch(advisor, batch, turns, wip);
   }
 
   /**
-   * Stop-enabled advisors receive the call before its result. Flush only their
-   * collected transcript, with compact runtime metadata; do not block execution
-   * or grant fuller tool outputs. Other advisors retain the original cadence.
+   * A new turn confirms prior accumulated turns were work-in-progress. Wake
+   * only when the configured turn threshold has been reached; otherwise keep
+   * accumulating behind the original timeout deadline.
    */
-  onToolStart(toolActivity: PrimaryToolActivity): void {
-    if (this.#paused) return;
-    for (const advisor of this.#advisors) {
-      if (advisor.disposed || !advisor.config.tools?.includes("request_stop")) continue;
-      this.#clearFlushTimer(advisor);
-      const batch = [...(advisor.awaitingBatch ?? []), ...advisor.pendingMessages];
-      advisor.awaitingBatch = undefined;
-      advisor.pendingMessages = [];
-      this.#dispatch(advisor, batch, true, toolActivity);
-    }
-  }
-
-  /** Called on `turn_start`: release any batch that was held pending WIP confirmation, marked WIP (a new turn is starting, so the prior batch wasn't final). */
   onTurnStart(): void {
     if (this.#paused) return;
     for (const advisor of this.#advisors) {
-      this.#clearFlushTimer(advisor);
-      if (advisor.disposed || !advisor.awaitingBatch) continue;
-      const batch = advisor.awaitingBatch;
-      advisor.awaitingBatch = undefined;
-      this.#dispatch(advisor, batch, true);
+      if (advisor.disposed || advisor.halted || advisor.awaitingTurns < advisor.maxBehind) continue;
+      this.#flushAwaiting(advisor, true);
     }
   }
 
-  /** Called on `turn_end`: close the current pending buffer into an awaiting batch. */
+  /** Close this primary turn into the single accumulated observation. */
   onTurnEnd(): void {
     if (this.#paused) return;
     this.#primaryTurnsCompleted++;
     for (const advisor of this.#advisors) {
-      if (advisor.disposed || advisor.pendingMessages.length === 0) continue;
+      if (advisor.disposed || advisor.halted || advisor.pendingMessages.length === 0) continue;
       const batch = advisor.pendingMessages;
       advisor.pendingMessages = [];
-      // A previous awaiting batch that was never confirmed (shouldn't
-      // normally happen — turn_start always resolves it first) is folded in
-      // ahead of the new one rather than dropped.
       advisor.awaitingBatch = advisor.awaitingBatch ? [...advisor.awaitingBatch, ...batch] : batch;
+      advisor.awaitingTurns++;
       this.#scheduleFlushTimer(advisor);
     }
   }
 
-  /** Called on `agent_settled`: the run is genuinely done; flush every remaining batch as final. */
+  /**
+   * Settlement marks queued work final but does not defeat turn batching. A
+   * short run waits for more primary turns or the oldest-message deadline;
+   * reaching the configured threshold still wakes immediately.
+   */
   onAgentSettled(): void {
     if (this.#paused) return;
     for (const advisor of this.#advisors) {
-      this.#clearFlushTimer(advisor);
-      if (advisor.disposed) continue;
-      const batch = advisor.awaitingBatch ?? (advisor.pendingMessages.length > 0 ? advisor.pendingMessages : undefined);
-      advisor.awaitingBatch = undefined;
-      advisor.pendingMessages = [];
-      if (batch) this.#dispatch(advisor, batch, false);
+      if (advisor.disposed || advisor.halted) continue;
+      for (const waiting of advisor.queue) waiting.wip = false;
+      if (advisor.pendingMessages.length > 0) {
+        advisor.awaitingBatch = advisor.awaitingBatch
+          ? [...advisor.awaitingBatch, ...advisor.pendingMessages]
+          : advisor.pendingMessages;
+        advisor.pendingMessages = [];
+        advisor.awaitingTurns++;
+      }
+      if (advisor.awaitingTurns >= advisor.maxBehind) this.#flushAwaiting(advisor, false);
     }
   }
 
-  #dispatch(advisor: ActiveAdvisor, batch: AgentMessage[], wip: boolean, toolActivity?: PrimaryToolActivity): void {
-    if (batch.length === 0 && !toolActivity) return;
-    const maxBehind = advisor.maxBehind;
-    if (advisor.queue.length >= maxBehind && advisor.queue.length > 0) {
-      // Coalesce into the tail of the queue
-      const last = advisor.queue[advisor.queue.length - 1]!;
-      last.batch = [...last.batch, ...batch];
-      last.wip = wip;
-      if (toolActivity) last.toolActivity = toolActivity;
+  #queuedTurns(advisor: ActiveAdvisor): number {
+    return advisor.queue.reduce((sum, item) => sum + item.turns, 0);
+  }
+
+  #dispatch(advisor: ActiveAdvisor, batch: AgentMessage[], turns: number, wip: boolean): void {
+    if (batch.length === 0 || advisor.disposed || advisor.halted) return;
+    advisor.wakeCount++;
+    if (advisor.queue.length > 0) {
+      const waiting = advisor.queue[0]!;
+      waiting.batch = [...waiting.batch, ...batch];
+      waiting.turns += turns;
+      waiting.wip = wip;
     } else {
-      advisor.queue.push({ batch, wip, toolActivity });
+      advisor.queue.push({ batch, turns, wip });
     }
     void this.#drainAdvisor(advisor);
   }
 
   /**
-   * Single-flight send loop for one advisor: pops queued batches in order
+   * Single-flight send loop for one advisor: runs the sole queued batch
    * and prompts them one at a time, so activity arriving while a batch is
    * still being reviewed is queued rather than dropped (mirrors upstream's
    * `#pending`/`#drain`).
@@ -755,14 +823,14 @@ export class AdvisorOrchestrator {
     if (advisor.draining || advisor.disposed) return;
     advisor.draining = true;
     try {
-      while (advisor.queue.length > 0 && !advisor.disposed && !this.#paused) {
-        const { batch, wip, toolActivity } = advisor.queue.shift()!;
+      while (advisor.queue.length > 0 && !advisor.disposed && !advisor.halted && !this.#paused) {
+        const { batch, wip } = advisor.queue.shift()!;
         // Deliberately not logged: an advisor running behind the primary is the
         // normal steady state, not an error, and upstream reports it through a
         // file logger rather than the user's session. Writing it to stderr put
         // a line of noise in the transcript for something nobody can act on.
         // Backlog is surfaced via `/advisor status` instead.
-        await this.#sendBatch(advisor, batch, wip, toolActivity);
+        await this.#sendBatch(advisor, batch, wip);
       }
     } finally {
       advisor.draining = false;
@@ -776,7 +844,7 @@ export class AdvisorOrchestrator {
    * this port approximates that with a single blanket retry-without-thinking
    * rather than reproducing the refusal classifier itself).
    */
-  async #sendBatch(advisor: ActiveAdvisor, batch: AgentMessage[], wip: boolean, toolActivity?: PrimaryToolActivity): Promise<void> {
+  async #sendBatch(advisor: ActiveAdvisor, batch: AgentMessage[], wip: boolean): Promise<void> {
     // Per-batch latch: `attempt` runs a second time on the thinking-stripped
     // retry, and the update bookkeeping below must happen exactly once per
     // batch — resetting the emission guard twice would hand one batch two
@@ -789,10 +857,16 @@ export class AdvisorOrchestrator {
     const contextNotice = advisor.contextNotice;
     const attempt = async (includeThinking: boolean): Promise<boolean> => {
       const chunks = renderAdvisorDeltaMessages(batch, { wip, includeThinking }) ?? [];
-      if (toolActivity) {
-        const activity = `### Primary tool activity (runtime metadata)\n${JSON.stringify(toolActivity)}\nThis call entered the execution lifecycle; it may still be in preflight. No result yet. Check current_tool before any stop request; this snapshot may be stale.`;
-        if (chunks.length === 0) chunks.push({ role: "user", text: activity });
-        else chunks[chunks.length - 1]!.text += `\n\n${activity}`;
+      // Tool events do not trigger reviews. If stop access was explicitly
+      // granted, sample the controller only when a scheduled review is about
+      // to run so queued metadata cannot point at a tool that has since ended.
+      if (advisor.config.tools?.includes("request_stop")) {
+        const currentTool = this.#host.currentTool();
+        if (currentTool.status !== "idle") {
+          const activity = `### Current primary tool state (live runtime metadata)\n${JSON.stringify(currentTool)}\nThis is a point-in-time snapshot. request_stop revalidates the target and fails closed if it ended, changed, became ambiguous, or is no longer the sole active call.`;
+          if (chunks.length === 0) chunks.push({ role: "user", text: activity });
+          else chunks[chunks.length - 1]!.text += `\n\n${activity}`;
+        }
       }
       if (chunks.length === 0) return false;
       if (!updateBegun) {
@@ -817,8 +891,15 @@ export class AdvisorOrchestrator {
       let lastAssistant: AssistantMessage | undefined;
       try {
         await reviewSession.agent.prompt(messages);
-        lastAssistant = reviewSession.agent.state.messages.slice(previousMessageCount).reverse().find(message => message.role === "assistant") as AssistantMessage | undefined;
       } finally {
+        const generated = reviewSession.agent.state.messages.slice(previousMessageCount);
+        const assistantMessages = generated.filter(message => message.role === "assistant") as AssistantMessage[];
+        advisor.modelRequestCount += assistantMessages.length;
+        advisor.toolCallCount += assistantMessages.reduce(
+          (count, message) => count + message.content.filter(block => block.type === "toolCall").length,
+          0,
+        );
+        lastAssistant = assistantMessages.at(-1);
         // Model-input trimming also runs between investigative tool calls. Once
         // the Agent settles, expire the same material from retained history.
         memory.trimRetainedHistory();

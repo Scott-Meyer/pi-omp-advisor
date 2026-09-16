@@ -14,19 +14,24 @@ const assistant = (content: AssistantMessage["content"], stopReason: AssistantMe
   role: "assistant", content, stopReason, timestamp: 2, model: model.id, provider: model.provider, api: model.api,
   usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
 });
+const response = (text: string) => assistant([{ type: "text", text }]);
 const call = (id: string) => assistant([{ type: "toolCall", id, name: "read_file", arguments: {} }], "toolUse");
 const result = (id: string, text: string): AgentMessage => ({ role: "toolResult", toolCallId: id, toolName: "read_file", content: [{ type: "text", text }], isError: false, timestamp: 3 });
 const body = (messages: AgentMessage[]) => JSON.stringify(messages);
 
-test("the default is a bounded 100k window, not a per-update limit", () => {
+test("the default is a bounded 32k memory that resets at an update boundary", () => {
   const window = new AdvisorContextWindow();
-  assert.equal(window.requestedTokens, 100_000);
-  const input = Array.from({ length: 25 }, (_, i) => user(`observation-${i}: ${"x".repeat(25_000)}`));
-  const view = window.trim(input);
+  assert.equal(window.requestedTokens, 32_000);
+  const input = Array.from({ length: 25 }, (_, i) => [
+    user(`observation-${i}: ${"x".repeat(25_000)}`), response(`review-${i}`),
+  ]).flat();
+  const currentStart = input.length - 2;
+  const view = window.trim(input, 0, 0, currentStart);
   assert.doesNotMatch(body(view), /observation-0:/);
   assert.match(body(view), /observation-24:/);
   assert.ok(window.status.estimatedTokens <= DEFAULT_ADVISOR_CONTEXT_TOKENS);
-  assert.ok(view.length < input.length);
+  assert.equal(window.status.resets, 1);
+  assert.deepEqual(view, input.slice(currentStart), "overflow drops the whole old prefix instead of sliding it");
 });
 
 test("eviction preserves complete tool-call/result groups and never mutates source messages", () => {
@@ -37,7 +42,7 @@ test("eviction preserves complete tool-call/result groups and never mutates sour
   const currentResult = result("current-call", "new result");
   const input = [user("old observation"), oldCall, oldResult, user("current observation"), currentCall, currentResult];
   const before = JSON.stringify(input);
-  const view = window.trim(input);
+  const view = window.trim(input, 0, 0, 3);
   assert.doesNotMatch(body(view), /old-call/);
   assert.ok(view.includes(currentCall));
   assert.ok(view.includes(currentResult));
@@ -65,10 +70,11 @@ test("large current observations and tool results are explicitly shortened witho
 test("expired material cannot reappear during a later transform with more free space", () => {
   const window = new AdvisorContextWindow(2048);
   const old = user("OLD_SECRET_MARKER " + "x".repeat(4000));
+  const priorReview = response("Earlier review");
   const latest = user("NEW " + "y".repeat(12_000));
-  assert.doesNotMatch(body(window.trim([old, latest])), /OLD_SECRET_MARKER/);
+  assert.doesNotMatch(body(window.trim([old, priorReview, latest], 0, 0, 2)), /OLD_SECRET_MARKER/);
   // The SDK loop can supply its original untrimmed array again after a tool call.
-  const next = window.trim([old, latest, user("A short newer observation")]);
+  const next = window.trim([old, priorReview, latest, user("A short newer observation")], 0, 0, 2);
   assert.doesNotMatch(body(next), /OLD_SECRET_MARKER/);
   assert.ok(window.status.estimatedTokens <= 2048);
 });
