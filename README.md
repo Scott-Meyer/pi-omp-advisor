@@ -160,7 +160,7 @@ the same settings entry works on every machine.
 
 ```bash
 pi install npm:pi-omp-advisor
-pi install git:github.com/Scott-Meyer/pi-omp-advisor@v0.2.0
+pi install git:github.com/Scott-Meyer/pi-omp-advisor@v0.5.0
 ```
 
 Requires pi **0.84.2 or newer** (it uses `createAgentSession`,
