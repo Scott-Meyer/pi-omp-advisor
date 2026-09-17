@@ -182,6 +182,16 @@ test("OMP's provider hook bounds tool followups and recovers after a failed stre
   await beforeModelCall!(first);
   assert.doesNotMatch(body(first.messages), /omp-failed|synthetic result/);
   assert.match(body(first.messages), /bounded recent context window|retry review/);
+  await assert.rejects(
+    async () => {
+      await beforeModelCall!({
+        systemPrompt: state.systemPrompt,
+        tools: [wrapper],
+        messages: [failed, result("different-call", "unmatched result"), user("retry review")],
+      });
+    },
+    /orphan tool result/,
+  );
 
   // OMP also retains the failed assistant/result pair in raw Agent history.
   // Completed-update trimming must remove both before the next observation.

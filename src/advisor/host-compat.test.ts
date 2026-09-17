@@ -60,6 +60,21 @@ test("OMP's native advisor is disabled only inside the extension-owned child", (
 
   disableNestedHostAdvisor({} as ExtensionContext, { setAdvisorEnabled: (enabled: boolean) => { calls.push(enabled); } });
   assert.deepEqual(calls, [false], "Pi sessions keep their existing behavior");
+
+  let disposed = 0;
+  assert.throws(
+    () => disableNestedHostAdvisor(ctx, { dispose: () => { disposed++; } }),
+    /session-local advisor controls/,
+  );
+  assert.equal(disposed, 1, "an incompatible OMP child cannot leak after creation");
+  assert.throws(
+    () => disableNestedHostAdvisor(ctx, {
+      setAdvisorEnabled: () => { throw new Error("disable failed"); },
+      dispose: () => { disposed++; },
+    }),
+    /disable failed/,
+  );
+  assert.equal(disposed, 2, "a child whose native advisor could not be disabled is disposed");
 });
 
 test("Pi child sessions keep the Pi tools allowlist contract", () => {

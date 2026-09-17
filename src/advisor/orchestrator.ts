@@ -137,6 +137,17 @@ const BACKLOG_CATCHUP_DEFAULT: number | "off" = "off";
 
 export type AdvisorRuntimeStatus = "running" | "paused" | "quota_exhausted" | "error" | "no_model";
 
+type AdvisorSession = Awaited<ReturnType<typeof createAgentSession>>["session"];
+
+function installAdvisorMemoryOrDispose(session: AdvisorSession, contextTokens?: number) {
+  try {
+    return installAdvisorContextWindow(session.agent, contextTokens);
+  } catch (err) {
+    session.dispose();
+    throw err;
+  }
+}
+
 interface ActiveAdvisor {
   config: AdvisorConfig;
   slug: string;
@@ -144,7 +155,7 @@ interface ActiveAdvisor {
    *  default advisor so its rendered `<advisory>` output stays
    *  byte-identical to the single-advisor form (no `advisor="..."` attribute). */
   sourceName: string | undefined;
-  session: Awaited<ReturnType<typeof createAgentSession>>["session"];
+  session: AdvisorSession;
   memory: ReturnType<typeof installAdvisorContextWindow>;
   emissionGuard: AdvisorEmissionGuard;
   adviseState: ReturnType<typeof makeAdviseTool> extends Promise<{ state: infer S }> ? S : never;
@@ -439,7 +450,8 @@ export class AdvisorOrchestrator {
     });
     await resourceLoader.reload();
 
-    let session: Awaited<ReturnType<typeof createAgentSession>>["session"];
+    let session: AdvisorSession;
+    let memory: ReturnType<typeof installAdvisorContextWindow>;
     try {
       const created = await this.createSession({
         sessionManager: SessionManager.inMemory(ctx.cwd),
@@ -451,12 +463,8 @@ export class AdvisorOrchestrator {
         customTools: [adviseTool, ...controlTools],
         resourceLoader,
       });
-      try {
-        disableNestedHostAdvisor(ctx, created.session);
-      } catch (err) {
-        created.session.dispose();
-        throw err;
-      }
+      disableNestedHostAdvisor(ctx, created.session);
+      memory = installAdvisorMemoryOrDispose(created.session, config.contextTokens);
       session = created.session;
     } catch (err) {
       console.error(`[pi-omp-advisor] advisor "${config.name}": failed to start: ${String(err)}`);
@@ -468,7 +476,7 @@ export class AdvisorOrchestrator {
       slug,
       sourceName,
       session,
-      memory: installAdvisorContextWindow(session.agent, config.contextTokens),
+      memory,
       emissionGuard,
       adviseState,
       pendingMessages: [],
@@ -715,18 +723,15 @@ export class AdvisorOrchestrator {
           customTools: [adviseTool, ...controlTools],
           resourceLoader,
         });
-        try {
-          disableNestedHostAdvisor(ctx, created.session);
-        } catch (err) {
-          created.session.dispose();
-          throw err;
-        }
+        disableNestedHostAdvisor(ctx, created.session);
+        const newMemory = installAdvisorMemoryOrDispose(created.session, advisor.config.contextTokens);
         if (advisor.disposed || advisor.generation !== rebuildGeneration) {
+          newMemory.dispose();
           created.session.dispose();
           continue;
         }
         advisor.session = created.session;
-        advisor.memory = installAdvisorContextWindow(created.session.agent, advisor.config.contextTokens);
+        advisor.memory = newMemory;
         advisor.adviseState = adviseState;
         advisor.status = "running";
         advisor.halted = false;

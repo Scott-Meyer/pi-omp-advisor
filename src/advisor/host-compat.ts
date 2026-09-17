@@ -101,9 +101,15 @@ export function ompAgentEndWasAborted(messages: readonly { role: string; stopRea
 /** Disable OMP's built-in watcher inside the extension-owned review session. */
 export function disableNestedHostAdvisor(ctx: ExtensionContext, session: unknown): void {
   if (!isOmpHost(ctx)) return;
-  const nested = session as { setAdvisorEnabled?: (enabled: boolean) => void };
+  const nested = session as { setAdvisorEnabled?: (enabled: boolean) => void; dispose?: () => void };
   if (typeof nested.setAdvisorEnabled !== "function") {
+    nested.dispose?.();
     throw new Error("OMP compatibility requires session-local advisor controls.");
   }
-  nested.setAdvisorEnabled(false);
+  try {
+    nested.setAdvisorEnabled(false);
+  } catch (err) {
+    nested.dispose?.();
+    throw err;
+  }
 }
