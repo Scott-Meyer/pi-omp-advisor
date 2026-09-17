@@ -241,6 +241,13 @@ export class AdvisorOrchestrator {
   #buildInputs:
     | { ctx: ExtensionContext; modelRegistry: AdvisorModelRegistry; piModelRuntime?: ModelRuntime; agentDir: string; watchdogBlocks: string[]; sharedInstructions: string | undefined; isLegacySingle: boolean; contextFiles: { path: string; content: string }[] }
     | undefined;
+  #activeChatModel: AdvisorModel | undefined;
+  #activeChatThinkingLevel: ThinkingLevel | undefined;
+  #activeChatRouteDirty = false;
+  // Route changes and transcript-triggered child rebuilds both mutate the live
+  // advisor sessions. Serialize them so a reset cannot publish a child built
+  // for the route that was active before a concurrent model selection.
+  #runtimeTransitions = new SerializedTransition();
   /** Shared FIFO for the non-interrupting "aside" channel across every
    *  advisor — matches upstream's single shared `yieldQueue` registration
    *  for the `"advisor"` key so nits from different advisors batch into one
@@ -259,6 +266,52 @@ export class AdvisorOrchestrator {
 
   get advisorNames(): string[] {
     return this.#advisors.map(a => a.config.name);
+  }
+
+  /** Whether any live advisor intentionally follows the primary chat route. */
+  get usesActiveChatModel(): boolean {
+    return this.#advisors.some(advisor => advisor.config.model === undefined);
+  }
+
+  /**
+   * Retarget only unpinned advisors after the primary changes model/thinking.
+   * Updating the existing child sessions preserves their review transcript,
+   * backlog, deferred notes, duplicate guard, and interruption immunity; pinned
+   * advisors in a mixed roster are untouched.
+   */
+  async followActiveChatModel(model: AdvisorModel | undefined, thinkingLevel: ThinkingLevel | undefined): Promise<void> {
+    await this.#runtimeTransitions.run(async () => {
+      const sameModel = model === this.#activeChatModel || (
+        model !== undefined && this.#activeChatModel !== undefined &&
+        model.provider === this.#activeChatModel.provider && model.id === this.#activeChatModel.id
+      );
+      if (!this.#activeChatRouteDirty && sameModel && thinkingLevel === this.#activeChatThinkingLevel) return;
+      if (!model) {
+        this.#activeChatModel = undefined;
+        this.#activeChatThinkingLevel = thinkingLevel;
+        this.#activeChatRouteDirty = false;
+        return;
+      }
+      try {
+        for (const advisor of this.#advisors) {
+          if (advisor.disposed || advisor.config.model !== undefined) continue;
+          await advisor.session.setModel(model);
+          if (thinkingLevel !== undefined) advisor.session.setThinkingLevel(thinkingLevel);
+        }
+      } catch (err) {
+        // Some earlier follower may already have accepted the route. Disable
+        // the equality fast path until a later transition converges them all,
+        // including when the user switches back to the cached route.
+        this.#activeChatRouteDirty = true;
+        throw err;
+      }
+      // Commit the route only after every follower accepted it. If one setter
+      // rejects (for example after an auth failure), the next host event retries
+      // the transition instead of treating the unapplied route as cached.
+      this.#activeChatModel = model;
+      this.#activeChatThinkingLevel = thinkingLevel;
+      this.#activeChatRouteDirty = false;
+    });
   }
 
   /**
@@ -366,6 +419,7 @@ export class AdvisorOrchestrator {
     modelRegistry: AdvisorModelRegistry,
     agentDir: string,
     piModelRuntime?: ModelRuntime,
+    activeThinkingLevel: ThinkingLevel | undefined = ctx.thinkingLevel,
   ): Promise<void> {
     await this.disposeAll();
     this.#noModelAdvisors = [];
@@ -373,6 +427,9 @@ export class AdvisorOrchestrator {
     this.#immuneTurns = configs.immuneTurns ?? ADVISOR_IMMUNE_TURNS_DEFAULT;
     this.#primaryTurnsCompleted = 0;
     this.#interruptImmuneTurnStart = undefined;
+    this.#activeChatModel = ctx.model;
+    this.#activeChatThinkingLevel = activeThinkingLevel;
+    this.#activeChatRouteDirty = false;
 
     const watchdogBlocks = await discoverWatchdogFiles(ctx.cwd, agentDir);
     const roster = configs.advisors.length > 0 ? configs.advisors : [{ name: "default" }];
@@ -405,8 +462,12 @@ export class AdvisorOrchestrator {
     const sourceName = isLegacySingle ? undefined : config.name;
 
     const resolvedModel = config.model ? this.#resolveModel(config.model, modelRegistry) : undefined;
-    const model = resolvedModel?.model;
-    const thinkingLevel = resolvedModel?.thinkingLevel;
+    // An omitted model means "watch this chat", not "ask a new SDK session to
+    // independently choose its configured default". The latter can select a
+    // different provider—or one without credentials—when the primary used
+    // --model. Explicit advisor selectors still resolve independently.
+    const model = resolvedModel?.model ?? (config.model === undefined ? this.#activeChatModel : undefined);
+    const thinkingLevel = resolvedModel?.thinkingLevel ?? (config.model === undefined ? this.#activeChatThinkingLevel : undefined);
     if (config.model && !model) {
       // Upstream skips an advisor whose explicit model does not resolve and
       // marks it `no_model`. Falling through to `createAgentSession` with no
@@ -674,6 +735,10 @@ export class AdvisorOrchestrator {
    * `resetAllRuntimes` vs `#resetAdvisorSessionState` distinction.
    */
   async resetRuntimesOnly(): Promise<void> {
+    await this.#runtimeTransitions.run(() => this.#resetRuntimesOnly());
+  }
+
+  async #resetRuntimesOnly(): Promise<void> {
     if (!this.#buildInputs) return;
     const { ctx, modelRegistry, piModelRuntime, agentDir, watchdogBlocks, sharedInstructions, isLegacySingle, contextFiles } = this.#buildInputs;
     for (const advisor of this.#advisors) {
@@ -694,8 +759,10 @@ export class AdvisorOrchestrator {
         await oldSession.agent.waitForIdle();
         if (advisor.disposed || advisor.generation !== rebuildGeneration) continue;
         const resolvedModel = advisor.config.model ? this.#resolveModel(advisor.config.model, modelRegistry) : undefined;
-        const model = resolvedModel?.model;
-        const thinkingLevel = resolvedModel?.thinkingLevel;
+        // Preserve the active chat route for implicit/unpinned advisors across
+        // transcript rebuilds just as the initial child creation does.
+        const model = resolvedModel?.model ?? (advisor.config.model === undefined ? this.#activeChatModel : undefined);
+        const thinkingLevel = resolvedModel?.thinkingLevel ?? (advisor.config.model === undefined ? this.#activeChatThinkingLevel : undefined);
         const toolNames = advisor.config.tools === undefined ? ADVISOR_DEFAULT_TOOL_NAMES : new Set(advisor.config.tools);
         const effectiveToolNames = [...toolNames].filter(name => advisor.stopEnabled || name !== "request_stop");
         const resolvedToolNames = withAdviseTool(effectiveToolNames.map(resolveAdvisorToolName));

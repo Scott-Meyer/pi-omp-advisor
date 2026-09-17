@@ -3,16 +3,12 @@
  * own Agent SDK. See ./PROVENANCE.md for exactly what is byte-identical,
  * what is ported-with-adapted-types, and what is a documented deviation.
  *
- * Auto-starts on session_start when a parseable `WATCHDOG.yml`/`.yaml` is
- * discovered (even one declaring no `advisors:`, which runs the implicit default
- * advisor), or when explicitly enabled via `/advisor on`. A `WATCHDOG.md` alone
- * does NOT activate anything — it supplies standing instructions to advisors that
- * are already running, so a project can carry attention notes without every
- * session there spawning a live model call. Unlike upstream (always-on, since it IS the product), pi-omp-advisor
- * defaults off absent any config — this extension is meant to be installed
- * globally and shouldn't silently start an extra live model call in every
- * project. This gating is the one deliberate policy deviation from
- * upstream; the advisor system itself once running is the faithful port.
+ * Auto-starts the implicit `default` advisor in every normal session. A
+ * discovered `WATCHDOG.yml`/`.yaml` can customize that advisor, replace it with
+ * a named roster, or set `main: false`; `/advisor on|off` changes only the live
+ * session. A `WATCHDOG.md` alone supplies standing instructions to the running
+ * default advisor without requiring a YAML opt-in. Like upstream, installing the
+ * advisor means normal sessions are watched unless explicitly disabled.
  *
  * Subagent processes (pi child processes spawned by a `subagent`/`task`
  * tool for delegated work) default OFF regardless of the main session's
@@ -67,7 +63,7 @@ import { PrimaryInterruptionState } from "./advisor/primary-interruption.ts";
 import { formatToolCallPrimaryArg } from "./advisor/session-history-format.ts";
 import { DEFAULT_ADVISOR_CONTEXT_TOKENS, MIN_ADVISOR_CONTEXT_TOKENS, type ContextWindowStatus } from "./advisor/context-window.ts";
 import { FileMutationTracker } from "./advisor/file-diff.ts";
-import { isOmpExtensionApi, isOmpHost, isOmpUserResumeMessage, ompAgentEndWasAborted } from "./advisor/host-compat.ts";
+import { isOmpExtensionApi, isOmpHost, isOmpUserResumeMessage, ompAgentEndWasAborted, piHostModelRuntime } from "./advisor/host-compat.ts";
 import {
   DEFAULT_FLUSH_TIMEOUT_MS,
   DEFAULT_MAX_BEHIND,
@@ -157,6 +153,10 @@ export default function (pi: ExtensionAPI) {
   let advisorPaused = false;
   const advisorPauseRequests = new RequestedBooleanState(false);
   const advisorPauseTransitions = new SerializedTransition();
+  // Model and thinking events can be emitted back-to-back (Pi's setModel
+  // changes thinking before it emits model_select). Serialize both route
+  // mutations so the awaited model event cannot race a fire-and-forget one.
+  const inheritedRouteTransitions = new SerializedTransition();
   // Explicit /advisor on|off for THIS process only. `undefined` means "no
   // explicit choice made yet" — defer to the config-derived default
   // computed in startOrchestrator. Once set, an explicit choice survives
@@ -168,12 +168,26 @@ export default function (pi: ExtensionAPI) {
   let lastMode: ExtensionContext["mode"] | undefined;
   let ompHost = isOmpExtensionApi(pi);
   const advisorCommandName = () => ompHost ? "/pi-advisor" : "/advisor";
-  let configHadRoster = false; // whether a WATCHDOG.yml/.yaml/.md advisor roster was actually found
+  const activeThinkingLevel = (ctx: ExtensionContext) => {
+    try {
+      // OMP 18.2.4 exposes this on ExtensionAPI rather than ExtensionContext.
+      return pi.getThinkingLevel() ?? ctx.thinkingLevel;
+    } catch {
+      return ctx.thinkingLevel;
+    }
+  };
+  // Whether this process may build a configured or implicit advisor roster.
+  // Normal sessions have an implicit default even when no config file exists;
+  // subagent sessions remain off unless explicitly enabled.
+  let advisorRosterAvailable = false;
   let lastDiscoveredMainEnabled: boolean | undefined; // last-discovered `main:` field, for the status line
   let lastDiscoveredSubagentsEnabled: boolean | undefined; // last-discovered `subagents:` field, for the status line
+  // Derived from configuration, not the momentarily live child list, so route
+  // events remain well-defined while child state is changing.
+  let inheritedRouteConfigured = true;
 
   function isActive(): boolean {
-    return !advisorPaused && runtimeEnabled && configHadRoster && !!orchestrator && orchestrator.advisorNames.length > 0;
+    return !advisorPaused && runtimeEnabled && advisorRosterAvailable && !!orchestrator && orchestrator.advisorNames.length > 0;
   }
 
   const primaryStop = new PrimaryStopController({
@@ -439,7 +453,7 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify(`Advisor is already ${paused ? "paused" : "running"}.`, "info");
         return;
       }
-      if (paused && (!runtimeEnabled || !configHadRoster || !orchestrator)) {
+      if (paused && (!runtimeEnabled || !advisorRosterAvailable || !orchestrator)) {
         advisorPauseRequests.reject(paused);
         ctx.ui.notify(`pi-omp-advisor is not running; use ${advisorCommandName()} on before pausing it.`, "warning");
         return;
@@ -546,16 +560,15 @@ export default function (pi: ExtensionAPI) {
     const discovered = await discoverAdvisorConfigs(ctx.cwd, agentDir);
     lastDiscoveredMainEnabled = discovered.mainEnabled;
     lastDiscoveredSubagentsEnabled = discovered.subagentsEnabled;
-    // A discovered WATCHDOG.yml is itself the opt-in, even with no `advisors:`
-    // entries — an empty roster runs the implicit unnamed "default" advisor,
-    // matching upstream, where the roster is optional and `advisor.enabled` is
-    // the switch. Without this, a file containing only `main: true` parsed fine
-    // and then started nothing.
-    configHadRoster = discovered.advisors.length > 0 || discovered.configFound || force;
+    inheritedRouteConfigured = discovered.advisors.length === 0 ||
+      discovered.advisors.some(advisor => advisor.enabled !== false && advisor.model === undefined);
     // Recompute the effective enablement unless the user already made an
     // explicit /advisor on|off choice for this process, which always wins.
+    // A normal session defaults on even when discovery finds no YAML: the
+    // orchestrator turns the empty roster into the implicit `default` advisor.
     runtimeEnabled = runtimeOverride ?? (force || configDefaultEnabled(discovered));
-    if (!configHadRoster || !runtimeEnabled) {
+    advisorRosterAvailable = discovered.advisors.length > 0 || discovered.configFound || runtimeEnabled || force;
+    if (!advisorRosterAvailable || !runtimeEnabled) {
       orchestrator = undefined;
       return;
     }
@@ -563,14 +576,14 @@ export default function (pi: ExtensionAPI) {
     // OMP to resolve Pi's unsupported static ModelRuntime export.
     const piModelRuntime = isOmpHost(ctx)
       ? undefined
-      : await (await import("@earendil-works/pi-coding-agent")).ModelRuntime.create();
+      : piHostModelRuntime(ctx) ?? await (await import("@earendil-works/pi-coding-agent")).ModelRuntime.create();
     orchestrator = new AdvisorOrchestrator(makeHost(ctx));
     // Armed here, not only in the `input` handler below: a headless caller must
     // never have an advisor note silently start a turn, and waiting for the
     // first `input` event leaves that unguarded from session_start until the
     // first prompt.
     orchestrator.setPreserveOnly(isHeadlessMode(ctx.mode));
-    await orchestrator.start(discovered, ctx, piModelRuntime ?? ctx.modelRegistry, agentDir, piModelRuntime);
+    await orchestrator.start(discovered, ctx, piModelRuntime ?? ctx.modelRegistry, agentDir, piModelRuntime, activeThinkingLevel(ctx));
     if (advisorPaused) await orchestrator.setPaused(true);
     updateAdvisorStatus(ctx);
   }
@@ -593,6 +606,31 @@ export default function (pi: ExtensionAPI) {
       console.error(`[pi-omp-advisor] startOrchestrator failed: ${err instanceof Error ? err.stack : String(err)}`);
     }
     updateAdvisorStatus(ctx);
+  });
+
+  async function followPrimaryModelSelection(ctx: ExtensionContext): Promise<void> {
+    if (!runtimeEnabled || !inheritedRouteConfigured) return;
+    await inheritedRouteTransitions.run(async () => {
+      // Re-check inside the queue: an earlier transition or command may have
+      // disabled the session or replaced every follower with pinned advisors.
+      if (!runtimeEnabled || !inheritedRouteConfigured || !orchestrator) return;
+      sessionContext = ctx;
+      try {
+        // Retarget existing unpinned children in place. Rebuilding the full
+        // orchestrator would discard review state and disrupt pinned advisors.
+        await orchestrator.followActiveChatModel(ctx.model, activeThinkingLevel(ctx));
+      } catch (err) {
+        console.error(`[pi-omp-advisor] failed to follow the active chat model: ${err instanceof Error ? err.stack : String(err)}`);
+      }
+      updateAdvisorStatus(ctx);
+    });
+  }
+
+  pi.on("model_select", async (_event, ctx) => {
+    await followPrimaryModelSelection(ctx);
+  });
+  pi.on("thinking_level_select", async (_event, ctx) => {
+    await followPrimaryModelSelection(ctx);
   });
 
   pi.on("session_shutdown", async () => {
@@ -662,13 +700,17 @@ export default function (pi: ExtensionAPI) {
     fileMutationTracker.onToolEnd(event.toolCallId, event.isError);
   });
 
-  pi.on("message_start", async event => {
+  pi.on("message_start", async (event, ctx) => {
     if (!ompHost) return;
     // OMP's RPC controller bypasses the legacy `input` event. Canonical user
     // attribution covers both ordinary prompts and `/skill:` custom messages;
     // the steering flag excludes agent/user steering just like Pi's input path.
     const message = event.message as typeof event.message & { attribution?: string; steering?: boolean };
     if (!isOmpUserResumeMessage(message)) return;
+    // OMP 18.2.4 does not emit Pi's legacy model_select event. Retarget before
+    // accepting each real user submission so a just-selected model is already
+    // the advisor route for the turn that follows.
+    await followPrimaryModelSelection(ctx);
     primaryInterruption.resume();
     // OMP's RPC path also bypasses `input`, so release preserved notes here.
     // The user message is already starting; the queued steer is folded into
@@ -1326,7 +1368,7 @@ export default function (pi: ExtensionAPI) {
         : unusable.length > 0
           ? `off — every configured advisor failed to start: ${unusable.map(describe).join(", ")}. ` +
             `Fix the \`model:\` values in WATCHDOG.yml (use "<provider>/<id>" from a model you have credentials for), or run ${advisorCommandName()} config.`
-          : `off (no WATCHDOG.yml/.yaml roster found, or not opted in for this process type — run ${advisorCommandName()} on, or ${advisorCommandName()} config)`;
+          : `off (disabled for this process type — run ${advisorCommandName()} on, or ${advisorCommandName()} config)`;
     ctx.ui.notify(`pi-omp-advisor: ${state}${subagentNote}`, "info");
   }
 

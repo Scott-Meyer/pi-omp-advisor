@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Api, Model } from "@earendil-works/pi-ai";
-import { advisorSessionToolOptions, disableNestedHostAdvisor, findAdvisorModel, isOmpExtensionApi, isOmpHost, isOmpUserResumeMessage, ompAgentEndWasAborted } from "./host-compat.ts";
+import { advisorSessionToolOptions, disableNestedHostAdvisor, findAdvisorModel, isOmpExtensionApi, isOmpHost, isOmpUserResumeMessage, ompAgentEndWasAborted, piHostModelRuntime } from "./host-compat.ts";
 
 const model = { provider: "fixture", id: "reviewer" } as Model<Api>;
 
@@ -81,4 +81,14 @@ test("Pi child sessions keep the Pi tools allowlist contract", () => {
   const ctx = {} as ExtensionContext;
   assert.equal(isOmpHost(ctx), false);
   assert.deepEqual(advisorSessionToolOptions(ctx, ["read", "advise"]), { tools: ["read", "advise"] });
+});
+
+test("Pi advisors reuse the live host runtime that owns session-only auth and providers", () => {
+  const runtime = { streamSimple() {} };
+  const pi = { modelRegistry: { runtime } } as unknown as ExtensionContext;
+  assert.equal(piHostModelRuntime(pi), runtime);
+
+  const missingCapability = { modelRegistry: { runtime: {} } } as unknown as ExtensionContext;
+  assert.equal(piHostModelRuntime(missingCapability), undefined);
+  assert.equal(piHostModelRuntime({ models: {}, modelRegistry: { runtime } } as unknown as ExtensionContext), undefined);
 });

@@ -29,6 +29,21 @@ export function isOmpHost(ctx: ExtensionContext): boolean {
 }
 
 /**
+ * Recover Pi's live model runtime from the compatibility registry it exposes
+ * to extensions. `ModelRegistry` deliberately fronts this same runtime for
+ * model lookup/auth/provider registration, but `createAgentSession` needs the
+ * runtime itself to preserve session-only `--api-key` credentials and
+ * extension-registered providers. There is no public accessor in Pi's current
+ * API, so this is capability-checked and callers retain a fresh-runtime
+ * fallback for older/different hosts.
+ */
+export function piHostModelRuntime(ctx: ExtensionContext): ModelRuntime | undefined {
+  if (isOmpHost(ctx)) return undefined;
+  const runtime = (ctx.modelRegistry as unknown as { runtime?: ModelRuntime }).runtime;
+  return runtime && typeof runtime.streamSimple === "function" ? runtime : undefined;
+}
+
+/**
  * Discover the same standing context files the host gives its primary session
  * without importing Pi-only convenience exports. Both Pi's loader and OMP's
  * legacy compatibility loader expose this resource contract.

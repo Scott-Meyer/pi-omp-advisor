@@ -170,7 +170,7 @@ the same settings entry works on every machine.
 
 ```bash
 pi install npm:pi-omp-advisor
-pi install git:github.com/Scott-Meyer/pi-omp-advisor@v0.5.0
+pi install git:github.com/Scott-Meyer/pi-omp-advisor@v0.5.2
 ```
 
 Requires pi **0.84.2 or newer** (it uses `createAgentSession`,
@@ -185,10 +185,15 @@ resolved relative to the agent dir):
 { "packages": ["../../git/pi-omp-advisor"] }
 ```
 
-Then create a `WATCHDOG.yml`, or nothing runs. A discovered, parseable config
-file is the opt-in; if it declares no `advisors:`, one implicit default advisor
-runs on the session's own model. A `WATCHDOG.md` on its own does **not** activate
-anything — it only adds instructions for advisors that are already running.
+That is enough: normal sessions immediately run one implicit `default` advisor
+on the active chat model, including a model selected with `--model`. No
+`WATCHDOG.yml` or command is required. This means installation adds a second
+model call after ordinary primary turns; use `/advisor off` for the current
+session or persist `main: false` when that is not wanted.
+
+`WATCHDOG.yml` is optional customization for model choice, cadence, tools, and
+named advisor rosters. A `WATCHDOG.md` by itself adds standing instructions to
+the implicit default advisor.
 
 > **Do not symlink `src/` into `~/.pi/agent/extensions/`.** That directory is
 > for single-file/self-contained extensions and gets no dependency
@@ -236,15 +241,15 @@ advisors:
 `WATCHDOG.md` files on the same search path are loaded as freeform standing
 instructions shared by every advisor.
 
-Set `model` explicitly to choose your advisor. If omitted, selection falls back
-to the SDK's configured/provider defaults; it does not reliably inherit the
-current primary model. Pick something fast — an advisor's judgment always lags
-the primary by its own round-trip time.
+Set `model` explicitly to choose a different advisor model. If omitted, the
+advisor inherits the active chat model and thinking level, including its live
+provider/authentication route. Pick something fast when overriding it — an
+advisor's judgment always lags the primary by its own round-trip time.
 
 ## Commands
 
-- `/advisor on` | `off` — enable/disable for this process (force-starts a
-  default advisor if no roster is configured)
+- `/advisor on` | `off` — enable/disable for this process (`on` restarts the
+  implicit default advisor when no roster is configured)
 - `/advisor main on|off` — default for normal sessions
 - `/advisor subagents on|off` — default inside subagent processes
   (`PI_ADVISOR_SUBAGENTS=1|0` overrides per process)
@@ -276,8 +281,9 @@ the primary by its own round-trip time.
 
 ## Security and privacy
 
-Read this before enabling an advisor. An advisor is a second agent that watches
-your session, so it has real data-flow and trust implications.
+Read this before installing the extension. An advisor starts enabled and is a
+second agent that watches your session, so it has real data-flow, cost, and
+trust implications.
 
 **Your session content is sent to the advisor's model provider**, by two separate
 routes. If `model:` names a different provider than your main session, all of this
@@ -306,8 +312,9 @@ goes to a *second* vendor.
    what the digest summarizes. Large results may be shortened before the next
    model request; older results expire with the rest of the conversation.
 
-If a session must stay within one provider, set `model:` to a model from that
-provider, or don't run an advisor there. To stop route 2 entirely, set
+An advisor without an explicit `model:` follows the active chat provider. If you
+choose a different advisor model, session content also goes to that provider.
+To stop route 2 entirely, set
 `tools: []`, which grants no investigative tools (the advisor keeps `advise`).
 
 **Advisors can be granted write access, and are not sandboxed.** `tools:` accepts

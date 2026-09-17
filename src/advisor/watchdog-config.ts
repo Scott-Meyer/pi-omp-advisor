@@ -149,8 +149,8 @@ export interface DiscoveredAdvisors {
    * itself, independent of whether an advisor roster is present. Lets a
    * roster stay configured (e.g. for subagent use only, via `subagents:
    * true`) while the main session itself defaults off. `undefined` when no
-   * file sets it explicitly (caller default: on, if a roster exists — the
-   * pre-existing behavior).
+   * file sets it explicitly (caller default: on, with an implicit advisor if
+   * no roster exists).
    */
   mainEnabled: boolean | undefined;
   /**
@@ -176,16 +176,10 @@ export interface DiscoveredAdvisors {
   /** Deliver pending observations at primary settlement instead of waiting for the turn batch (default true; set false for strict turn batching). */
   flushOnSettled: boolean | undefined;
   /**
-   * Whether at least one `WATCHDOG.yml`/`.yaml` was found **and parsed into a
-   * valid mapping**, even if it declares no advisors. Upstream's activation
-   * switch is the `advisor.enabled` setting with the roster optional (an empty
-   * roster runs one implicit `default` advisor); pi has no such setting, so
-   * writing a watchdog config file *is* the opt-in. Without this, a file
-   * containing only `main: true` would parse fine and then start nothing.
-   *
-   * Deliberately keyed on a successful parse, not on file existence: a
-   * malformed or non-mapping file must NOT silently activate a default advisor
-   * off the back of a config the user clearly intended to say something else.
+   * Whether at least one `WATCHDOG.yml`/`.yaml` was found and parsed into a
+   * valid mapping, even if it declares no advisors. Activation no longer
+   * depends on this flag—normal sessions have an implicit default—but callers
+   * still use it to distinguish configured and implicit rosters.
    */
   configFound: boolean;
 }

@@ -30,7 +30,7 @@ if [[ "$actual_version" != "$EXPECTED_OMP_VERSION" ]]; then
   exit 1
 fi
 
-mkdir -p "$WORK/pack" "$WORK/stage" "$WORK/home/.omp/agent" "$WORK/project/.omp/skills/resume-check"
+mkdir -p "$WORK/pack" "$WORK/stage" "$WORK/home/.omp/agent" "$WORK/project/.omp/skills/resume-check" "$WORK/zero-config-project"
 printf '{"private":true}\n' >"$WORK/stage/package.json"
 if [[ -n "$PACKAGE_SPEC" ]]; then
   npm view "$PACKAGE_SPEC" version dist.integrity dist.shasum dist.tarball --json >"$WORK/npm-registry-dist.json"
@@ -66,6 +66,8 @@ export OMP_SKIP_SETUP=1
 cat >"$PI_CODING_AGENT_DIR/config.yml" <<'YAML'
 advisor:
   enabled: false
+modelRoles:
+  default: compat/saved-default-model
 YAML
 
 PORT=${OMP_COMPAT_PORT:-$(python3 - <<'PY'
@@ -85,6 +87,13 @@ providers:
     models:
       - id: compat-model
         name: OMP Compatibility Fixture
+        reasoning: true
+        input: [text]
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+        contextWindow: 128000
+        maxTokens: 4096
+      - id: saved-default-model
+        name: Deliberately Different Saved Default
         reasoning: false
         input: [text]
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
@@ -152,7 +161,35 @@ run_print() {
   (cd "$WORK/project" && "$OMP_BIN" --model compat/compat-model --no-session -p "Reply exactly PRIMARY_COMPAT_OK.") >"$output" 2>"$stderr"
 }
 
-printf '[1/7] npm-packed install and restricted child inventory\n'
+printf '[1/9] fresh install starts an implicit advisor on the active chat model\n'
+start_server direct-advice "$WORK/zero-config.requests.jsonl"
+(cd "$WORK/zero-config-project" && "$OMP_BIN" --model compat/compat-model --no-session -p "Reply exactly PRIMARY_COMPAT_OK.") >"$WORK/zero-config.out" 2>"$WORK/zero-config.err"
+node - "$WORK/zero-config.requests.jsonl" "$WORK/zero-config.out" <<'NODE'
+const fs = require("fs");
+const [log, out] = process.argv.slice(2);
+const rows = fs.readFileSync(log, "utf8").trim().split(/\n/).map(JSON.parse);
+const primary = rows.filter(row => !row.advisorRequest);
+const advisor = rows.filter(row => row.advisorRequest);
+if (fs.readFileSync(out, "utf8").trim() !== "PRIMARY_COMPAT_OK") throw new Error("unexpected zero-config primary output");
+if (primary.length < 1 || advisor.length < 2) throw new Error(`fresh install did not run the implicit advisor: ${JSON.stringify(rows.map(row => row.advisorRequest))}`);
+if (!primary.every(row => row.model === "compat-model") || !advisor.every(row => row.model === "compat-model")) throw new Error(`implicit advisor used the saved default instead of the active --model selection: ${JSON.stringify(rows.map(row => row.model))}`);
+NODE
+stop_server
+
+printf '[2/9] implicit advisor follows an interactive chat-model switch\n'
+start_server direct-advice "$WORK/model-switch.requests.jsonl"
+node "$ROOT/scripts/omp-compat/rpc-model-switch-probe.mjs" "$OMP_BIN" "$WORK/zero-config-project" "$WORK/model-switch.rpc.json" >"$WORK/model-switch.probe.txt"
+node - "$WORK/model-switch.requests.jsonl" <<'NODE'
+const fs = require("fs");
+const rows = fs.readFileSync(process.argv[2], "utf8").trim().split(/\n/).map(JSON.parse);
+const primaryModels = rows.filter(row => !row.advisorRequest).map(row => row.model);
+const advisorModels = rows.filter(row => row.advisorRequest).map(row => row.model);
+if (primaryModels[0] !== "compat-model" || primaryModels.slice(1).some(model => model !== "saved-default-model")) throw new Error(`unexpected primary model sequence: ${JSON.stringify(primaryModels)}`);
+if (!advisorModels.includes("compat-model") || !advisorModels.includes("saved-default-model")) throw new Error(`implicit advisor did not follow the model switch: ${JSON.stringify(advisorModels)}`);
+NODE
+stop_server
+
+printf '[3/9] npm-packed install and restricted child inventory\n'
 start_server direct-advice "$WORK/direct.requests.jsonl"
 run_print "$WORK/direct.out" "$WORK/direct.err"
 node - "$WORK/direct.requests.jsonl" "$WORK/direct.out" "$WORK/direct.err" <<'NODE'
@@ -170,7 +207,7 @@ if (!/route advisor=/.test(fs.readFileSync(err, "utf8"))) throw new Error("exten
 NODE
 stop_server
 
-printf '[2/7] provider-context bounding across two large tool cycles\n'
+printf '[4/9] provider-context bounding across two large tool cycles\n'
 start_server context-window "$WORK/context.requests.jsonl"
 node "$ROOT/scripts/omp-compat/rpc-two-update-probe.mjs" "$OMP_BIN" "$WORK/project" "$WORK/context.rpc.json" >"$WORK/context.probe.txt"
 node - "$WORK/context.requests.jsonl" <<'NODE'
@@ -182,7 +219,7 @@ if (Math.max(...advisor.map(row => row.totalContentChars)) > 30000) throw new Er
 NODE
 stop_server
 
-printf '[3/7] terminal settlement ignores automatic continuation\n'
+printf '[5/9] terminal settlement ignores automatic continuation\n'
 start_server empty-stop-retry "$WORK/continuation.requests.jsonl"
 run_print "$WORK/continuation.out" "$WORK/continuation.err"
 node - "$WORK/continuation.requests.jsonl" <<'NODE'
@@ -194,7 +231,7 @@ if (rows.length < 3 || rows[0].advisorRequest || rows[1].advisorRequest || !rows
 NODE
 stop_server
 
-printf '[4/7] tool-phase abort, inbox release, and explicit user resume\n'
+printf '[6/9] tool-phase abort, inbox release, and explicit user resume\n'
 start_server tool-abort-blocker "$WORK/abort.requests.jsonl"
 RESUME_PROMPT="/skill:resume-check second fixture response" \
   node "$ROOT/scripts/omp-compat/rpc-tool-abort-probe.mjs" "$OMP_BIN" "$WORK/project" "$WORK/abort.rpc.json" >"$WORK/abort.probe.txt"
@@ -214,12 +251,12 @@ if (latest[0] !== "aborted" || !latest.includes("stop")) throw new Error(`unexpe
 NODE
 stop_server
 
-printf '[5/7] malformed advisor tool stream recovers on the next observation\n'
+printf '[7/9] malformed advisor tool stream recovers on the next observation\n'
 start_server failed-tool-stream-recovery "$WORK/failed-stream.requests.jsonl"
 node "$ROOT/scripts/omp-compat/rpc-failed-stream-recovery-probe.mjs" "$OMP_BIN" "$WORK/project" "$WORK/failed-stream.rpc.json" >"$WORK/failed-stream.probe.txt"
 stop_server
 
-printf '[6/7] primary native advisor enabled without nesting inside extension child\n'
+printf '[8/9] primary native advisor enabled without nesting inside extension child\n'
 cat >"$PI_CODING_AGENT_DIR/config.yml" <<'YAML'
 advisor:
   enabled: true
@@ -241,7 +278,7 @@ advisor:
   enabled: false
 YAML
 
-printf '[7/7] namespaced command and host-aware help\n'
+printf '[9/9] namespaced command and host-aware help\n'
 node "$ROOT/scripts/omp-compat/rpc-command-probe.mjs" "$OMP_BIN" "$WORK/project" "/pi-advisor help" >"$WORK/help.rpc.json"
 node - "$WORK/help.rpc.json" <<'NODE'
 const fs = require("fs");

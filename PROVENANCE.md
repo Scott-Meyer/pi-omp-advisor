@@ -56,7 +56,7 @@ copyright Scott Meyer, MIT (see `LICENSE`):
 - subagent-process gating (`main:` / `subagents:` config fields,
   `PI_ADVISOR_SUBAGENTS`, the `/advisor` command surface) — see deviation 6
 - advisor-session resource isolation (`ADVISOR_RESOURCE_ISOLATION`) — deviation 8
-- activation on config presence (`DiscoveredAdvisors.configFound`) — deviation 9
+- default-on activation with optional config (`main:` / `DiscoveredAdvisors.configFound`) — deviation 9
 - the pi extension host bridge in `src/index.ts` (`pi.sendMessage`,
   `pi.registerMessageRenderer`, lifecycle wiring, headless drain)
 - the visible, cancellable preserved-advice queue and session-scoped
@@ -138,14 +138,12 @@ copyright Scott Meyer, MIT (see `LICENSE`):
    is armed from `ctx.mode` at orchestrator start (and for `json` as well as
    `print`) rather than only from the `input` event.
 
-9. **Activation on config presence** (`DiscoveredAdvisors.configFound`). Upstream's
-   switch is the `advisor.enabled` setting (default `false`) with the roster
-   optional — an empty roster runs one implicit unnamed `default` advisor. pi has
-   no settings-schema surface to register such a toggle into, so discovering a
-   parseable `WATCHDOG.yml` *is* the opt-in, and a file that declares `main: true`
-   with no `advisors:` now starts that same implicit default advisor instead of
-   silently doing nothing. Keyed on a successful parse rather than file existence,
-   so a malformed config cannot activate an advisor by accident.
+9. **Default-on activation with optional config.** A normal Pi or OMP session
+   starts one implicit unnamed `default` advisor even when no `WATCHDOG.yml`
+   exists, matching the installed extension's purpose rather than requiring a
+   second opt-in after installation. `WATCHDOG.yml` customizes or replaces that
+   roster and `main: false` persists an opt-out. Subagent processes remain off by
+   default through the separate gate in deviation 6.
 10. **Primary-message provenance and presentation.** Upstream marks advisor custom
    messages with `attribution: "agent"`; its message conversion then sends custom
    messages to the model as `developer`. Pi's extension API has no attribution
@@ -274,9 +272,10 @@ never executed before this):
   not: upstream's `AdvisorConfig.model` is always a concrete selector, and the
   global `advisor` role applies only when `model` is *omitted*. The map was
   reverted as invented, incompatible schema. pi has no role registry, so an
-  omitted `model` still means "session default"; a role-equivalent default would
-  need to be an explicitly pi-omp-advisor-specific field, not a reinterpretation of
-  upstream's.
+  omitted `model` inherits the active chat model and thinking level. On Pi the
+  child also reuses the live host `ModelRuntime` behind `ModelRegistry`, preserving
+  runtime-only credentials and extension-registered providers; OMP receives its
+  live model registry through the host-specific child contract.
 - **`yaml` was an undeclared dependency.** It is not in pi's host-provided set
   (`@earendil-works/*` plus `typebox`), so a bare static import resolved only
   where it happened to be hoisted — and threw at extension load elsewhere,

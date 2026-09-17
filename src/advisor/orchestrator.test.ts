@@ -8,6 +8,7 @@ import { createAssistantMessageEventStream, type AssistantMessage, type StopReas
 import { PrimaryInterruptionState } from "./primary-interruption.ts";
 import type { createAgentSession, ExtensionContext, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { AdvisorOrchestrator, type OrchestratorHost } from "./orchestrator.ts";
+import type { AdvisorModelRegistry } from "./host-compat.ts";
 import { AdvisorInbox } from "./advisor-inbox.ts";
 import { ADVISOR_COMMUNICATION_TOOLS } from "./advise-tool.ts";
 import { ADVISOR_STOP_TOOLS } from "./stop-tools.ts";
@@ -24,7 +25,7 @@ type Review = (text: string, call: (name: string, args?: Record<string, unknown>
 
 // Substitute only the model/session boundary: real batching, tools, state,
 // prompt assembly, resource isolation and host inbox remain in the exercise.
-async function harness(t: TestContext, review: Review, options?: { stop?: PrimaryStopAccess; contextTokens?: number; includePrimaryThinking?: boolean; syncBacklog?: unknown; maxBehind?: number; flushTimeoutMs?: number; flushOnSettled?: boolean; unsupportedContextOnSession?: number; primary?: { isStreaming(): boolean; isAborting(): boolean; isAutoResumeSuppressed(): boolean; hasQueuedWork?(): boolean } }) {
+async function harness(t: TestContext, review: Review, options?: { stop?: PrimaryStopAccess; contextTokens?: number; includePrimaryThinking?: boolean; syncBacklog?: unknown; maxBehind?: number; flushTimeoutMs?: number; flushOnSettled?: boolean; unsupportedContextOnSession?: number; zeroConfig?: boolean; watchdogLines?: string[]; modelRegistry?: AdvisorModelRegistry; failSetModelOnCall?: number; blockSessionCreationOn?: number; activeModel?: ExtensionContext["model"]; activeThinkingLevel?: ExtensionContext["thinkingLevel"]; primary?: { isStreaming(): boolean; isAborting(): boolean; isAutoResumeSuppressed(): boolean; hasQueuedWork?(): boolean } }) {
   const cwd = await mkdtemp(join(tmpdir(), "advisor-orchestrator-"));
   const agentDir = join(cwd, "agent-config");
   await mkdir(agentDir);
@@ -54,15 +55,28 @@ async function harness(t: TestContext, review: Review, options?: { stop?: Primar
   };
   let sessionCount = 0;
   let sessionDisposals = 0;
+  let setModelCallCount = 0;
+  const failSetModelOnCall = options?.failSetModelOnCall;
+  const blockSessionCreationOn = options?.blockSessionCreationOn;
+  const blockedSessionCreationStarted = deferred();
+  const blockedSessionCreationRelease = deferred();
   const unsupportedContextOnSession = options?.unsupportedContextOnSession;
   const advisorStates: Array<{
     messages: AgentMessage[];
     isStreaming: boolean;
     streamingMessage?: AgentMessage | null;
     streamMessage?: AgentMessage | null;
+    model?: unknown;
+    thinkingLevel?: unknown;
   }> = [];
+  const createdSessionOptions: Parameters<typeof createAgentSession>[0][] = [];
   const createSession: typeof createAgentSession = async options => {
     sessionCount++;
+    createdSessionOptions.push(options);
+    if (sessionCount === blockSessionCreationOn) {
+      blockedSessionCreationStarted.resolve();
+      await blockedSessionCreationRelease.promise;
+    }
     assert.ok(options?.customTools);
     for (const name of ADVISOR_COMMUNICATION_TOOLS) {
       assert.ok(options.tools?.includes(name), `${name} must survive the tool allowlist`);
@@ -77,7 +91,9 @@ async function harness(t: TestContext, review: Review, options?: { stop?: Primar
     const state = {
       messages: [] as AgentMessage[], isStreaming: false,
       systemPrompt: options.resourceLoader?.getSystemPrompt() ?? "",
-      tools, model: { contextWindow: 128_000 },
+      tools,
+      model: options.model ?? { contextWindow: 128_000 },
+      thinkingLevel: options.thinkingLevel,
     };
     advisorStates.push(state);
     let controller = new AbortController();
@@ -123,32 +139,55 @@ async function harness(t: TestContext, review: Review, options?: { stop?: Primar
       },
       // Wrapper idle is already true, so this signals without awaiting the Agent.
       async abort() { controller.abort(); },
+      async setModel(model: NonNullable<ExtensionContext["model"]>) {
+        setModelCallCount++;
+        if (setModelCallCount === failSetModelOnCall) throw new Error("simulated route auth failure");
+        state.model = model;
+      },
+      setThinkingLevel(level: NonNullable<ExtensionContext["thinkingLevel"]>) { state.thinkingLevel = level; },
       dispose() { sessionDisposals++; controller.abort(); },
     };
     if (sessionCount === unsupportedContextOnSession) delete (session.agent as { transformContext?: unknown }).transformContext;
     return { session } as unknown as Awaited<ReturnType<typeof createAgentSession>>;
   };
-  await writeFile(join(cwd, "WATCHDOG.yml"), [
-    "main: true",
-    `maxBehind: ${options?.maxBehind ?? 1}`,
-    ...(options?.flushTimeoutMs !== undefined ? [`flushTimeoutMs: ${options.flushTimeoutMs}`] : []),
-    ...(options?.flushOnSettled !== undefined ? [`flushOnSettled: ${options.flushOnSettled}`] : []),
-    "advisors:", "  - name: reviewer",
-    ...(options?.stop ? ["    tools: [read, grep, glob, request_stop]"] : []),
-    ...(options?.contextTokens !== undefined ? [`    contextTokens: ${options.contextTokens}`] : []),
-    ...(options?.includePrimaryThinking !== undefined ? [`    includePrimaryThinking: ${options.includePrimaryThinking}`] : []),
-    ...(options?.syncBacklog !== undefined
-      ? [typeof options.syncBacklog === "object" && options.syncBacklog !== null
-          ? `syncBacklog:\n  pauseAt: ${(options.syncBacklog as { pauseAt: number }).pauseAt}\n  resumeAt: ${(options.syncBacklog as { resumeAt: number }).resumeAt}`
-          : `syncBacklog: ${options.syncBacklog}`]
-      : []), "",
-  ].join("\n"));
+  if (!options?.zeroConfig) {
+    await writeFile(join(cwd, "WATCHDOG.yml"), (options?.watchdogLines ?? [
+      "main: true",
+      `maxBehind: ${options?.maxBehind ?? 1}`,
+      ...(options?.flushTimeoutMs !== undefined ? [`flushTimeoutMs: ${options.flushTimeoutMs}`] : []),
+      ...(options?.flushOnSettled !== undefined ? [`flushOnSettled: ${options.flushOnSettled}`] : []),
+      "advisors:", "  - name: reviewer",
+      ...(options?.stop ? ["    tools: [read, grep, glob, request_stop]"] : []),
+      ...(options?.contextTokens !== undefined ? [`    contextTokens: ${options.contextTokens}`] : []),
+      ...(options?.includePrimaryThinking !== undefined ? [`    includePrimaryThinking: ${options.includePrimaryThinking}`] : []),
+      ...(options?.syncBacklog !== undefined
+        ? [typeof options.syncBacklog === "object" && options.syncBacklog !== null
+            ? `syncBacklog:\n  pauseAt: ${(options.syncBacklog as { pauseAt: number }).pauseAt}\n  resumeAt: ${(options.syncBacklog as { resumeAt: number }).resumeAt}`
+            : `syncBacklog: ${options.syncBacklog}`]
+        : []), "",
+    ]).join("\n"));
+  }
   const discovered = await discoverAdvisorConfigs(cwd, agentDir);
   assert.equal(discovered.advisors[0]?.tools?.includes("request_stop") ?? false, Boolean(options?.stop), "the explicit YAML grant must survive discovery");
   const orchestrator = new AdvisorOrchestrator(host, createSession);
-  await orchestrator.start(discovered, { cwd } as ExtensionContext, {} as ModelRuntime, agentDir);
+  await orchestrator.start(discovered, {
+    cwd,
+    model: options?.activeModel,
+    thinkingLevel: options?.activeThinkingLevel,
+  } as ExtensionContext, options?.modelRegistry ?? {} as ModelRuntime, agentDir);
   t.after(() => orchestrator.disposeAll());
-  return { orchestrator, inbox, sent, whenPreserved: preserved.promise, sessionCount: () => sessionCount, sessionDisposals: () => sessionDisposals, advisorStates };
+  return {
+    orchestrator,
+    inbox,
+    sent,
+    whenPreserved: preserved.promise,
+    sessionCount: () => sessionCount,
+    sessionDisposals: () => sessionDisposals,
+    advisorStates,
+    createdSessionOptions,
+    whenSessionCreationBlocked: blockedSessionCreationStarted.promise,
+    releaseSessionCreation: blockedSessionCreationRelease.resolve,
+  };
 }
 
 function update(orchestrator: AdvisorOrchestrator, final: boolean) {
@@ -157,6 +196,143 @@ function update(orchestrator: AdvisorOrchestrator, final: boolean) {
   if (final) orchestrator.onAgentSettled();
   else orchestrator.onTurnStart();
 }
+
+test("a zero-config default advisor inherits the active chat model and thinking level", async t => {
+  const activeModel = { provider: "runtime-only", id: "selected-with-cli", contextWindow: 128_000 } as ExtensionContext["model"];
+  const result = await harness(t, async () => {}, {
+    zeroConfig: true,
+    activeModel,
+    activeThinkingLevel: "high",
+  });
+
+  assert.deepEqual(result.orchestrator.advisorNames, ["default"]);
+  assert.equal(result.orchestrator.usesActiveChatModel, true);
+  assert.equal(result.createdSessionOptions[0]?.model, activeModel);
+  assert.equal(result.createdSessionOptions[0]?.thinkingLevel, "high");
+
+  const switchedModel = { provider: "runtime-only", id: "switched-live", contextWindow: 128_000 } as ExtensionContext["model"];
+  await result.orchestrator.followActiveChatModel(switchedModel, "low");
+  assert.equal(result.sessionCount(), 1, "a model switch must not rebuild or discard the advisor runtime");
+  assert.equal(result.advisorStates[0]?.model, switchedModel);
+  assert.equal(result.advisorStates[0]?.thinkingLevel, "low");
+
+  await result.orchestrator.resetRuntimesOnly();
+  assert.equal(result.createdSessionOptions[1]?.model, switchedModel);
+  assert.equal(result.createdSessionOptions[1]?.thinkingLevel, "low");
+});
+
+test("a failed chat-route change remains retryable without rebuilding advisor state", async t => {
+  const initial = { provider: "chat", id: "initial", contextWindow: 128_000 } as ExtensionContext["model"];
+  const switched = { provider: "chat", id: "switched", contextWindow: 128_000 } as ExtensionContext["model"];
+  const result = await harness(t, async () => {}, {
+    zeroConfig: true,
+    activeModel: initial,
+    failSetModelOnCall: 1,
+  });
+  const retained = { role: "user", content: "state that must survive a failed route update" } as AgentMessage;
+  result.advisorStates[0]?.messages.push(retained);
+
+  await assert.rejects(result.orchestrator.followActiveChatModel(switched, "low"), /simulated route auth failure/);
+  assert.equal(result.advisorStates[0]?.model, initial);
+  assert.equal(result.sessionCount(), 1);
+  assert.equal(result.sessionDisposals(), 0);
+
+  await result.orchestrator.followActiveChatModel(switched, "low");
+  assert.equal(result.advisorStates[0]?.model, switched);
+  assert.equal(result.advisorStates[0]?.messages.includes(retained), true);
+  assert.equal(result.sessionCount(), 1);
+});
+
+test("a chat-route change waits for an in-flight transcript reset and retargets the published child", async t => {
+  const initial = { provider: "chat", id: "initial", contextWindow: 128_000 } as ExtensionContext["model"];
+  const switched = { provider: "chat", id: "switched", contextWindow: 128_000 } as ExtensionContext["model"];
+  const result = await harness(t, async () => {}, {
+    zeroConfig: true,
+    activeModel: initial,
+    blockSessionCreationOn: 2,
+  });
+
+  const reset = result.orchestrator.resetRuntimesOnly();
+  await result.whenSessionCreationBlocked;
+  const follow = result.orchestrator.followActiveChatModel(switched, "low");
+  result.releaseSessionCreation();
+  await Promise.all([reset, follow]);
+
+  assert.equal(result.sessionCount(), 2);
+  assert.equal(result.createdSessionOptions[1]?.model, initial, "the reset began on the old route");
+  assert.equal(result.advisorStates[1]?.model, switched, "the queued route change must retarget the replacement child");
+  assert.equal(result.advisorStates[1]?.thinkingLevel, "low");
+});
+
+test("a partially applied multi-advisor route change retries until every follower converges", async t => {
+  const initial = { provider: "chat", id: "initial", contextWindow: 128_000 } as ExtensionContext["model"];
+  const switched = { provider: "chat", id: "switched", contextWindow: 128_000 } as ExtensionContext["model"];
+  const result = await harness(t, async () => {}, {
+    activeModel: initial,
+    failSetModelOnCall: 2,
+    watchdogLines: [
+      "main: true",
+      "advisors:",
+      "  - name: first-follower",
+      "  - name: second-follower",
+      "",
+    ],
+  });
+
+  await assert.rejects(result.orchestrator.followActiveChatModel(switched, "low"), /simulated route auth failure/);
+  assert.equal(result.advisorStates[0]?.model, switched);
+  assert.equal(result.advisorStates[1]?.model, initial);
+
+  await result.orchestrator.followActiveChatModel(initial, "high");
+  assert.equal(result.advisorStates[0]?.model, initial, "returning to the cached route must repair a partial switch");
+  assert.equal(result.advisorStates[1]?.model, initial);
+
+  await result.orchestrator.followActiveChatModel(switched, "low");
+  assert.equal(result.advisorStates[0]?.model, switched);
+  assert.equal(result.advisorStates[1]?.model, switched);
+  assert.equal(result.sessionCount(), 2);
+  assert.equal(result.sessionDisposals(), 0);
+});
+
+test("chat-model changes retarget only unpinned advisors without rebuilding a mixed roster", async t => {
+  const initial = { provider: "chat", id: "initial", contextWindow: 128_000 } as ExtensionContext["model"];
+  const switched = { provider: "chat", id: "switched", contextWindow: 128_000 } as ExtensionContext["model"];
+  const pinned = { provider: "review", id: "fixed", contextWindow: 128_000 } as NonNullable<ExtensionContext["model"]>;
+  const result = await harness(t, async () => {}, {
+    activeModel: initial,
+    activeThinkingLevel: "high",
+    watchdogLines: [
+      "main: true",
+      "advisors:",
+      "  - name: follows-chat",
+      "  - name: pinned",
+      "    model: review/fixed",
+      "",
+    ],
+    modelRegistry: {
+      find: (provider, id) => provider === "review" && id === "fixed" ? pinned : undefined,
+    },
+  });
+
+  assert.deepEqual(result.orchestrator.advisorNames, ["follows-chat", "pinned"]);
+  assert.equal(result.sessionCount(), 2);
+  assert.equal(result.advisorStates[0]?.model, initial);
+  assert.equal(result.advisorStates[1]?.model, pinned);
+  const retainedFollowerMessage = { role: "user", content: "retained follower review state" } as AgentMessage;
+  const retainedPinnedMessage = { role: "user", content: "retained pinned review state" } as AgentMessage;
+  result.advisorStates[0]?.messages.push(retainedFollowerMessage);
+  result.advisorStates[1]?.messages.push(retainedPinnedMessage);
+
+  await result.orchestrator.followActiveChatModel(switched, "low");
+  assert.equal(result.sessionCount(), 2, "route changes must preserve both child sessions");
+  assert.equal(result.sessionDisposals(), 0, "route changes must not discard advisor state");
+  assert.equal(result.advisorStates[0]?.model, switched);
+  assert.equal(result.advisorStates[0]?.thinkingLevel, "low");
+  assert.equal(result.advisorStates[1]?.model, pinned);
+  assert.equal(result.advisorStates[1]?.thinkingLevel, undefined);
+  assert.equal(result.advisorStates[0]?.messages.includes(retainedFollowerMessage), true);
+  assert.equal(result.advisorStates[1]?.messages.includes(retainedPinnedMessage), true);
+});
 
 test("an OMP child fails closed on stop access and unsupported context hooks", async t => {
   t.mock.method(console, "error", () => {});
