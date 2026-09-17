@@ -289,9 +289,9 @@ that protects the mechanics but does not replace this two-model session test.
   headless pi hang forever instead of exiting: nested MCP child processes kept
   the event loop alive past teardown.
 - **The emission guard gates new notes at the tool-call boundary**, not during
-  a deferred flush. Each deferred note already spent its update's budget;
-  applying a fresh one-note budget to a batch would silently discard the rest.
-  Revisions edit a held note and do not create a new one.
+  a deferred flush. Each deferred note already spent its update's allowance (up to
+  3 accepted notes per review cycle). Revisions and updates edit a held note or
+  follow up and do not spend a new-note slot.
 - **Review before release.** `beginUpdate` leaves deferred advice editable.
   A completed review calls `finishUpdate` to release accepted notes into the
   delivery channels (steer for concerns during active work, aside for nits,

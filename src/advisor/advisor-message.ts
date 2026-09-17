@@ -90,8 +90,13 @@ class AdvisorMessageCard implements Component {
     ].filter((part): part is string => part !== undefined);
 
     const header = truncateToWidth(`─ Advisor · ${summary.join(" · ")} `, insideWidth, "");
-    const headerFill = "─".repeat(Math.max(0, insideWidth - visibleWidth(header)));
-    const lines: string[] = [border(`╭${header}${headerFill}╮`)];
+    // A lone note with a title IS the card, so its title becomes the card's
+    // headline in the top rule; multi-note cards keep titles on their own
+    // label lines below so the header stays an honest summary.
+    const loneTitle = this.notes.length === 1 ? this.notes[0]!.shortTitle : undefined;
+    const headline = loneTitle ? truncateToWidth(`─ ${loneTitle} `, insideWidth - visibleWidth(header), "") : "";
+    const headerFill = "─".repeat(Math.max(0, insideWidth - visibleWidth(header) - visibleWidth(headline)));
+    const lines: string[] = [border(`╭${header}${loneTitle ? this.theme.bold(headline) : ""}${headerFill}╮`)];
 
     const frameLine = (content: string): void => {
       const clipped = truncateToWidth(content, contentWidth, "");
@@ -113,9 +118,11 @@ class AdvisorMessageCard implements Component {
     } else {
       this.notes.forEach((note, index) => {
         if (index > 0) frameLine("");
-        const label = note.severity?.toUpperCase() ?? "NOTE";
+        const updateSuffix = note.updateOnId ? " (UPDATE)" : "";
+        const label = (note.severity?.toUpperCase() ?? "NOTE") + updateSuffix;
         const source = note.advisor ? `  ${this.theme.fg("dim", note.advisor)}` : "";
-        frameLine(`${this.theme.fg(severityColor(note.severity), this.theme.bold(label))}${source}`);
+        const title = note.shortTitle && !loneTitle ? `  ${this.theme.bold(note.shortTitle)}` : "";
+        frameLine(`${this.theme.fg(severityColor(note.severity), this.theme.bold(label))}${source}${title}`);
 
         for (const line of note.note.split("\n")) {
           for (const part of wrapped(this.theme.fg("customMessageText", line))) frameLine(part);

@@ -35,6 +35,7 @@ import {
   isInterruptingSeverity,
   resolveAdvisorDeliveryChannel,
   resolveAdvisorToolName,
+  type AdvisorNote,
   type PendingAdvisorNote,
   type PendingAdviceAccess,
   type AdvisorSeverity,
@@ -47,7 +48,7 @@ import { installAdvisorContextWindow, type ContextWindowStatus } from "./context
 import { ADVISOR_STOP_TOOLS } from "./stop-tools.ts";
 import type { CurrentToolResult, PrimaryStopAccess, StopRequestResult } from "./primary-stop.ts";
 import type { AdvisorConfig, SyncBacklogConfig } from "./watchdog-config.ts";
-import { DEFAULT_FLUSH_TIMEOUT_MS, DEFAULT_MAX_BEHIND, discoverWatchdogFiles, normalizeSyncBacklog } from "./watchdog-config.ts";
+import { DEFAULT_FLUSH_ON_SETTLED, DEFAULT_FLUSH_TIMEOUT_MS, DEFAULT_MAX_BEHIND, discoverWatchdogFiles, normalizeSyncBacklog } from "./watchdog-config.ts";
 import { buildAdvisorSystemPrompt } from "./system-prompt.ts";
 
 /**
@@ -164,6 +165,8 @@ interface ActiveAdvisor {
   includeThinking: boolean;
   maxBehind: number;
   flushTimeoutMs: number;
+  /** Deliver pending observations when the primary settles instead of waiting for the turn batch (default true). */
+  flushOnSettled: boolean;
   flushTimer: NodeJS.Timeout | undefined;
   wakeCount: number;
   modelRequestCount: number;
@@ -178,6 +181,7 @@ export interface AdvisorStatusOverviewItem {
   pendingTurns: number;
   wakeEveryTurns: number;
   flushTimeoutMs: number;
+  flushOnSettled?: boolean;
   wakes: number;
   modelRequests: number;
   toolCalls: number;
@@ -189,7 +193,7 @@ export interface OrchestratorHost {
   sendCustom(content: string, details: unknown, opts: { deliverAs: "steer"; triggerTurn?: boolean }): void;
   preserveAdvice(note: PendingAdvisorNote): void;
   pendingAdvice(advisor: string | undefined): PendingAdvisorNote[];
-  reviseAdvice(advisor: string | undefined, adviceId: string, note: string): boolean;
+  reviseAdvice(advisor: string | undefined, adviceId: string, note: string, shortTitle?: string, severity?: AdvisorSeverity): boolean;
   withdrawAdvice(advisor: string | undefined, adviceId: string): boolean;
   currentTool(): CurrentToolResult;
   requestStop(advisor: string | undefined, targetId: string, reason: string): StopRequestResult;
@@ -235,6 +239,30 @@ export class AdvisorOrchestrator {
     return this.#advisors.map(a => a.config.name);
   }
 
+  /**
+   * Read-only transcript snapshots of running advisors, for the stream
+   * viewer (`/advisor stream`). Advisors are in-memory sessions with no file
+   * to tail, so this reads the live agent state directly. Message arrays are
+   * copied per call; contents are shared read-only with the advisor.
+   */
+  transcriptSnapshot(name?: string): { name: string; streaming: boolean; messages: AgentMessage[] }[] {
+    const wanted = name?.toLowerCase();
+    return this.#advisors
+      .filter(a => !a.disposed && !a.halted)
+      .filter(a => wanted === undefined || a.config.name.toLowerCase() === wanted)
+      .map(a => ({
+        name: a.config.name,
+        streaming: a.session.agent.state.isStreaming,
+        // `messages` holds only COMPLETED messages; `streamingMessage` is
+        // the in-flight response — append it so the viewer shows a live
+        // review as it happens rather than only once it settles.
+        messages: [
+          ...a.session.agent.state.messages,
+          ...(a.session.agent.state.streamingMessage ? [a.session.agent.state.streamingMessage] : []),
+        ],
+      }));
+  }
+
   statusOverview(): AdvisorStatusOverviewItem[] {
     // `backlog` is how many primary turns are waiting behind the one currently
     // being prompted — the honest "how far behind is this advisor" number, shown in
@@ -248,6 +276,7 @@ export class AdvisorOrchestrator {
         pendingTurns: a.awaitingTurns,
         wakeEveryTurns: a.maxBehind,
         flushTimeoutMs: a.flushTimeoutMs,
+        flushOnSettled: a.flushOnSettled,
         wakes: a.wakeCount,
         modelRequests: a.modelRequestCount,
         toolCalls: a.toolCallCount,
@@ -388,7 +417,7 @@ export class AdvisorOrchestrator {
     // downstream of AdviseState silently strands deferred notes.
     const routeAdvice = (note: PendingAdvisorNote) => this.#routeAdvice(sourceName, note);
     const { tool: adviseTool, controlTools, state: adviseState } = await makeAdviseTool(
-      routeAdvice, note => emissionGuard.accept(note), this.#pendingAccess(sourceName), undefined,
+      routeAdvice, note => emissionGuard.check(note), this.#pendingAccess(sourceName), undefined,
       config.tools?.includes("request_stop") ? this.#stopAccess(sourceName) : undefined,
       note => emissionGuard.remember(note),
       note => emissionGuard.forget(note),
@@ -442,6 +471,7 @@ export class AdvisorOrchestrator {
       includeThinking: config.includePrimaryThinking ?? false,
       maxBehind: config.maxBehind ?? configs?.maxBehind ?? DEFAULT_MAX_BEHIND,
       flushTimeoutMs: config.flushTimeoutMs ?? configs?.flushTimeoutMs ?? DEFAULT_FLUSH_TIMEOUT_MS,
+      flushOnSettled: config.flushOnSettled ?? configs?.flushOnSettled ?? DEFAULT_FLUSH_ON_SETTLED,
       flushTimer: undefined,
       wakeCount: 0,
       modelRequestCount: 0,
@@ -655,7 +685,7 @@ export class AdvisorOrchestrator {
         // Context rebuilds preserve the outbox and its IDs. The next review
         // receives a pending summary even though its model history is fresh.
         const { tool: adviseTool, controlTools, state: adviseState } = await makeAdviseTool(
-          routeAdvice, note => advisor.emissionGuard.accept(note),
+          routeAdvice, note => advisor.emissionGuard.check(note),
           this.#pendingAccess(advisor.sourceName), advisor.adviseState,
           advisor.config.tools?.includes("request_stop") ? this.#stopAccess(advisor.sourceName) : undefined,
           note => advisor.emissionGuard.remember(note),
@@ -777,7 +807,11 @@ export class AdvisorOrchestrator {
   /**
    * Settlement marks queued work final but does not defeat turn batching. A
    * short run waits for more primary turns or the oldest-message deadline;
-   * reaching the configured threshold still wakes immediately.
+   * reaching the configured threshold still wakes immediately. An advisor
+   * configured with `flushOnSettled: false` instead keeps whatever it has
+   * batching for more primary turns or the oldest-message deadline, so a
+   * short run's review stays economical. Mid-run batching is untouched in
+   * both modes: only the final settlement flushes early.
    */
   onAgentSettled(): void {
     if (this.#paused) return;
@@ -791,7 +825,9 @@ export class AdvisorOrchestrator {
         advisor.pendingMessages = [];
         advisor.awaitingTurns++;
       }
-      if (advisor.awaitingTurns >= advisor.maxBehind) this.#flushAwaiting(advisor, false);
+      if (advisor.awaitingTurns >= advisor.maxBehind || (advisor.flushOnSettled && advisor.awaitingTurns > 0)) {
+        this.#flushAwaiting(advisor, false);
+      }
     }
   }
 
@@ -975,10 +1011,16 @@ export class AdvisorOrchestrator {
         ...this.#asideQueue.filter(note => note.advisor === sourceName).map(note => ({ ...note })),
         ...this.#host.pendingAdvice(sourceName),
       ],
-      revise: (adviceId, note) => {
+      revise: (adviceId, note, shortTitle, severity) => {
         const index = this.#asideQueue.findIndex(item => item.adviceId === adviceId && item.advisor === sourceName);
-        if (index < 0) return this.#host.reviseAdvice(sourceName, adviceId, note);
-        this.#asideQueue[index] = { ...this.#asideQueue[index]!, note, updatedAt: Date.now() };
+        if (index < 0) return this.#host.reviseAdvice(sourceName, adviceId, note, shortTitle, severity);
+        this.#asideQueue[index] = {
+          ...this.#asideQueue[index]!,
+          note,
+          ...(shortTitle !== undefined ? { shortTitle: shortTitle || undefined } : {}),
+          ...(severity !== undefined ? { severity } : {}),
+          updatedAt: Date.now(),
+        };
         return true;
       },
       withdraw: adviceId => {
@@ -1032,6 +1074,7 @@ export class AdvisorOrchestrator {
     this.#recordInterruptDelivered();
     const content = formatAdvisorBatchContent([noteRecord]);
     this.#host.sendCustom(content, { notes: [noteRecord] }, { deliverAs: "steer", triggerTurn: true });
+    this.markNotesStreamed([noteRecord]);
   }
 
   #enqueueAside(note: PendingAdvisorNote): void {
@@ -1053,7 +1096,16 @@ export class AdvisorOrchestrator {
       if (notes.length === 0) return;
       const content = formatAdvisorBatchContent(notes);
       this.#host.sendCustom(content, { notes }, { deliverAs: "steer" });
+      this.markNotesStreamed(notes);
     });
+  }
+
+  markNotesStreamed(notes: readonly (AdvisorNote & { adviceId?: string })[]): void {
+    for (const note of notes) {
+      if (!note.adviceId) continue;
+      const adv = this.#advisors.find(a => a.sourceName === note.advisor);
+      adv?.adviseState.markStreamed(note.adviceId, note as PendingAdvisorNote);
+    }
   }
 }
 
@@ -1064,4 +1116,6 @@ export interface DiscoveredAdvisorsLike {
   immuneTurns?: number;
   maxBehind?: number;
   flushTimeoutMs?: number;
+  /** Deliver pending observations at settlement; defaults to true when unset. */
+  flushOnSettled?: boolean;
 }

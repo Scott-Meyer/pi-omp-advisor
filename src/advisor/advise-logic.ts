@@ -14,6 +14,8 @@ export interface AdviseDetails {
   severity?: AdvisorSeverity;
   /** Which configured advisor produced this note (omitted for the default/unnamed advisor). */
   advisor?: string;
+  /** Optional human-readable title naming the note's point in a few words. */
+  shortTitle?: string;
 }
 
 /** One queued advice note. */
@@ -21,10 +23,14 @@ export interface AdvisorNote {
   note: string;
   severity?: AdvisorSeverity;
   advisor?: string;
+  /** Optional human-readable title naming the note's point in a few words. */
+  shortTitle?: string;
   /** Stable receipt shared by deferred advice and the preserved inbox. */
   adviceId?: string;
   createdAt?: number;
   updatedAt?: number;
+  /** If this note is a follow-up revision on an earlier delivered note. */
+  updateOnId?: string;
 }
 
 export interface PendingAdvisorNote extends AdvisorNote {
@@ -34,7 +40,7 @@ export interface PendingAdvisorNote extends AdvisorNote {
 /** Scoped by the host to one advisor; handed-off or removed IDs cannot be edited. */
 export interface PendingAdviceAccess {
   list(): PendingAdvisorNote[];
-  revise(adviceId: string, note: string): boolean;
+  revise(adviceId: string, note: string, shortTitle?: string, severity?: AdvisorSeverity): boolean;
   withdraw(adviceId: string): boolean;
 }
 
@@ -69,9 +75,12 @@ const ADVISOR_GUIDANCE = "weigh, don't blindly obey";
 export function formatAdvisorBatchContent(notes: readonly AdvisorNote[]): string {
   return notes
     .map(n => {
+      const idTag = n.adviceId ? ` id="${escapeXmlAttribute(n.adviceId)}"` : "";
       const severity = n.severity ? ` severity="${n.severity}"` : "";
       const who = n.advisor ? ` advisor="${escapeXmlAttribute(n.advisor)}"` : "";
-      return `<advisory${who}${severity} guidance="${ADVISOR_GUIDANCE}">\n${escapeXmlText(n.note)}\n</advisory>`;
+      const title = n.shortTitle ? ` title="${escapeXmlAttribute(n.shortTitle)}"` : "";
+      const updateTag = n.updateOnId ? ` updateOn="${escapeXmlAttribute(n.updateOnId)}"` : "";
+      return `<advisory${idTag}${who}${severity}${title}${updateTag} guidance="${ADVISOR_GUIDANCE}">\n${escapeXmlText(n.note)}\n</advisory>`;
     })
     .join("\n");
 }
@@ -198,6 +207,8 @@ export class AdviseState {
   #deliveredNoteSeverities = new Map<string, number>();
   #reviewing = false;
   #deferredNotes: PendingAdvisorNote[] = [];
+  #streamedHistory = new Map<string, PendingAdvisorNote>();
+  #trackedNotes = new Map<string, PendingAdvisorNote>();
 
   constructor(
     private readonly onAdvice: (note: PendingAdvisorNote) => void,
@@ -236,18 +247,131 @@ export class AdviseState {
     ];
   }
 
+  /** Render a compact, single-turn snapshot of currently pending/queued advice. */
+  formatQueueSnapshot(): string {
+    const pending = this.pendingAdvice();
+    if (pending.length === 0) {
+      return "Current pending queue: (empty)";
+    }
+    const lines = pending.map(item => {
+      const preview = item.note.replace(/\s+/g, " ").slice(0, 160);
+      const title = item.shortTitle ? ` "${item.shortTitle}"` : "";
+      const age = item.createdAt === undefined ? "" : `, ${Math.max(0, Math.floor((Date.now() - item.createdAt) / 1000))}s old`;
+      return `• ${item.adviceId} [${item.severity ?? "nit"}${age}]${title}: ${preview}`;
+    });
+    return [`Current pending queue (${pending.length} ${pending.length === 1 ? "item" : "items"}):`, ...lines].join("\n");
+  }
+
+  /**
+   * Update an existing note: if still in review or queued in the inbox, updates
+   * in place; if already delivered into the primary agent's live stream, delivers
+   * as a follow-up note referencing the original. If previously dismissed by the
+   * operator, respects the dismissal without resurrecting it into the stream.
+   */
+  update(
+    adviceId: string,
+    note: string,
+    shortTitle?: string,
+    severity?: AdvisorSeverity,
+  ): { changed: boolean; text: string; adviceId: string; outcome: "updated_pending" | "delivered_followup" | "dismissed" | "created_new"; oldNote?: string } {
+    if (!note.trim()) {
+      return { changed: false, text: "An empty update is not advice. Note text is required.", adviceId, outcome: "updated_pending" };
+    }
+
+    // Case 1: Check if still deferred in review
+    const pending = this.#deferredNotes.find(item => item.adviceId === adviceId);
+    if (pending) {
+      const oldNote = pending.note;
+      const oldSeverity = pending.severity;
+      pending.note = note;
+      if (shortTitle !== undefined) pending.shortTitle = shortTitle || undefined;
+      if (severity !== undefined) pending.severity = severity;
+      pending.updatedAt = Date.now();
+      this.#trackedNotes.set(adviceId, { ...pending });
+
+      // If escalated from non-blocker to blocker, route immediately rather than staying deferred
+      if (pending.severity === "blocker" && oldSeverity !== "blocker") {
+        if (this.#deliver(pending)) {
+          this.#deferredNotes = this.#deferredNotes.filter(item => item !== pending);
+          const statusText = `Updated advice ${adviceId} and escalated to blocker (delivered immediately).\n\n${this.formatQueueSnapshot()}`;
+          return { changed: true, text: statusText, adviceId, outcome: "delivered_followup", oldNote };
+        }
+      }
+
+      const statusText = `Updated pending advice ${adviceId} in place.\n\n${this.formatQueueSnapshot()}`;
+      return { changed: true, text: statusText, adviceId, outcome: "updated_pending", oldNote };
+    }
+
+    // Case 2: Check if queued in the host inbox / aside queue
+    const queued = this.pendingAccess?.list().find(item => item.adviceId === adviceId);
+    if (queued) {
+      const finalSeverity = severity ?? queued.severity;
+      const finalTitle = shortTitle !== undefined ? (shortTitle || undefined) : queued.shortTitle;
+      const updatedRecord: PendingAdvisorNote = { ...queued, note, shortTitle: finalTitle, severity: finalSeverity, updatedAt: Date.now() };
+
+      // Only treat an actual severity increase from non-blocker to blocker as immediate escalation
+      if (finalSeverity === "blocker" && queued.severity !== "blocker") {
+        if (this.#deliver(updatedRecord)) {
+          this.pendingAccess?.withdraw(adviceId);
+          const statusText = `Escalated queued advice ${adviceId} to blocker and delivered immediately.\n\n${this.formatQueueSnapshot()}`;
+          return { changed: true, text: statusText, adviceId, outcome: "delivered_followup" };
+        }
+      }
+
+      if (this.pendingAccess!.revise(adviceId, note, shortTitle, severity)) {
+        const key = advisorNoteDedupeKey(note);
+        this.#deliveredNoteSeverities.set(key, Math.max(
+          this.#deliveredNoteSeverities.get(key) ?? 0, advisorSeverityRank(finalSeverity),
+        ));
+        this.#trackedNotes.set(adviceId, updatedRecord);
+        const statusText = `Updated queued advice ${adviceId} in the inbox.\n\n${this.formatQueueSnapshot()}`;
+        return { changed: true, text: statusText, adviceId, outcome: "updated_pending" };
+      }
+    }
+
+    // Case 3: Check if already delivered into the primary agent's stream
+    const streamed = this.#streamedHistory.get(adviceId);
+    if (streamed) {
+      const originalTitle = streamed.shortTitle ? ` "${streamed.shortTitle}"` : "";
+      const baseTitle = shortTitle ?? streamed.shortTitle;
+      const followupTitle = baseTitle ? (baseTitle.startsWith("Update:") ? baseTitle : `Update: ${baseTitle}`) : "Update";
+      const followupSeverity = severity ?? streamed.severity;
+      const res = this.submit(note, followupSeverity, followupTitle, adviceId);
+      if (!res.adviceId) {
+        const statusText = `Update on ${adviceId}${originalTitle} was ignored as duplicate content.\n\n${this.formatQueueSnapshot()}`;
+        return { changed: false, text: statusText, adviceId, outcome: "delivered_followup" };
+      }
+      const isStreamed = this.#streamedHistory.has(res.adviceId);
+      const deliveryStatus = isStreamed ? "Delivered" : "Queued";
+      const statusText = `Original advice ${adviceId}${originalTitle} was already delivered to the live stream. ${deliveryStatus} follow-up advisory note (id: ${res.adviceId}).\n\n${this.formatQueueSnapshot()}`;
+      return { changed: true, text: statusText, adviceId: res.adviceId, outcome: "delivered_followup" };
+    }
+
+    // Case 4: Was it previously tracked in the inbox, but is no longer present and was not streamed?
+    // That means the human operator explicitly dismissed it! Do not resurrect it into the stream.
+    if (this.#trackedNotes.has(adviceId)) {
+      const statusText = `Original advice ${adviceId} was dismissed by the operator; revision not applied.\n\n${this.formatQueueSnapshot()}`;
+      return { changed: false, text: statusText, adviceId, outcome: "dismissed" };
+    }
+
+    // Case 5: Unknown ID — reject cleanly so mistyped IDs do not bypass the new-note allowance
+    const statusText = `No active, queued, or delivered advice found matching targetId "${adviceId}". Update not applied.\n\n${this.formatQueueSnapshot()}`;
+    return { changed: false, text: statusText, adviceId, outcome: "updated_pending" };
+  }
+
   /** Replace content, not urgency; revisions neither create notes nor spend a new-note slot. */
-  revise(adviceId: string, note: string): { changed: boolean; text: string; oldNote?: string } {
+  revise(adviceId: string, note: string, shortTitle?: string): { changed: boolean; text: string; oldNote?: string } {
     if (!note.trim()) return { changed: false, text: "An empty revision is not advice. Use withdraw_advice to remove it." };
     const pending = this.#deferredNotes.find(item => item.adviceId === adviceId);
     if (pending) {
       const oldNote = pending.note;
       pending.note = note;
+      if (shortTitle !== undefined) pending.shortTitle = shortTitle || undefined;
       pending.updatedAt = Date.now();
       return { changed: true, text: `Updated pending advice ${adviceId}.`, oldNote };
     }
     const queued = this.pendingAccess?.list().find(item => item.adviceId === adviceId);
-    if (queued && this.pendingAccess!.revise(adviceId, note)) {
+    if (queued && this.pendingAccess!.revise(adviceId, note, shortTitle)) {
       // This note was already routed to a queue. Its new text belongs in the
       // delivered history too, even if the user later dismisses that queue item.
       const key = advisorNoteDedupeKey(note);
@@ -284,8 +408,9 @@ export class AdviseState {
     if (pending.length === 0) return undefined;
     const lines = pending.slice(0, 3).map(item => {
       const preview = item.note.replace(/\s+/g, " ").slice(0, 180);
+      const title = item.shortTitle ? ` “${item.shortTitle}”` : "";
       const age = item.createdAt === undefined ? "" : `, ${Math.max(0, Math.floor((Date.now() - item.createdAt) / 1000))}s old`;
-      return `${item.adviceId} (${item.severity ?? "nit"}, ${item.status}${age}): ${JSON.stringify(preview)}`;
+      return `${item.adviceId} (${item.severity ?? "nit"}, ${item.status}${age})${title}: ${JSON.stringify(preview)}`;
     });
     return [
       "### Your pending advice",
@@ -303,20 +428,23 @@ export class AdviseState {
   }
 
   /** Returns an ID only for accepted advice, whether deferred or routed to the host. */
-  submit(note: string, severity: AdvisorSeverity | undefined): { text: string; delivered: boolean; adviceId?: string } {
+  submit(note: string, severity: AdvisorSeverity | undefined, shortTitle?: string, updateOnId?: string): { text: string; delivered: boolean; adviceId?: string } {
     const key = advisorNoteDedupeKey(note);
     if ((this.#deliveredNoteSeverities.get(key) ?? 0) >= advisorSeverityRank(severity)) {
       return { text: "Duplicate advice ignored.", delivered: false };
     }
     const existing = this.#deferredNotes.find(item => advisorNoteDedupeKey(item.note) === key);
     const now = Date.now();
-    const record: PendingAdvisorNote = existing ?? { adviceId: randomUUID(), note, severity, createdAt: now, updatedAt: now };
+    const record: PendingAdvisorNote = existing ?? { adviceId: randomUUID(), note, severity, shortTitle, updateOnId, createdAt: now, updatedAt: now };
     if (existing && advisorSeverityRank(severity) > advisorSeverityRank(existing.severity)) existing.severity = severity;
+    if (existing && shortTitle !== undefined) existing.shortTitle = shortTitle || undefined;
+    if (existing && updateOnId !== undefined) existing.updateOnId = updateOnId;
+    this.#trackedNotes.set(record.adviceId, { ...record });
 
     if (this.#reviewing && severity !== "blocker") {
       if (!existing) this.#deferredNotes.push(record);
       return {
-        text: `Deferred advice ${record.adviceId}. It remains editable with revise_advice or withdraw_advice until review completes (or while queued in the inbox).`,
+        text: `Deferred advice ${record.adviceId}. It remains editable until review completes (or while queued in the inbox).\n\n${this.formatQueueSnapshot()}`,
         delivered: false,
         adviceId: record.adviceId,
       };
@@ -324,7 +452,7 @@ export class AdviseState {
     const delivered = this.#deliver(record);
     if (existing && delivered) this.#deferredNotes = this.#deferredNotes.filter(item => item !== existing);
     return {
-      text: delivered ? `Recorded advice ${record.adviceId}. pending_advice shows whether it is still editable; handed-off messages cannot be recalled.` : "Duplicate advice ignored.",
+      text: delivered ? `Recorded advice ${record.adviceId}.\n\n${this.formatQueueSnapshot()}` : `Duplicate advice ignored.\n\n${this.formatQueueSnapshot()}`,
       delivered,
       ...(delivered ? { adviceId: record.adviceId } : {}),
     };
@@ -337,5 +465,13 @@ export class AdviseState {
     this.onAdvice({ ...note });
     this.#deliveredNoteSeverities.set(key, rank);
     return true;
+  }
+
+  /** Mark a note as genuinely handed off to the primary agent's stream. */
+  markStreamed(adviceId: string, note?: PendingAdvisorNote): void {
+    const existing = note ?? this.#trackedNotes.get(adviceId);
+    if (existing) {
+      this.#streamedHistory.set(adviceId, { ...existing });
+    }
   }
 }

@@ -25,11 +25,13 @@ batch per primary turn, one line per tool call. Its recent model context is
 bounded to **32,000 estimated input tokens** by default, and primary-agent
 reasoning is excluded unless explicitly enabled.
 
-An advisor's only way to reach the primary agent is `advise(note, severity)`.
-Alongside it, an advisor gets whatever investigative tools its config grants — by
-default the read-only set `read`, `grep`, `glob` (pi's `find`) — so it can check a
-claim before raising it. How a note reaches the primary depends on severity and on
-what the primary is doing:
+An advisor reaches the primary agent and operator through `advise(note, severity?, ShortTitle?)`
+and `update_advice(targetId, note, ShortTitle?, severity?)`.
+Alongside them, an advisor gets whatever investigative tools its config grants — by
+default the read-only set `read`, `grep`, `find` (configured as `glob` too) — so it can check a
+claim before raising it. Every tool response automatically includes a live snapshot of
+its pending queue and review allowance, eliminating multi-turn state-query churn. How a
+note reaches the primary depends on severity and on what the primary is doing:
 
 | Situation | Channel |
 |---|---|
@@ -51,9 +53,10 @@ immediate routing. This is review between completed model/tool cycles, not a
 pre-execution check of each tool call.
 
 Two gates keep the primary's transcript clean even when an advisor model
-misbehaves: a noise filter (`stop`, `done`, `lgtm`, `no issues`, …) and a
-budget of one accepted note per update, both applied at the tool-call
-boundary before a note can enter the delivery state machine.
+misbehaves: a noise filter (`stop`, `done`, `lgtm`, `no issues`, …) and an
+allowance of up to 3 accepted notes per review update (with allowance metadata
+`[Review allowance: N of 3 used]` returned on every tool completion), both
+applied at the tool-call boundary before a note can enter the delivery state machine.
 
 Preserved notes remain in an extension-owned **Advisor inbox** instead of pi's
 invisible `nextTurn` queue. A widget above the editor shows up to three queued
@@ -66,7 +69,14 @@ Queue and pause state are persisted as session metadata, so they survive
 extension reloads. Late ordinary notes, including default-severity nits, stay
 here for you to read and discard before submitting your next prompt. Typing alone
 does not release them. Asides queued during work are checked again at handoff in
-case the primary has since finished or been stopped.
+case the primary has since finished or been stopped. One more release gesture
+exists for the empty-chat case: with the session idle, the editor empty, and
+something queued, a bare `Enter` delivers the whole queue and starts the turn
+(pi drops empty submits before extensions' `input` event, so this hooks the
+editor's own input path). Because pi routes each keystroke to the focused
+component, an Enter claimed by any dialog, picker, or autocomplete never
+reaches this — it only fires on the honest empty-editor case. It also never
+fires while the advisor is paused or the agent is mid-run.
 
 The advisor can inspect its own unsent notes with `pending_advice`, replace their
 text with `revise_advice`, or remove them with `withdraw_advice`. A small pending
@@ -208,6 +218,7 @@ subagents: false   # run inside subagent processes too (default false; see note 
 syncBacklog: off   # backpressure: off, queued turns, or { pauseAt: 4, resumeAt: 1 } hysteresis
 maxBehind: 3       # completed primary turns accumulated per advisor wake (default 3, min 1)
 flushTimeoutMs: 240000 # maximum age of the oldest unseen message (default 4 minutes, min 100ms)
+flushOnSettled: true # deliver pending observations as soon as the primary finishes (default true; set false for strict turn batching)
 
 advisors:
   - name: advisor
@@ -217,6 +228,7 @@ advisors:
     includePrimaryThinking: false  # default; independent of the advisor's own thinking level
     maxBehind: 3          # per-advisor turn-batch override
     flushTimeoutMs: 240000 # per-advisor maximum wait for a partial batch
+    flushOnSettled: true  # per-advisor settlement-flush override
     instructions: Pay extra attention to auth and data-loss risk.
     enabled: true
 ```

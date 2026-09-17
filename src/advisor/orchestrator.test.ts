@@ -24,7 +24,7 @@ type Review = (text: string, call: (name: string, args?: Record<string, unknown>
 
 // Substitute only the model/session boundary: real batching, tools, state,
 // prompt assembly, resource isolation and host inbox remain in the exercise.
-async function harness(t: TestContext, review: Review, options?: { stop?: PrimaryStopAccess; contextTokens?: number; includePrimaryThinking?: boolean; syncBacklog?: unknown; maxBehind?: number; flushTimeoutMs?: number; primary?: { isStreaming(): boolean; isAborting(): boolean; isAutoResumeSuppressed(): boolean; hasQueuedWork?(): boolean } }) {
+async function harness(t: TestContext, review: Review, options?: { stop?: PrimaryStopAccess; contextTokens?: number; includePrimaryThinking?: boolean; syncBacklog?: unknown; maxBehind?: number; flushTimeoutMs?: number; flushOnSettled?: boolean; primary?: { isStreaming(): boolean; isAborting(): boolean; isAutoResumeSuppressed(): boolean; hasQueuedWork?(): boolean } }) {
   const cwd = await mkdtemp(join(tmpdir(), "advisor-orchestrator-"));
   const agentDir = join(cwd, "agent-config");
   await mkdir(agentDir);
@@ -122,6 +122,7 @@ async function harness(t: TestContext, review: Review, options?: { stop?: Primar
     "main: true",
     `maxBehind: ${options?.maxBehind ?? 1}`,
     ...(options?.flushTimeoutMs !== undefined ? [`flushTimeoutMs: ${options.flushTimeoutMs}`] : []),
+    ...(options?.flushOnSettled !== undefined ? [`flushOnSettled: ${options.flushOnSettled}`] : []),
     "advisors:", "  - name: reviewer",
     ...(options?.stop ? ["    tools: [read, grep, glob, request_stop]"] : []),
     ...(options?.contextTokens !== undefined ? [`    contextTokens: ${options.contextTokens}`] : []),
@@ -581,11 +582,22 @@ test("three continuing primary turns produce one advisor wake with one combined 
   const status = orchestrator.statusOverview()[0]!;
   assert.equal(status.wakes, 1);
   assert.equal(status.modelRequests, 1);
+
+  // The stream viewer reads the advisor's own session: its context contains the
+  // observed turns and the review it produced.
+  const snapshots = orchestrator.transcriptSnapshot();
+  assert.equal(snapshots.length, 1);
+  assert.equal(snapshots[0]!.name, "reviewer");
+  assert.equal(snapshots[0]!.streaming, false);
+  const transcript = snapshots[0]!.messages.map(m => JSON.stringify(m)).join("\n");
+  assert.match(transcript, /batched-turn-3/);
+  assert.equal(orchestrator.transcriptSnapshot("reviewer").length, 1, "name filter selects the advisor");
+  assert.equal(orchestrator.transcriptSnapshot("nope").length, 0, "unknown names select nothing");
 });
 
-test("settlement does not wake short runs before the shared turn threshold", async t => {
+test("settlement with flushOnSettled off does not wake short runs before the shared turn threshold", async t => {
   const reviews: string[] = [];
-  const { orchestrator } = await harness(t, async text => { reviews.push(text); }, { maxBehind: 3 });
+  const { orchestrator } = await harness(t, async text => { reviews.push(text); }, { maxBehind: 3, flushOnSettled: false });
   for (let run = 1; run <= 3; run++) {
     orchestrator.onMessage({ role: "user", content: `short-run-${run}`, timestamp: run });
     orchestrator.onTurnEnd();
@@ -597,6 +609,29 @@ test("settlement does not wake short runs before the shared turn threshold", asy
   for (let run = 1; run <= 3; run++) assert.match(reviews[0]!, new RegExp(`short-run-${run}`));
   assert.doesNotMatch(reviews[0]!, /in progress — more steps follow/);
 });
+
+test("settlement delivers a short completed run immediately by default", async t => {
+  const reviews: string[] = [];
+  const { orchestrator } = await harness(t, async text => { reviews.push(text); }, { maxBehind: 3 });
+  orchestrator.onMessage({ role: "user", content: "short-run-1", timestamp: 1 });
+  orchestrator.onTurnEnd();
+  orchestrator.onAgentSettled();
+  assert.equal(await orchestrator.drainForExit(1000), true);
+  assert.equal(reviews.length, 1, "settlement flushes below the turn threshold without opting in");
+  assert.match(reviews[0]!, /short-run-1/);
+  const status = orchestrator.statusOverview()[0]!;
+  assert.equal(status.flushOnSettled, true);
+  assert.equal(status.pendingTurns, 0);
+});
+
+test("flushOnSettled does not flush an empty queue on settlement", async t => {
+  const reviews: string[] = [];
+  const { orchestrator } = await harness(t, async text => { reviews.push(text); }, { maxBehind: 3, flushOnSettled: true });
+  orchestrator.onAgentSettled();
+  assert.equal(await orchestrator.drainForExit(1000), true);
+  assert.equal(reviews.length, 0, "nothing observed means nothing to deliver");
+});
+
 
 test("waitForCatchup pauses when queued turns reach pauseAt and resumes when the merged successor starts", async t => {
   const allowTurn1 = deferred();

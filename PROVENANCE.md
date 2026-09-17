@@ -8,12 +8,16 @@ public git tags checked for this version — pinned by the exact npm package
 version installed at port time). License: MIT, Copyright (c) 2025 Mario
 Zechner, (c) 2025-2026 Can Bölük, (c) 2026 Stencil Labs, Inc. — see `LICENSE`.
 
-The following prompt files were copied from upstream. `advise-tool.md` remains
-byte-identical. The other three now have small, explicit changes: limited-view
-and pending-advice context, a clarification of the peer role and user intent,
-and a repository hint that no longer claims more than its detector establishes.
-Their OMP structure and most wording are retained; this is not a wholesale persona
-rewrite. See `src/prompts/ATTRIBUTION.md` for copyright attribution.
+The prompt files in `src/prompts/` originally derived from upstream.
+`system.md` and `advise-tool.md` have been rewritten for pi-omp-advisor to
+replace upstream's RFC-2119 all-caps prohibitions with human-to-human
+conceptual framing (`ai-writing` principles), ambient queue snapshots in tool
+returns, and a streamlined `advise` + `update_advice` tool contract.
+The historical upstream baselines are preserved for comparison in
+`src/prompts/system.backup.md` and `src/prompts/advise-tool.backup.md`.
+`active-repo-watchdog.md` and `context-files.md` retain their upstream
+structure with small explicit clarifications. See `src/prompts/ATTRIBUTION.md`
+for copyright attribution.
 
 - `src/prompts/system.md` ← `src/prompts/advisor/system.md`
 - `src/prompts/advise-tool.md` ← `src/prompts/advisor/advise-tool.md`

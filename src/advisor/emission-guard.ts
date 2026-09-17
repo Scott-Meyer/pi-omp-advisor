@@ -116,14 +116,17 @@ const DEFAULT_HISTORY_CAPACITY = 4096;
  * start of every advisor prompt cycle via {@link AdvisorEmissionGuard.beginUpdate}.
  */
 export class AdvisorEmissionGuard {
+  static readonly DEFAULT_UPDATE_BUDGET = 3;
   #seen = new Set<string>();
   /** Insertion-order log to drive FIFO eviction without an extra Map. */
   #seenOrder: string[] = [];
-  #consumedThisUpdate = false;
+  #acceptedThisUpdate = 0;
   readonly #capacity: number;
+  readonly #updateBudget: number;
 
-  constructor(opts: { capacity?: number } = {}) {
+  constructor(opts: { capacity?: number; updateBudget?: number } = {}) {
     this.#capacity = opts.capacity ?? DEFAULT_HISTORY_CAPACITY;
+    this.#updateBudget = opts.updateBudget ?? AdvisorEmissionGuard.DEFAULT_UPDATE_BUDGET;
   }
 
   /**
@@ -133,16 +136,53 @@ export class AdvisorEmissionGuard {
   reset(): void {
     this.#seen.clear();
     this.#seenOrder.length = 0;
-    this.#consumedThisUpdate = false;
+    this.#acceptedThisUpdate = 0;
   }
 
   /**
    * Clear the per-update rate-limit gate. Called right before each advisor
    * prompt invocation so the next advisor model cycle starts with a fresh
-   * budget of one advise.
+   * budget of notes.
    */
   beginUpdate(): void {
-    this.#consumedThisUpdate = false;
+    this.#acceptedThisUpdate = 0;
+  }
+
+  /** Inspect the current review's used and total note allowance. */
+  statusThisUpdate(): { used: number; total: number; remaining: number } {
+    return {
+      used: this.#acceptedThisUpdate,
+      total: this.#updateBudget,
+      remaining: Math.max(0, this.#updateBudget - this.#acceptedThisUpdate),
+    };
+  }
+
+  /**
+   * Diagnostic check evaluating whether a note is accepted, with specific
+   * reason codes for rate limits vs deduplication/noise filtering.
+   */
+  check(note: string): {
+    accepted: boolean;
+    reason?: "empty" | "noise" | "duplicate" | "budget_exceeded";
+    allowance?: { used: number; total: number };
+  } {
+    const key = normalizeAdvisorNote(note);
+    if (!key) return { accepted: false, reason: "empty" };
+    if (SUPPRESSED_NORMALIZED_PHRASES[key]) return { accepted: false, reason: "noise" };
+    if (this.#seen.has(key)) return { accepted: false, reason: "duplicate" };
+    if (this.#acceptedThisUpdate >= this.#updateBudget) {
+      return {
+        accepted: false,
+        reason: "budget_exceeded",
+        allowance: { used: this.#acceptedThisUpdate, total: this.#updateBudget },
+      };
+    }
+    this.#acceptedThisUpdate++;
+    this.remember(note);
+    return {
+      accepted: true,
+      allowance: { used: this.#acceptedThisUpdate, total: this.#updateBudget },
+    };
   }
 
   /**
@@ -150,19 +190,9 @@ export class AdvisorEmissionGuard {
    * has already recorded the note (consumed the per-update budget and added
    * it to the dedupe history) — caller delivers the note. On `false` the
    * caller drops it.
-   *
-   * Empty / whitespace-only notes are suppressed; the tool's args schema
-   * still requires a non-empty string but this is defense-in-depth.
    */
   accept(note: string): boolean {
-    const key = normalizeAdvisorNote(note);
-    if (!key) return false;
-    if (SUPPRESSED_NORMALIZED_PHRASES[key]) return false;
-    if (this.#seen.has(key)) return false;
-    if (this.#consumedThisUpdate) return false;
-    this.#consumedThisUpdate = true;
-    this.remember(note);
-    return true;
+    return this.check(note).accepted;
   }
 
   /** Remember a successful revision without consuming the new-note allowance. */

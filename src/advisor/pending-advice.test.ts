@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { AdviseState, type PendingAdviceAccess, type PendingAdvisorNote } from "./advise-logic.ts";
+import { AdviseState, formatAdvisorBatchContent, type PendingAdviceAccess, type PendingAdvisorNote } from "./advise-logic.ts";
 import { AdvisorInbox } from "./advisor-inbox.ts";
 import { makeAdviseTool } from "./advise-tool.ts";
 import { AdvisorEmissionGuard } from "./emission-guard.ts";
@@ -8,7 +8,7 @@ import { AdvisorEmissionGuard } from "./emission-guard.ts";
 function access(inbox: AdvisorInbox, advisor: string): PendingAdviceAccess {
   return {
     list: () => inbox.pendingFor(advisor),
-    revise: (id, note) => inbox.revise(advisor, id, note),
+    revise: (id, note, shortTitle) => inbox.revise(advisor, id, note, shortTitle),
     withdraw: id => inbox.withdraw(advisor, id),
   };
 }
@@ -210,9 +210,153 @@ test("revisions do not spend the new-note budget, and returned snapshots cannot 
   state.beginUpdate(true);
   assert.equal(guard.accept("Initial note"), true);
   const note = state.submit("Initial note", "concern");
+  // Revisions do not consume the new-note budget
   assert.equal(state.revise(note.adviceId!, "Better wording").changed, true);
-  assert.equal(guard.accept("An extra note"), false);
+  assert.equal(guard.accept("Second note"), true);
+  assert.equal(guard.accept("Third note"), true);
+  assert.equal(guard.accept("Fourth note (over budget)"), false);
   state.pendingAdvice()[0]!.note = "Mutated copy";
   assert.equal(state.pendingAdvice()[0]!.note, "Better wording");
   assert.equal(state.revise(note.adviceId!, "   ").changed, false);
+});
+
+test("a shortTitle rides with a note through delivery and rendering", () => {
+  const sent: PendingAdvisorNote[] = [];
+  const state = new AdviseState(note => sent.push(note));
+  state.submit("The early flush path never clears the timer, so a later batch double-delivers", "concern", "Timer leak on early flush");
+  assert.equal(sent[0]!.shortTitle, "Timer leak on early flush");
+  const rendered = formatAdvisorBatchContent(sent);
+  assert.match(rendered, /title="Timer leak on early flush"/);
+  assert.match(rendered, /guidance="weigh, don't blindly obey"/);
+});
+
+test("the advise and revise tools accept the ShortTitle key end to end", async () => {
+  const inbox = new AdvisorInbox();
+  const tools = await makeAdviseTool(note => inbox.enqueue({ ...note, advisor: "a" }));
+  const invoke = async (tool: typeof tools.tool, args: Record<string, unknown>) =>
+    (await tool.execute("fixture", args as any, undefined, undefined, {} as any)).details as any;
+
+  tools.state.beginUpdate();
+  const submitted = await invoke(tools.tool, { note: "Check the dispose path", severity: "concern", ShortTitle: "Unclosed handle" });
+  assert.equal(submitted.suppressed, false);
+  const revised = await invoke(tools.controlTools.find(tool => tool.name === "revise_advice")!,
+    { adviceId: submitted.adviceId, note: "The dispose path leaks the handle", ShortTitle: "Handle leak on dispose" });
+  assert.equal(revised.changed, true);
+  tools.state.finishUpdate();
+
+  assert.equal(inbox.items[0]!.shortTitle, "Handle leak on dispose");
+  assert.equal(inbox.items[0]!.note, "The dispose path leaks the handle");
+});
+
+test("revising can replace a shortTitle, and omitting it keeps the current one", () => {
+  const inbox = new AdvisorInbox();
+  const state = new AdviseState(note => inbox.enqueue({ ...note, advisor: "a" }), access(inbox, "a"));
+  const note = state.submit("Earlier concern", "concern", "Old title");
+  assert.equal(state.revise(note.adviceId!, "New evidence").changed, true);
+  assert.equal(inbox.items[0]!.shortTitle, "Old title", "an omitted title survives a revision");
+  assert.equal(state.revise(note.adviceId!, "Newer evidence", "Better title").changed, true);
+  assert.equal(inbox.items[0]!.shortTitle, "Better title");
+  assert.equal(state.revise(note.adviceId!, "Clearer title", "").changed, true);
+  assert.equal(inbox.items[0]!.shortTitle, undefined, "an empty string clears the title");
+});
+
+test("update_advice updates queued notes, delivers follow-up on streamed notes, and respects operator dismissal", async () => {
+  const inbox = new AdvisorInbox();
+  const streamed: PendingAdvisorNote[] = [];
+  const guard = new AdvisorEmissionGuard();
+  let toolsRef: Awaited<ReturnType<typeof makeAdviseTool>> | undefined;
+  const tools = await makeAdviseTool(
+    note => {
+      if (note.severity === "blocker") {
+        streamed.push(note);
+        toolsRef?.state.markStreamed(note.adviceId!, note);
+      } else {
+        inbox.enqueue({ ...note, advisor: "a" });
+      }
+    },
+    note => guard.check(note),
+    access(inbox, "a"),
+    undefined,
+    undefined,
+    note => guard.remember(note),
+    note => guard.forget(note),
+  );
+  toolsRef = tools;
+
+  const invoke = async (name: string, args: Record<string, unknown>) => {
+    const t = name === "advise" ? tools.tool : tools.controlTools.find(tool => tool.name === name)!;
+    return (await t.execute("fixture", args as any, undefined, undefined, {} as any)) as any;
+  };
+
+  tools.state.beginUpdate();
+  // 1. Submit initial note (deferred in review)
+  const res1 = await invoke("advise", { note: "First draft", severity: "concern", ShortTitle: "Draft 1" });
+  const adviceId1 = res1.details.adviceId;
+  assert.ok(res1.content[0].text.includes("[Review allowance: 1 of 3 used"));
+
+  // 2. update_advice while deferred in review: forgets old draft text and updates in place
+  const res2 = await invoke("update_advice", { targetId: adviceId1, note: "Second draft", ShortTitle: "Draft 2" });
+  assert.equal(res2.details.outcome, "updated_pending");
+  // Proves old draft text was forgotten: guard allows re-submitting "First draft"
+  assert.equal(guard.accept("First draft"), true);
+
+  // 3. Complete review: releases note into inbox
+  tools.state.finishUpdate();
+  assert.equal(inbox.items.length, 1);
+  assert.equal(inbox.items[0]!.shortTitle, "Draft 2");
+
+  // 4. update_advice while queued in inbox: updates in place and propagates severity
+  const res3 = await invoke("update_advice", { targetId: adviceId1, note: "Inbox draft", ShortTitle: "Inbox title" });
+  assert.equal(res3.details.outcome, "updated_pending");
+  assert.equal(inbox.items[0]!.shortTitle, "Inbox title");
+
+  // 5. Escalate to blocker: delivers immediately
+  const res4 = await invoke("update_advice", { targetId: adviceId1, note: "Critical blocker", severity: "blocker" });
+  assert.equal(res4.details.outcome, "delivered_followup");
+  assert.equal(streamed.length, 1);
+  assert.equal(streamed[0]!.severity, "blocker");
+  assert.equal(inbox.items.length, 0, "withdrawn from inbox on blocker escalation");
+
+  // 6. Test dismissal: submit second note into inbox, then operator dismisses it
+  tools.state.beginUpdate();
+  const res5 = await invoke("advise", { note: "Third note", severity: "nit" });
+  const adviceId2 = res5.details.adviceId;
+  tools.state.finishUpdate();
+  assert.equal(inbox.items.length, 1);
+  inbox.dismiss(inbox.items[0]!.id);
+  assert.equal(inbox.items.length, 0);
+
+  // update_advice on dismissed note must NOT resurrect it
+  const res6 = await invoke("update_advice", { targetId: adviceId2, note: "Resurrect attempt" });
+  assert.equal(res6.details.outcome, "dismissed");
+  assert.equal(inbox.items.length, 0, "remains dismissed");
+  assert.equal(streamed.length, 1, "no extra stream delivery");
+
+  // 7. Update an already-streamed note: delivers a follow-up note referencing the original
+  tools.state.beginUpdate();
+  const res7 = await invoke("update_advice", { targetId: adviceId1, note: "Follow-up refined finding" });
+  assert.equal(res7.details.outcome, "delivered_followup");
+  assert.equal(streamed.length, 2);
+  assert.equal(streamed[1]!.updateOnId, adviceId1);
+  assert.equal(streamed[1]!.note, "Follow-up refined finding");
+
+  // 8. Note delivered from inbox to stream (markStreamed): update delivers follow-up referencing it
+  guard.beginUpdate();
+  tools.state.beginUpdate();
+  const res8 = await invoke("advise", { note: "Inbox delivered note", ShortTitle: "Inbox title" });
+  const adviceId3 = res8.details.adviceId;
+  tools.state.finishUpdate();
+  assert.equal(inbox.items.length, 1);
+  // Simulate user delivering from inbox to stream:
+  const item = inbox.takeAll()[0]!;
+  tools.state.markStreamed(item.adviceId!, item as PendingAdvisorNote);
+
+  // Now update that delivered note: delivers follow-up referencing it
+  guard.beginUpdate();
+  tools.state.beginUpdate();
+  const res9 = await invoke("update_advice", { targetId: item.adviceId!, note: "Inbox follow-up update" });
+  assert.equal(res9.details.outcome, "delivered_followup");
+  tools.state.finishUpdate();
+  assert.equal(inbox.items.length, 1);
+  assert.equal(inbox.items[0]!.updateOnId, item.adviceId!);
 });

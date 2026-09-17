@@ -13,6 +13,7 @@ test("offers documented advisor subcommands with descriptions", () => {
       "menu",
       "status",
       "inbox",
+      "stream",
       "queue",
       "pause",
       "resume",

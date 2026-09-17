@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { AdvisorNote, PendingAdvisorNote } from "./advise-logic.ts";
+import type { AdvisorNote, AdvisorSeverity, PendingAdvisorNote } from "./advise-logic.ts";
 
 export interface QueuedAdvisorNote extends AdvisorNote {
   id: number;
@@ -36,11 +36,17 @@ export class AdvisorInbox {
       .map(({ id: _id, ...note }) => ({ ...note }));
   }
 
-  revise(advisor: string | undefined, adviceId: string, note: string): boolean {
+  revise(advisor: string | undefined, adviceId: string, note: string, shortTitle?: string, severity?: AdvisorSeverity): boolean {
     if (!note.trim()) return false;
     const index = this.#items.findIndex(item => item.adviceId === adviceId && item.advisor === advisor);
     if (index < 0) return false;
-    this.#items[index] = { ...this.#items[index]!, note, updatedAt: Date.now() };
+    this.#items[index] = {
+      ...this.#items[index]!,
+      note,
+      ...(shortTitle !== undefined ? { shortTitle: shortTitle || undefined } : {}),
+      ...(severity !== undefined ? { severity } : {}),
+      updatedAt: Date.now(),
+    };
     return true;
   }
 

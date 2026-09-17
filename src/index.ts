@@ -51,11 +51,13 @@
  *   roster editing.
  */
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { getAgentDir, ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { CustomEditor, getAgentDir, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ToolResultMessage } from "@earendil-works/pi-ai";
 import { Text, type AutocompleteItem } from "@earendil-works/pi-tui";
 import { formatAdvisorBatchContent, type AdvisorNote } from "./advisor/advise-logic.ts";
+import { attachEnterDelivery } from "./advisor/enter-delivery.ts";
+import { showAdvisorStream } from "./advisor/stream-view.ts";
 import { AdvisorInbox, type QueuedAdvisorNote } from "./advisor/advisor-inbox.ts";
 import { AdvisorOrchestrator, type AdvisorStatusOverviewItem, type OrchestratorHost } from "./advisor/orchestrator.ts";
 import { renderAdvisorMessage, type AdvisorMessageDetails } from "./advisor/advisor-message.ts";
@@ -94,6 +96,7 @@ const ADVISOR_COMMAND_COMPLETIONS: readonly AutocompleteItem[] = [
   { value: "menu", label: "menu", description: "Open the interactive advisor control menu" },
   { value: "status", label: "status", description: "Show runtime, model, backlog, and queue state" },
   { value: "inbox", label: "inbox", description: "Inspect, deliver, or dismiss queued advisories" },
+  { value: "stream", label: "stream [name]", description: "Watch one advisor's own chat stream in a read-only popup" },
   { value: "queue", label: "queue", description: "Alias for the advisor inbox" },
   { value: "pause", label: "pause", description: "Pause observation and retain the queue" },
   { value: "resume", label: "resume", description: "Resume observation without releasing the queue" },
@@ -148,6 +151,8 @@ export default function (pi: ExtensionAPI) {
   const fileMutationTracker = new FileMutationTracker();
   let sessionContext: ExtensionContext | undefined;
   let advisorContextNeeded = false;
+  /** Our composed editor factory for Enter-to-deliver, so re-registration is idempotent. */
+  let enterDeliveryEditorFactory: Parameters<ExtensionContext["ui"]["setEditorComponent"]>[0];
   let advisorPaused = false;
   const advisorPauseRequests = new RequestedBooleanState(false);
   const advisorPauseTransitions = new SerializedTransition();
@@ -245,7 +250,8 @@ export default function (pi: ExtensionAPI) {
 
   function noteLabel(item: QueuedAdvisorNote): string {
     const source = item.advisor ? `${item.advisor} · ` : "";
-    return `#${item.id} · ${source}${item.severity ?? "nit"} · ${notePreview(item)}`;
+    const lead = item.shortTitle ? `${item.shortTitle} — ` : "";
+    return `#${item.id} · ${source}${item.severity ?? "nit"} · ${lead}${notePreview(item, item.shortTitle ? 80 : 100)}`;
   }
 
   function updateInboxWidget(ctx = sessionContext): void {
@@ -270,7 +276,8 @@ export default function (pi: ExtensionAPI) {
                 ? theme.fg("warning", marker)
                 : theme.fg("accent", marker);
           const source = item.advisor ? theme.fg("muted", `${item.advisor} · `) : "";
-          return `  ${styledMarker} ${source}${theme.fg("dim", notePreview(item, 140))}`;
+          const title = item.shortTitle ? `${theme.bold(item.shortTitle)} ${theme.fg("dim", "— ")}` : "";
+          return `  ${styledMarker} ${source}${title}${theme.fg("dim", notePreview(item, 120))}`;
         }),
       ];
       if (items.length > shown.length) lines.push(theme.fg("dim", `  … ${items.length - shown.length} more`));
@@ -292,6 +299,7 @@ export default function (pi: ExtensionAPI) {
       },
       triggerTurn ? { deliverAs: "steer", triggerTurn: true } : { deliverAs: "steer", triggerTurn: false },
     );
+    orchestrator?.markNotesStreamed(notes);
     inbox.dismissMany(current.map(item => item.id));
     persistInbox();
     updateInboxWidget();
@@ -304,6 +312,36 @@ export default function (pi: ExtensionAPI) {
     // message. Appending without triggering therefore places these cards
     // above that message while still making them context for its turn.
     deliverQueuedAdvice([...inbox.items], false);
+  }
+
+  /**
+   * Enter-to-deliver: a bare Enter on an empty editor in an idle session
+   * releases whatever is waiting in the advisor inbox — the one gesture pi's
+   * own pipeline can never see, because empty submits are dropped before the
+   * `input` event. Interception lives on the editor's input handler: pi's TUI
+   * routes a keystroke to exactly one focused component, so the editor only
+   * sees keys that dialogs, model pickers, and other overlays did not claim,
+   * and cannot steal an Enter from any of them. Composes with an existing
+   * custom editor (ours wraps whatever `getEditorComponent` had).
+   */
+  function registerEnterDelivery(ctx: ExtensionContext): void {
+    if (ctx.mode !== "tui" || typeof ctx.ui.setEditorComponent !== "function" || typeof ctx.ui.getEditorComponent !== "function") return;
+    const existing = ctx.ui.getEditorComponent();
+    if (existing === enterDeliveryEditorFactory) return;
+    const base = existing ?? ((tui, theme, keybindings) => new CustomEditor(tui, theme, keybindings));
+    enterDeliveryEditorFactory = (tui, theme, keybindings) =>
+      attachEnterDelivery(base(tui, theme, keybindings), {
+        isSubmitKey: data => keybindings.matches(data, "tui.input.submit"),
+        state: () => ({ idle: sessionContext?.isIdle() ?? false, paused: advisorPaused, queued: inbox.items.length }),
+        deliver: () => {
+          const current = sessionContext;
+          const delivered = deliverQueuedAdvice([...inbox.items], true);
+          if (delivered > 0) {
+            current?.ui.notify(`Delivered ${delivered} queued advisor ${delivered === 1 ? "advisory" : "advisories"}.`, "info");
+          }
+        },
+      });
+    ctx.ui.setEditorComponent(enterDeliveryEditorFactory);
   }
 
   async function showAdvisorInbox(ctx: ExtensionContext): Promise<void> {
@@ -347,8 +385,9 @@ export default function (pi: ExtensionAPI) {
       const item = items[labels.indexOf(choice)];
       if (!item) continue;
       const source = item.advisor ? ` · ${item.advisor}` : "";
+      const title = item.shortTitle ? `${item.shortTitle}\n` : "";
       const action = await ctx.ui.select(
-        `Advisor #${item.id}${source} · ${item.severity ?? "nit"}\n${item.note}`,
+        `Advisor #${item.id}${source} · ${item.severity ?? "nit"}\n${title}${item.note}`,
         ["Deliver now", "Dismiss", "Back"],
       );
       if (action === "Deliver now") {
@@ -465,8 +504,8 @@ export default function (pi: ExtensionAPI) {
         updateAdvisorStatus(ctx);
       },
       pendingAdvice: advisor => inbox.pendingFor(advisor),
-      reviseAdvice(advisor, adviceId, note) {
-        if (!inbox.revise(advisor, adviceId, note)) return false;
+      reviseAdvice(advisor, adviceId, note, shortTitle, severity) {
+        if (!inbox.revise(advisor, adviceId, note, shortTitle, severity)) return false;
         persistInbox();
         updateInboxWidget(ctx);
         return true;
@@ -525,6 +564,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     lastMode = ctx.mode;
     sessionContext = ctx;
+    registerEnterDelivery(ctx);
     primaryInterruption.reset();
     primaryStop.reset();
     restoreInbox(ctx);
@@ -1066,6 +1106,33 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  async function showAdvisorStreamCommand(ctx: ExtensionCommandContext, name?: string): Promise<void> {
+    const snapshots = orchestrator?.transcriptSnapshot() ?? [];
+    if (snapshots.length === 0) {
+      ctx.ui.notify("No running advisors to watch. /advisor status shows why.", "info");
+      return;
+    }
+    let target = name
+      ? snapshots.find(s => s.name.toLowerCase() === name)
+      : snapshots.length === 1
+        ? snapshots[0]
+        : undefined;
+    if (!target) {
+      const choice = await ctx.ui.select(
+        "Watch which advisor's stream?",
+        [...snapshots.map(s => s.name), "Cancel"],
+      );
+      if (!choice || choice === "Cancel") return;
+      target = snapshots.find(s => s.name === choice);
+    }
+    if (!target) {
+      ctx.ui.notify(name ? `No running advisor named "${name}".` : "No advisor selected.", "warning");
+      return;
+    }
+    const wanted = target.name;
+    await showAdvisorStream(ctx.ui.custom, () => orchestrator?.transcriptSnapshot(wanted)[0]);
+  }
+
   async function handleCommand(args: string, ctx: ExtensionCommandContext): Promise<void> {
     const parts = args.trim().toLowerCase().split(/\s+/).filter(Boolean);
     const [first, second] = parts;
@@ -1084,6 +1151,14 @@ export default function (pi: ExtensionAPI) {
     }
     if (first === "inbox" || first === "queue") {
       await showAdvisorInbox(ctx);
+      return;
+    }
+    if (first === "stream") {
+      if (ctx.mode !== "tui" || typeof ctx.ui.custom !== "function") {
+        ctx.ui.notify("The advisor stream popup needs an interactive TUI session.", "warning");
+        return;
+      }
+      await showAdvisorStreamCommand(ctx, second);
       return;
     }
     if (first === "pause") {
@@ -1183,6 +1258,7 @@ export default function (pi: ExtensionAPI) {
         : " · caught up") +
       ` · pending batch: ${s.pendingTurns}/${s.wakeEveryTurns} turn(s)` +
       ` · maxWait: ${s.flushTimeoutMs}ms` +
+      (s.flushOnSettled === false ? " · waits for turn batch" : "") +
       ` · wakes/requests/tools: ${s.wakes}/${s.modelRequests}/${s.toolCalls}` +
       (s.context ? `; context ~${s.context.estimatedTokens}/${s.context.limitTokens} tokens, ${s.context.retainedMessages} messages, ${s.context.resets} reset(s)${s.context.trimmed ? " (older content expired/shortened)" : ""}; primary reasoning ${s.includePrimaryThinking ? "included" : "excluded"}` : "");
     const unusable = overview.filter(s => s.status === "no_model");
