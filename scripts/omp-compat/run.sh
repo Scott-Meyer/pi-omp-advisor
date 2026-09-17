@@ -75,7 +75,7 @@ flushOnSettled: true
 advisors:
   - name: extension-sentinel
     model: compat/compat-model
-    tools: [read]
+    tools: [read, request_stop]
     contextTokens: 8192
     instructions: Review the observed turn and call advise once with a short title.
 YAML

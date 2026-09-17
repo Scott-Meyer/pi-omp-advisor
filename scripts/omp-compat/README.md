@@ -5,7 +5,7 @@ This harness tests the npm-packed extension through a real, isolated OMP install
 It covers:
 
 - package manifest and extension loading;
-- exact provider-visible child tool restrictions;
+- exact provider-visible child tool restrictions, including fail-closed removal of an explicitly requested `request_stop` grant because OMP 18.2.4 exposes no abort-in-progress state;
 - bounded provider context across large tool loops;
 - terminal settlement after OMP automatic continuation;
 - primary abort during a running tool, delayed blocker preservation, inbox delivery on a user-attributed `/skill:` RPC resume, and later blocker steering;

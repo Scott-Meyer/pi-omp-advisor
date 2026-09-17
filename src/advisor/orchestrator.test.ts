@@ -24,7 +24,7 @@ type Review = (text: string, call: (name: string, args?: Record<string, unknown>
 
 // Substitute only the model/session boundary: real batching, tools, state,
 // prompt assembly, resource isolation and host inbox remain in the exercise.
-async function harness(t: TestContext, review: Review, options?: { stop?: PrimaryStopAccess; contextTokens?: number; includePrimaryThinking?: boolean; syncBacklog?: unknown; maxBehind?: number; flushTimeoutMs?: number; flushOnSettled?: boolean; primary?: { isStreaming(): boolean; isAborting(): boolean; isAutoResumeSuppressed(): boolean; hasQueuedWork?(): boolean } }) {
+async function harness(t: TestContext, review: Review, options?: { stop?: PrimaryStopAccess; contextTokens?: number; includePrimaryThinking?: boolean; syncBacklog?: unknown; maxBehind?: number; flushTimeoutMs?: number; flushOnSettled?: boolean; unsupportedContextOnSession?: number; primary?: { isStreaming(): boolean; isAborting(): boolean; isAutoResumeSuppressed(): boolean; hasQueuedWork?(): boolean } }) {
   const cwd = await mkdtemp(join(tmpdir(), "advisor-orchestrator-"));
   const agentDir = join(cwd, "agent-config");
   await mkdir(agentDir);
@@ -53,6 +53,8 @@ async function harness(t: TestContext, review: Review, options?: { stop?: Primar
     setStatus: () => {},
   };
   let sessionCount = 0;
+  let sessionDisposals = 0;
+  const unsupportedContextOnSession = options?.unsupportedContextOnSession;
   const advisorStates: Array<{
     messages: AgentMessage[];
     isStreaming: boolean;
@@ -121,8 +123,9 @@ async function harness(t: TestContext, review: Review, options?: { stop?: Primar
       },
       // Wrapper idle is already true, so this signals without awaiting the Agent.
       async abort() { controller.abort(); },
-      dispose() { controller.abort(); },
+      dispose() { sessionDisposals++; controller.abort(); },
     };
+    if (sessionCount === unsupportedContextOnSession) delete (session.agent as { transformContext?: unknown }).transformContext;
     return { session } as unknown as Awaited<ReturnType<typeof createAgentSession>>;
   };
   await writeFile(join(cwd, "WATCHDOG.yml"), [
@@ -145,7 +148,7 @@ async function harness(t: TestContext, review: Review, options?: { stop?: Primar
   const orchestrator = new AdvisorOrchestrator(host, createSession);
   await orchestrator.start(discovered, { cwd } as ExtensionContext, {} as ModelRuntime, agentDir);
   t.after(() => orchestrator.disposeAll());
-  return { orchestrator, inbox, sent, whenPreserved: preserved.promise, sessionCount: () => sessionCount, advisorStates };
+  return { orchestrator, inbox, sent, whenPreserved: preserved.promise, sessionCount: () => sessionCount, sessionDisposals: () => sessionDisposals, advisorStates };
 }
 
 function update(orchestrator: AdvisorOrchestrator, final: boolean) {
@@ -155,16 +158,22 @@ function update(orchestrator: AdvisorOrchestrator, final: boolean) {
   else orchestrator.onTurnStart();
 }
 
-test("an OMP child without a supported context hook is disposed instead of partially published", async t => {
+test("an OMP child fails closed on stop access and unsupported context hooks", async t => {
   t.mock.method(console, "error", () => {});
+  t.mock.method(console, "warn", () => {});
   const cwd = await mkdtemp(join(tmpdir(), "advisor-unsupported-context-"));
   const agentDir = join(cwd, "agent-config");
   await mkdir(agentDir);
   t.after(() => rm(cwd, { recursive: true, force: true }));
-  await writeFile(join(cwd, "WATCHDOG.yml"), "main: true\n");
+  await writeFile(join(cwd, "WATCHDOG.yml"), "main: true\nadvisors:\n  - name: unsafe-stop\n    tools: [read, request_stop]\n");
   const discovered = await discoverAdvisorConfigs(cwd, agentDir);
   let disposed = 0;
-  const createSession: typeof createAgentSession = async () => ({
+  const createSession: typeof createAgentSession = async options => {
+    const ompOptions = options as typeof options & { toolNames?: string[] };
+    assert.equal(ompOptions.toolNames?.includes("request_stop"), false);
+    assert.equal(ompOptions.toolNames?.includes("current_tool"), false);
+    assert.equal(options?.customTools?.some(tool => tool.name === "request_stop" || tool.name === "current_tool"), false);
+    return ({
     session: {
       agent: {
         state: { messages: [], isStreaming: false, systemPrompt: "", tools: [], model: { contextWindow: 128_000 } },
@@ -178,6 +187,7 @@ test("an OMP child without a supported context hook is disposed instead of parti
       dispose: () => { disposed++; },
     },
   }) as unknown as Awaited<ReturnType<typeof createAgentSession>>;
+  };
   const host: OrchestratorHost = {
     sendCustom: () => {}, preserveAdvice: () => {}, pendingAdvice: () => [],
     reviseAdvice: () => false, withdrawAdvice: () => false,
@@ -196,6 +206,17 @@ test("an OMP child without a supported context hook is disposed instead of parti
   assert.equal(disposed, 1);
   assert.deepEqual(orchestrator.advisorNames, []);
   await orchestrator.disposeAll();
+});
+
+test("a failed context reset disposes both the unsupported replacement and halted old child", async t => {
+  t.mock.method(console, "error", () => {});
+  const { orchestrator, sessionCount, sessionDisposals } = await harness(t, async () => {}, {
+    unsupportedContextOnSession: 2,
+  });
+  await orchestrator.resetRuntimesOnly();
+  assert.equal(sessionCount(), 2);
+  assert.equal(sessionDisposals(), 2);
+  assert.equal(orchestrator.statusOverview()[0]?.status, "error");
 });
 
 test("real review tools revise/withdraw deferred notes before review releases them", async t => {
