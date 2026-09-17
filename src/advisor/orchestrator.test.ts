@@ -155,6 +155,49 @@ function update(orchestrator: AdvisorOrchestrator, final: boolean) {
   else orchestrator.onTurnStart();
 }
 
+test("an OMP child without a supported context hook is disposed instead of partially published", async t => {
+  t.mock.method(console, "error", () => {});
+  const cwd = await mkdtemp(join(tmpdir(), "advisor-unsupported-context-"));
+  const agentDir = join(cwd, "agent-config");
+  await mkdir(agentDir);
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  await writeFile(join(cwd, "WATCHDOG.yml"), "main: true\n");
+  const discovered = await discoverAdvisorConfigs(cwd, agentDir);
+  let disposed = 0;
+  const createSession: typeof createAgentSession = async () => ({
+    session: {
+      agent: {
+        state: { messages: [], isStreaming: false, systemPrompt: "", tools: [], model: { contextWindow: 128_000 } },
+        subscribe: () => () => {},
+        abort: () => {},
+        waitForIdle: async () => {},
+        prompt: async () => {},
+      },
+      setAdvisorEnabled: () => {},
+      abort: async () => {},
+      dispose: () => { disposed++; },
+    },
+  }) as unknown as Awaited<ReturnType<typeof createAgentSession>>;
+  const host: OrchestratorHost = {
+    sendCustom: () => {}, preserveAdvice: () => {}, pendingAdvice: () => [],
+    reviseAdvice: () => false, withdrawAdvice: () => false,
+    currentTool: () => ({ status: "idle", activeCount: 0 }),
+    requestStop: () => ({ requested: false, status: "disabled", message: "No stop grant" }),
+    isStreaming: () => false, isAborting: () => false, isAutoResumeSuppressed: () => false,
+    hasQueuedWork: () => false, setStatus: () => {},
+  };
+  const orchestrator = new AdvisorOrchestrator(host, createSession);
+  await orchestrator.start(
+    discovered,
+    { cwd, models: {}, modelRegistry: {} } as unknown as ExtensionContext,
+    {},
+    agentDir,
+  );
+  assert.equal(disposed, 1);
+  assert.deepEqual(orchestrator.advisorNames, []);
+  await orchestrator.disposeAll();
+});
+
 test("real review tools revise/withdraw deferred notes before review releases them", async t => {
   let firstId = "";
   const reviewing = deferred();
