@@ -258,7 +258,44 @@ export class AdvisorContextWindow {
   }
 }
 
-/** Install on the advisor only, using the SDK's public per-request context hook. */
+/** Provider-ready context gate exposed by OMP's Agent but not Pi's Agent type. */
+interface ProviderContextLike {
+  messages: AgentMessage[];
+  systemPrompt?: string | string[];
+  tools?: unknown[];
+}
+
+interface ProviderContextAgent {
+  addBeforeModelCall?(callback: (
+    context: ProviderContextLike,
+    signal?: AbortSignal,
+  ) => void | Promise<void>): () => void;
+}
+
+/**
+ * OMP may retain an errored assistant plus synthetic results for calls that
+ * completed before its stream failed. Its next provider context must omit the
+ * whole failed exchange; Pi's raw-history behavior remains untouched.
+ */
+function withoutFailedProviderExchanges(messages: AgentMessage[]): AgentMessage[] {
+  const retained: AgentMessage[] = [];
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i]!;
+    if (message.role !== "assistant" || (message.stopReason !== "aborted" && message.stopReason !== "error")) {
+      retained.push(message);
+      continue;
+    }
+    const failedCalls = new Set(message.content.filter(block => block.type === "toolCall").map(block => block.id));
+    while (messages[i + 1]?.role === "toolResult") {
+      const result = messages[i + 1] as ToolResultMessage;
+      if (!failedCalls.delete(result.toolCallId)) break;
+      i++;
+    }
+  }
+  return retained;
+}
+
+/** Install on the advisor only, using whichever public per-request hook the host exposes. */
 export function installAdvisorContextWindow(agent: Agent, requestedTokens?: number): {
   window: AdvisorContextWindow;
   readonly interrupted: boolean;
@@ -270,37 +307,102 @@ export function installAdvisorContextWindow(agent: Agent, requestedTokens?: numb
   let runStart = agent.state.messages.length;
   const unsubscribe = agent.subscribe((event, signal) => {
     if (event.type === "agent_start") {
+      // Pi supplies the signal here. OMP's single-argument subscription does
+      // not, so its provider-context hook below captures the same run signal.
       runSignal = signal;
       runStart = agent.state.messages.length;
     }
   });
-  const priorTransform = agent.transformContext;
-  const fixedTokens = () => Math.ceil((agent.state.systemPrompt.length + JSON.stringify(agent.state.tools.map(tool => ({
-    name: tool.name, description: tool.description, parameters: tool.parameters,
-  }))).length) / 4) + 256;
-  const trim = (messages: AgentMessage[], currentStart?: number) =>
-    window.trim(messages, fixedTokens(), agent.state.model?.contextWindow ?? 0, currentStart);
-  const transform: NonNullable<Agent["transformContext"]> = async (messages, signal) => {
-    if (signal?.aborted) throw new AdvisorContextBudgetError("Advisor review was interrupted before the next model request.");
-    // Trim original objects before the SDK's cloning context event, so objects
-    // evicted mid-review cannot reappear on the next tool-followup request.
-    const retained = trim(messages, runStart);
-    const transformedCurrentStart = window.lastCurrentStart;
-    const transformed = priorTransform ? await priorTransform.call(agent, retained, signal) : retained;
-    return [window.notice(), ...trim(transformed, transformedCurrentStart)];
+  const fixedTokens = (providerContext?: ProviderContextLike) => {
+    const rawPrompt = providerContext?.systemPrompt ?? agent.state.systemPrompt;
+    const prompt = Array.isArray(rawPrompt) ? rawPrompt.join("\n") : rawPrompt;
+    const sourceTools = providerContext?.tools ?? agent.state.tools;
+    // OMP's provider-context tool wrappers contain runner/session backrefs that
+    // never go over the wire. Count only the descriptor fields a provider sees.
+    const tools = sourceTools.map(tool => {
+      const descriptor = tool as { name?: unknown; description?: unknown; parameters?: unknown; strict?: unknown };
+      return {
+        name: descriptor.name,
+        description: descriptor.description,
+        parameters: descriptor.parameters,
+        ...(providerContext && descriptor.strict !== undefined ? { strict: descriptor.strict } : {}),
+      };
+    });
+    return Math.ceil((prompt.length + JSON.stringify(tools).length) / 4) + 256;
   };
-  agent.transformContext = transform;
+  const trim = (messages: AgentMessage[], currentStart?: number, fixed = fixedTokens()) =>
+    window.trim(messages, fixed, agent.state.model?.contextWindow ?? 0, currentStart);
+
+  const hasPiTransform = "transformContext" in agent;
+  const priorTransform = agent.transformContext;
+  let transform: NonNullable<Agent["transformContext"]> | undefined;
+  let removeProviderHook: (() => void) | undefined;
+
+  if (hasPiTransform) {
+    transform = async (messages, signal) => {
+      if (signal?.aborted) throw new AdvisorContextBudgetError("Advisor review was interrupted before the next model request.");
+      // Trim original objects before Pi's cloning context event, so objects
+      // evicted mid-review cannot reappear on the next tool-followup request.
+      const retained = trim(messages, runStart);
+      const transformedCurrentStart = window.lastCurrentStart;
+      const transformed = priorTransform ? await priorTransform.call(agent, retained, signal) : retained;
+      return [window.notice(), ...trim(transformed, transformedCurrentStart)];
+    };
+    agent.transformContext = transform;
+  } else {
+    // OMP keeps its Agent transform private, but exposes the final provider
+    // context before every request. Transforming that request-local array keeps
+    // tool-loop followups bounded without mutating or bypassing OMP's own
+    // context transforms. The no-cursor form finds the latest user update in
+    // this already-converted context; raw Agent history is still trimmed at the
+    // completed update boundary below.
+    const providerAgent = agent as Agent & ProviderContextAgent;
+    if (!providerAgent.addBeforeModelCall) {
+      unsubscribe();
+      throw new AdvisorContextBudgetError("The host Agent exposes no supported per-request context hook.");
+    }
+    removeProviderHook = providerAgent.addBeforeModelCall(async (context, signal) => {
+      runSignal = signal;
+      if (signal?.aborted) throw new AdvisorContextBudgetError("Advisor review was interrupted before the next model request.");
+      const fixed = fixedTokens(context);
+      if (process.env.PI_ADVISOR_DEBUG === "1") {
+        const rawPrompt = context.systemPrompt ?? "";
+        const promptChars = (Array.isArray(rawPrompt) ? rawPrompt.join("\n") : rawPrompt).length;
+        console.error(`[advisor:debug] OMP provider-context budget fixedTokens=${fixed} promptChars=${promptChars} requestedTokens=${requestedTokens ?? DEFAULT_ADVISOR_CONTEXT_TOKENS}`);
+      }
+      // OMP conversion retains assistant identities but clones user/tool-result
+      // messages. A retention map shared across provider calls could therefore
+      // expire half of a tool exchange and see the fresh clone as orphaned on
+      // the next call. Each provider request gets an independent deterministic
+      // view; the raw-history window below owns persistence across updates.
+      const requestWindow = new AdvisorContextWindow(requestedTokens);
+      const retained = requestWindow.trim(
+        withoutFailedProviderExchanges(context.messages),
+        fixed,
+        agent.state.model?.contextWindow ?? 0,
+      );
+      context.messages = [requestWindow.notice(), ...retained];
+    });
+  }
+
   return {
     window,
     get interrupted() { return runSignal?.aborted === true; },
     // Called only after Agent.prompt settles, not while its event loop is live.
     trimRetainedHistory: () => {
       if (runSignal?.aborted) window.forgetInterruptedExchanges(agent.state.messages, runStart);
-      agent.state.messages = trim(agent.state.messages, runStart);
+      const retainedHistory = hasPiTransform
+        ? agent.state.messages
+        : withoutFailedProviderExchanges(agent.state.messages);
+      const retainedRunStart = hasPiTransform
+        ? runStart
+        : withoutFailedProviderExchanges(agent.state.messages.slice(0, runStart)).length;
+      agent.state.messages = trim(retainedHistory, retainedRunStart);
     },
     dispose: () => {
       unsubscribe();
-      if (agent.transformContext === transform) agent.transformContext = priorTransform;
+      removeProviderHook?.();
+      if (transform && agent.transformContext === transform) agent.transformContext = priorTransform;
     },
   };
 }

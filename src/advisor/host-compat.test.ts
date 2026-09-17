@@ -1,0 +1,69 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { Api, Model } from "@earendil-works/pi-ai";
+import { advisorSessionToolOptions, disableNestedHostAdvisor, findAdvisorModel, isOmpExtensionApi, isOmpHost, isOmpUserResumeMessage, ompAgentEndWasAborted } from "./host-compat.ts";
+
+const model = { provider: "fixture", id: "reviewer" } as Model<Api>;
+
+test("host model lookup accepts OMP and Pi registry contracts", () => {
+  assert.equal(findAdvisorModel({ find: (provider, id) => provider === "fixture" && id === "reviewer" ? model : undefined }, "fixture", "reviewer"), model);
+  assert.equal(findAdvisorModel({ getModel: (provider, id) => provider === "fixture" && id === "reviewer" ? model : undefined }, "fixture", "reviewer"), model);
+  assert.equal(findAdvisorModel({}, "fixture", "missing"), undefined);
+});
+
+test("the initialization API distinguishes OMP before session_start", () => {
+  assert.equal(isOmpExtensionApi({ runtime: {}, pi: {} }), true);
+  assert.equal(isOmpExtensionApi({ registerCommand() {}, events: {} }), false);
+});
+
+test("OMP child sessions are restricted without passing string names as tool objects", () => {
+  const modelRegistry = { find: () => model };
+  const ctx = { models: {}, modelRegistry } as unknown as ExtensionContext;
+  assert.equal(isOmpHost(ctx), true);
+  const options = advisorSessionToolOptions(ctx, ["read", "advise"]);
+  assert.deepEqual(options.toolNames, ["read", "advise"]);
+  assert.equal(options.tools, undefined);
+  assert.equal(options.restrictToolNames, true);
+  assert.equal(options.allowRestrictedCustomTools, true);
+  assert.equal(options.disableExtensionDiscovery, true);
+  assert.equal(options.enableMCP, false);
+  assert.equal(options.enableLsp, false);
+  assert.deepEqual(options.skills, []);
+  assert.equal(options.modelRegistry, modelRegistry);
+});
+
+test("OMP resume detection includes skills but excludes steering and agent messages", () => {
+  assert.equal(isOmpUserResumeMessage({ role: "user", attribution: "user" }), true);
+  assert.equal(isOmpUserResumeMessage({ role: "custom", attribution: "user" }), true);
+  assert.equal(isOmpUserResumeMessage({ role: "custom", attribution: "agent" }), false);
+  assert.equal(isOmpUserResumeMessage({ role: "user", attribution: "user", steering: true }), false);
+});
+
+test("OMP abort detection uses the latest run, not an aborted historical turn", () => {
+  assert.equal(ompAgentEndWasAborted([
+    { role: "assistant", stopReason: "stop" },
+    { role: "assistant", stopReason: "aborted" },
+  ]), true);
+  assert.equal(ompAgentEndWasAborted([
+    { role: "assistant", stopReason: "aborted" },
+    { role: "user" },
+    { role: "assistant", stopReason: "stop" },
+  ]), false);
+});
+
+test("OMP's native advisor is disabled only inside the extension-owned child", () => {
+  const ctx = { models: {} } as unknown as ExtensionContext;
+  const calls: boolean[] = [];
+  disableNestedHostAdvisor(ctx, { setAdvisorEnabled: (enabled: boolean) => { calls.push(enabled); } });
+  assert.deepEqual(calls, [false]);
+
+  disableNestedHostAdvisor({} as ExtensionContext, { setAdvisorEnabled: (enabled: boolean) => { calls.push(enabled); } });
+  assert.deepEqual(calls, [false], "Pi sessions keep their existing behavior");
+});
+
+test("Pi child sessions keep the Pi tools allowlist contract", () => {
+  const ctx = {} as ExtensionContext;
+  assert.equal(isOmpHost(ctx), false);
+  assert.deepEqual(advisorSessionToolOptions(ctx, ["read", "advise"]), { tools: ["read", "advise"] });
+});

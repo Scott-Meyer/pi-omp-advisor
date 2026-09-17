@@ -36,9 +36,15 @@
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",
     "test": "node --import jiti/register --test --test-timeout=10000 \"src/**/*.test.ts\" \"scripts/*.test.mjs\"",
+    "test:omp": "scripts/omp-compat/run.sh",
     "verify:package": "node scripts/verify-package.mjs"
   },
   "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "omp": {
     "extensions": [
       "./src/index.ts"
     ]

@@ -19,8 +19,8 @@
  * tracks them independently and a live snapshot is attached to a normally
  * scheduled review when that capability is granted.
  */
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { createAgentSession, DefaultResourceLoader, loadProjectContextFiles, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext, ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, DefaultResourceLoader, SessionManager } from "@earendil-works/pi-coding-agent";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 // `ThinkingLevel` must come from pi-agent-core, which is what
@@ -50,6 +50,14 @@ import type { CurrentToolResult, PrimaryStopAccess, StopRequestResult } from "./
 import type { AdvisorConfig, SyncBacklogConfig } from "./watchdog-config.ts";
 import { DEFAULT_FLUSH_ON_SETTLED, DEFAULT_FLUSH_TIMEOUT_MS, DEFAULT_MAX_BEHIND, discoverWatchdogFiles, normalizeSyncBacklog } from "./watchdog-config.ts";
 import { buildAdvisorSystemPrompt } from "./system-prompt.ts";
+import {
+  advisorSessionToolOptions,
+  disableNestedHostAdvisor,
+  findAdvisorModel,
+  loadAdvisorContextFiles,
+  type AdvisorModel,
+  type AdvisorModelRegistry,
+} from "./host-compat.ts";
 
 /**
  * An advisor's session is a throwaway watcher, not a second user session: it
@@ -217,7 +225,7 @@ export class AdvisorOrchestrator {
    *  each advisor's underlying session in place without needing the caller
    *  to re-supply them. */
   #buildInputs:
-    | { ctx: ExtensionContext; modelRuntime: ModelRuntime; agentDir: string; watchdogBlocks: string[]; sharedInstructions: string | undefined; isLegacySingle: boolean; contextFiles: { path: string; content: string }[] }
+    | { ctx: ExtensionContext; modelRegistry: AdvisorModelRegistry; piModelRuntime?: ModelRuntime; agentDir: string; watchdogBlocks: string[]; sharedInstructions: string | undefined; isLegacySingle: boolean; contextFiles: { path: string; content: string }[] }
     | undefined;
   /** Shared FIFO for the non-interrupting "aside" channel across every
    *  advisor — matches upstream's single shared `yieldQueue` registration
@@ -250,17 +258,22 @@ export class AdvisorOrchestrator {
     return this.#advisors
       .filter(a => !a.disposed && !a.halted)
       .filter(a => wanted === undefined || a.config.name.toLowerCase() === wanted)
-      .map(a => ({
-        name: a.config.name,
-        streaming: a.session.agent.state.isStreaming,
-        // `messages` holds only COMPLETED messages; `streamingMessage` is
-        // the in-flight response — append it so the viewer shows a live
-        // review as it happens rather than only once it settles.
-        messages: [
-          ...a.session.agent.state.messages,
-          ...(a.session.agent.state.streamingMessage ? [a.session.agent.state.streamingMessage] : []),
-        ],
-      }));
+      .map(a => {
+        const state = a.session.agent.state as typeof a.session.agent.state & { streamMessage?: AgentMessage | null };
+        // Pi names the in-flight message `streamingMessage`; OMP exposes the
+        // same state as `streamMessage` through its legacy Agent surface.
+        const streamingMessage = state.streamingMessage ?? state.streamMessage;
+        return {
+          name: a.config.name,
+          streaming: state.isStreaming,
+          // Completed history excludes the in-flight response. Append its
+          // read-only object so the viewer updates before message_end.
+          messages: [
+            ...state.messages,
+            ...(streamingMessage ? [streamingMessage] : []),
+          ],
+        };
+      });
   }
 
   statusOverview(): AdvisorStatusOverviewItem[] {
@@ -336,8 +349,9 @@ export class AdvisorOrchestrator {
   async start(
     configs: DiscoveredAdvisorsLike,
     ctx: ExtensionContext,
-    modelRuntime: ModelRuntime,
+    modelRegistry: AdvisorModelRegistry,
     agentDir: string,
+    piModelRuntime?: ModelRuntime,
   ): Promise<void> {
     await this.disposeAll();
     this.#noModelAdvisors = [];
@@ -349,21 +363,14 @@ export class AdvisorOrchestrator {
     const watchdogBlocks = await discoverWatchdogFiles(ctx.cwd, agentDir);
     const roster = configs.advisors.length > 0 ? configs.advisors : [{ name: "default" }];
     const isLegacySingle = configs.advisors.length === 0;
-    // `ctx.getSystemPromptOptions().contextFiles` is the same AGENTS.md/
-    // project-instructions set the primary's own system prompt gets — fed to
-    // context-files.md so the advisor is held to the same standing rules the
-    // primary was given (upstream: `formatAdvisorContextPrompt`).
-    // `loadProjectContextFiles` is the same AGENTS.md/project-instructions
-    // discovery pi's own resource loader runs to build the PRIMARY's system
-    // prompt (`ctx.getSystemPromptOptions().contextFiles` for command
-    // contexts) — called directly here since `session_start`'s `ctx` is a
-    // plain `ExtensionContext`, which doesn't expose that method.
-    const contextFiles = loadProjectContextFiles({ cwd: ctx.cwd, agentDir });
-    this.#buildInputs = { ctx, modelRuntime, agentDir, watchdogBlocks, sharedInstructions: configs.sharedInstructions, isLegacySingle, contextFiles };
+    // Load through the host's resource contract rather than Pi's convenience
+    // export, which OMP's legacy compatibility module does not expose.
+    const contextFiles = await loadAdvisorContextFiles(ctx.cwd, agentDir);
+    this.#buildInputs = { ctx, modelRegistry, piModelRuntime, agentDir, watchdogBlocks, sharedInstructions: configs.sharedInstructions, isLegacySingle, contextFiles };
 
     for (const config of roster) {
       if (config.enabled === false) continue;
-      const advisor = await this.#buildAdvisor(config, isLegacySingle, watchdogBlocks, configs.sharedInstructions, ctx, modelRuntime, agentDir, contextFiles, configs);
+      const advisor = await this.#buildAdvisor(config, isLegacySingle, watchdogBlocks, configs.sharedInstructions, ctx, modelRegistry, agentDir, contextFiles, configs, piModelRuntime);
       if (advisor) this.#advisors.push(advisor);
     }
   }
@@ -374,15 +381,16 @@ export class AdvisorOrchestrator {
     watchdogBlocks: string[],
     sharedInstructions: string | undefined,
     ctx: ExtensionContext,
-    modelRuntime: ModelRuntime,
+    modelRegistry: AdvisorModelRegistry,
     agentDir: string,
     contextFiles: { path: string; content: string }[],
     configs?: DiscoveredAdvisorsLike,
+    piModelRuntime?: ModelRuntime,
   ): Promise<ActiveAdvisor | undefined> {
     const slug = config.name === "default" ? "" : config.name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "advisor";
     const sourceName = isLegacySingle ? undefined : config.name;
 
-    const resolvedModel = config.model ? this.#resolveModel(config.model, modelRuntime) : undefined;
+    const resolvedModel = config.model ? this.#resolveModel(config.model, modelRegistry) : undefined;
     const model = resolvedModel?.model;
     const thinkingLevel = resolvedModel?.thinkingLevel;
     if (config.model && !model) {
@@ -435,15 +443,20 @@ export class AdvisorOrchestrator {
     try {
       const created = await this.createSession({
         sessionManager: SessionManager.inMemory(ctx.cwd),
-        modelRuntime,
         model,
         // Honors an omp-style `:level` suffix on the advisor's model selector.
         ...(thinkingLevel ? { thinkingLevel } : {}),
         cwd: ctx.cwd,
-        tools: resolvedToolNames,
+        ...advisorSessionToolOptions(ctx, resolvedToolNames, piModelRuntime),
         customTools: [adviseTool, ...controlTools],
         resourceLoader,
       });
+      try {
+        disableNestedHostAdvisor(ctx, created.session);
+      } catch (err) {
+        created.session.dispose();
+        throw err;
+      }
       session = created.session;
     } catch (err) {
       console.error(`[pi-omp-advisor] advisor "${config.name}": failed to start: ${String(err)}`);
@@ -494,14 +507,14 @@ export class AdvisorOrchestrator {
    */
   #resolveModel(
     selector: string,
-    modelRuntime: ModelRuntime,
-  ): { model: NonNullable<ReturnType<ModelRuntime["getModel"]>>; thinkingLevel?: ThinkingLevel } | undefined {
+    modelRegistry: AdvisorModelRegistry,
+  ): { model: AdvisorModel; thinkingLevel?: ThinkingLevel } | undefined {
     // Try the selector VERBATIM first. Real model ids contain colons — OpenRouter
     // variant suffixes (`:free`, `:exacto`) and ids like `glm-4.7:max` — and
     // `max` is also a thinking-level name, so the literal id has to win before
     // any suffix is considered. Stripping unconditionally would silently
     // resolve the wrong model, or fail on a perfectly valid one.
-    const direct = this.#lookupModel(selector, modelRuntime);
+    const direct = this.#lookupModel(selector, modelRegistry);
     if (direct) return { model: direct };
 
     // Only now consider a `:level` thinking suffix, and only if it is a level pi
@@ -511,7 +524,7 @@ export class AdvisorOrchestrator {
       const level = selector.slice(suffix + 1).toLowerCase();
       if (ADVISOR_THINKING_LEVEL_SUFFIXES.has(level)) {
         const stripped = selector.slice(0, suffix);
-        const model = this.#lookupModel(stripped, modelRuntime);
+        const model = this.#lookupModel(stripped, modelRegistry);
         if (model) return { model, thinkingLevel: level as ThinkingLevel };
       }
     }
@@ -520,13 +533,13 @@ export class AdvisorOrchestrator {
 
   /** Split a `provider/id` key on the FIRST slash only — an id can itself contain
    *  slashes (e.g. provider `openrouter`, id `qwen/qwen3-coder`). */
-  #lookupModel(modelKey: string, modelRuntime: ModelRuntime) {
+  #lookupModel(modelKey: string, modelRegistry: AdvisorModelRegistry) {
     const sep = modelKey.indexOf("/");
     if (sep < 0) return undefined;
     const provider = modelKey.slice(0, sep);
     const id = modelKey.slice(sep + 1);
     if (!provider || !id) return undefined;
-    return modelRuntime.getModel(provider, id);
+    return findAdvisorModel(modelRegistry, provider, id);
   }
 
   /**
@@ -644,7 +657,7 @@ export class AdvisorOrchestrator {
    */
   async resetRuntimesOnly(): Promise<void> {
     if (!this.#buildInputs) return;
-    const { ctx, modelRuntime, agentDir, watchdogBlocks, sharedInstructions, isLegacySingle, contextFiles } = this.#buildInputs;
+    const { ctx, modelRegistry, piModelRuntime, agentDir, watchdogBlocks, sharedInstructions, isLegacySingle, contextFiles } = this.#buildInputs;
     for (const advisor of this.#advisors) {
       this.#clearFlushTimer(advisor);
       if (advisor.disposed) continue;
@@ -662,7 +675,7 @@ export class AdvisorOrchestrator {
         oldSession.agent.abort();
         await oldSession.agent.waitForIdle();
         if (advisor.disposed || advisor.generation !== rebuildGeneration) continue;
-        const resolvedModel = advisor.config.model ? this.#resolveModel(advisor.config.model, modelRuntime) : undefined;
+        const resolvedModel = advisor.config.model ? this.#resolveModel(advisor.config.model, modelRegistry) : undefined;
         const model = resolvedModel?.model;
         const thinkingLevel = resolvedModel?.thinkingLevel;
         const toolNames = advisor.config.tools === undefined ? ADVISOR_DEFAULT_TOOL_NAMES : new Set(advisor.config.tools);
@@ -693,16 +706,21 @@ export class AdvisorOrchestrator {
         );
         const created = await this.createSession({
           sessionManager: SessionManager.inMemory(ctx.cwd),
-          modelRuntime,
           model,
           // Same `:level` handling as the initial build — a context reset must not
           // silently drop the advisor's configured thinking level.
           ...(thinkingLevel ? { thinkingLevel } : {}),
           cwd: ctx.cwd,
-          tools: resolvedToolNames,
+          ...advisorSessionToolOptions(ctx, resolvedToolNames, piModelRuntime),
           customTools: [adviseTool, ...controlTools],
           resourceLoader,
         });
+        try {
+          disableNestedHostAdvisor(ctx, created.session);
+        } catch (err) {
+          created.session.dispose();
+          throw err;
+        }
         if (advisor.disposed || advisor.generation !== rebuildGeneration) {
           created.session.dispose();
           continue;

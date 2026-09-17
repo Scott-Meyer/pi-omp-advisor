@@ -53,6 +53,12 @@ async function harness(t: TestContext, review: Review, options?: { stop?: Primar
     setStatus: () => {},
   };
   let sessionCount = 0;
+  const advisorStates: Array<{
+    messages: AgentMessage[];
+    isStreaming: boolean;
+    streamingMessage?: AgentMessage | null;
+    streamMessage?: AgentMessage | null;
+  }> = [];
   const createSession: typeof createAgentSession = async options => {
     sessionCount++;
     assert.ok(options?.customTools);
@@ -71,6 +77,7 @@ async function harness(t: TestContext, review: Review, options?: { stop?: Primar
       systemPrompt: options.resourceLoader?.getSystemPrompt() ?? "",
       tools, model: { contextWindow: 128_000 },
     };
+    advisorStates.push(state);
     let controller = new AbortController();
     let inFlight = Promise.resolve();
     const listeners = new Set<(event: AgentEvent, signal: AbortSignal) => void>();
@@ -138,7 +145,7 @@ async function harness(t: TestContext, review: Review, options?: { stop?: Primar
   const orchestrator = new AdvisorOrchestrator(host, createSession);
   await orchestrator.start(discovered, { cwd } as ExtensionContext, {} as ModelRuntime, agentDir);
   t.after(() => orchestrator.disposeAll());
-  return { orchestrator, inbox, sent, whenPreserved: preserved.promise, sessionCount: () => sessionCount };
+  return { orchestrator, inbox, sent, whenPreserved: preserved.promise, sessionCount: () => sessionCount, advisorStates };
 }
 
 function update(orchestrator: AdvisorOrchestrator, final: boolean) {
@@ -569,7 +576,7 @@ for (const boundary of ["completion", "abort"] as const) {
 
 test("three continuing primary turns produce one advisor wake with one combined delta", async t => {
   const reviews: string[] = [];
-  const { orchestrator } = await harness(t, async text => { reviews.push(text); }, { maxBehind: 3 });
+  const { orchestrator, advisorStates } = await harness(t, async text => { reviews.push(text); }, { maxBehind: 3 });
   for (let turn = 1; turn <= 3; turn++) {
     orchestrator.onMessage({ role: "user", content: `batched-turn-${turn}`, timestamp: turn });
     orchestrator.onTurnEnd();
@@ -593,6 +600,14 @@ test("three continuing primary turns produce one advisor wake with one combined 
   assert.match(transcript, /batched-turn-3/);
   assert.equal(orchestrator.transcriptSnapshot("reviewer").length, 1, "name filter selects the advisor");
   assert.equal(orchestrator.transcriptSnapshot("nope").length, 0, "unknown names select nothing");
+
+  // OMP names the live field `streamMessage`; Pi uses `streamingMessage`.
+  const state = advisorStates.at(-1)!;
+  state.isStreaming = true;
+  state.streamMessage = { role: "assistant", content: [{ type: "text", text: "OMP live review" }] } as AgentMessage;
+  const live = orchestrator.transcriptSnapshot()[0]!;
+  assert.equal(live.streaming, true);
+  assert.match(live.messages.map(message => JSON.stringify(message)).join("\n"), /OMP live review/);
 });
 
 test("settlement with flushOnSettled off does not wake short runs before the shared turn threshold", async t => {

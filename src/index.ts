@@ -51,7 +51,7 @@
  *   roster editing.
  */
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { CustomEditor, getAgentDir, ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ToolResultMessage } from "@earendil-works/pi-ai";
 import { Text, type AutocompleteItem } from "@earendil-works/pi-tui";
@@ -67,6 +67,7 @@ import { PrimaryInterruptionState } from "./advisor/primary-interruption.ts";
 import { formatToolCallPrimaryArg } from "./advisor/session-history-format.ts";
 import { DEFAULT_ADVISOR_CONTEXT_TOKENS, MIN_ADVISOR_CONTEXT_TOKENS, type ContextWindowStatus } from "./advisor/context-window.ts";
 import { FileMutationTracker } from "./advisor/file-diff.ts";
+import { isOmpExtensionApi, isOmpHost, isOmpUserResumeMessage, ompAgentEndWasAborted } from "./advisor/host-compat.ts";
 import {
   DEFAULT_FLUSH_TIMEOUT_MS,
   DEFAULT_MAX_BEHIND,
@@ -163,8 +164,10 @@ export default function (pi: ExtensionAPI) {
   // changed again.
   let runtimeOverride: boolean | undefined;
   let runtimeEnabled = false; // effective value, recomputed by startOrchestrator / on|off
-  /** Run mode of the live session, captured at session_start for teardown decisions. */
+  /** Run mode/host of the live session, captured at session_start. */
   let lastMode: ExtensionContext["mode"] | undefined;
+  let ompHost = isOmpExtensionApi(pi);
+  const advisorCommandName = () => ompHost ? "/pi-advisor" : "/advisor";
   let configHadRoster = false; // whether a WATCHDOG.yml/.yaml/.md advisor roster was actually found
   let lastDiscoveredMainEnabled: boolean | undefined; // last-discovered `main:` field, for the status line
   let lastDiscoveredSubagentsEnabled: boolean | undefined; // last-discovered `subagents:` field, for the status line
@@ -324,11 +327,18 @@ export default function (pi: ExtensionAPI) {
    * and cannot steal an Enter from any of them. Composes with an existing
    * custom editor (ours wraps whatever `getEditorComponent` had).
    */
-  function registerEnterDelivery(ctx: ExtensionContext): void {
+  async function registerEnterDelivery(ctx: ExtensionContext): Promise<void> {
     if (ctx.mode !== "tui" || typeof ctx.ui.setEditorComponent !== "function" || typeof ctx.ui.getEditorComponent !== "function") return;
     const existing = ctx.ui.getEditorComponent();
     if (existing === enterDeliveryEditorFactory) return;
-    const base = existing ?? ((tui, theme, keybindings) => new CustomEditor(tui, theme, keybindings));
+    // OMP's legacy coding-agent shim does not expose getEditorComponent. Load
+    // the Pi-only fallback only after that capability check so OMP can load the
+    // rest of the extension without resolving an incompatible editor class.
+    let base = existing;
+    if (!base) {
+      const { CustomEditor } = await import("@earendil-works/pi-coding-agent");
+      base = (tui, theme, keybindings) => new CustomEditor(tui, theme, keybindings);
+    }
     enterDeliveryEditorFactory = (tui, theme, keybindings) =>
       attachEnterDelivery(base(tui, theme, keybindings), {
         isSubmitKey: data => keybindings.matches(data, "tui.input.submit"),
@@ -431,7 +441,7 @@ export default function (pi: ExtensionAPI) {
       }
       if (paused && (!runtimeEnabled || !configHadRoster || !orchestrator)) {
         advisorPauseRequests.reject(paused);
-        ctx.ui.notify("pi-omp-advisor is not running; use /advisor on before pausing it.", "warning");
+        ctx.ui.notify(`pi-omp-advisor is not running; use ${advisorCommandName()} on before pausing it.`, "warning");
         return;
       }
       if (paused) {
@@ -549,22 +559,27 @@ export default function (pi: ExtensionAPI) {
       orchestrator = undefined;
       return;
     }
-    const modelRuntime = await ModelRuntime.create();
+    // Preserve Pi's existing child-session runtime contract without forcing
+    // OMP to resolve Pi's unsupported static ModelRuntime export.
+    const piModelRuntime = isOmpHost(ctx)
+      ? undefined
+      : await (await import("@earendil-works/pi-coding-agent")).ModelRuntime.create();
     orchestrator = new AdvisorOrchestrator(makeHost(ctx));
     // Armed here, not only in the `input` handler below: a headless caller must
     // never have an advisor note silently start a turn, and waiting for the
     // first `input` event leaves that unguarded from session_start until the
     // first prompt.
     orchestrator.setPreserveOnly(isHeadlessMode(ctx.mode));
-    await orchestrator.start(discovered, ctx, modelRuntime, agentDir);
+    await orchestrator.start(discovered, ctx, piModelRuntime ?? ctx.modelRegistry, agentDir, piModelRuntime);
     if (advisorPaused) await orchestrator.setPaused(true);
     updateAdvisorStatus(ctx);
   }
 
   pi.on("session_start", async (_event, ctx) => {
     lastMode = ctx.mode;
+    ompHost = isOmpHost(ctx);
     sessionContext = ctx;
-    registerEnterDelivery(ctx);
+    await registerEnterDelivery(ctx);
     primaryInterruption.reset();
     primaryStop.reset();
     restoreInbox(ctx);
@@ -601,6 +616,7 @@ export default function (pi: ExtensionAPI) {
     inbox.clear();
     sessionContext?.ui.setWidget(ADVISOR_INBOX_WIDGET_ID, undefined);
     sessionContext = undefined;
+    ompHost = false;
     primaryStop.reset();
     advisorContextNeeded = false;
     advisorPaused = false;
@@ -646,9 +662,30 @@ export default function (pi: ExtensionAPI) {
     fileMutationTracker.onToolEnd(event.toolCallId, event.isError);
   });
 
+  pi.on("message_start", async event => {
+    if (!ompHost) return;
+    // OMP's RPC controller bypasses the legacy `input` event. Canonical user
+    // attribution covers both ordinary prompts and `/skill:` custom messages;
+    // the steering flag excludes agent/user steering just like Pi's input path.
+    const message = event.message as typeof event.message & { attribution?: string; steering?: boolean };
+    if (!isOmpUserResumeMessage(message)) return;
+    primaryInterruption.resume();
+    // OMP's RPC path also bypasses `input`, so release preserved notes here.
+    // The user message is already starting; the queued steer is folded into
+    // this run without creating a separate model turn.
+    releaseInboxAheadOfPrompt();
+  });
+
   pi.on("message_end", async (event, _ctx) => {
-    if (!isActive()) return;
     let message = event.message as AgentMessage;
+    // OMP's legacy ExtensionContext omits Pi's live AbortSignal. Its terminal
+    // assistant message still records an explicit user/provider abort; latch
+    // that even while advisor observation is paused/off, because this state is
+    // primary-session-owned and must survive a later advisor resume/rebuild.
+    if (ompHost && message.role === "assistant" && message.stopReason === "aborted") {
+      primaryInterruption.suppress();
+    }
+    if (!isActive()) return;
     if (message.role === "toolResult") {
       const tr = message as ToolResultMessage;
       const diff = await fileMutationTracker.onToolResult(tr.toolCallId, tr.toolName, tr.isError);
@@ -672,11 +709,29 @@ export default function (pi: ExtensionAPI) {
     // never gated on an advisor.
     await orchestrator!.waitForCatchup();
   });
-  pi.on("agent_settled", async (_event, _ctx) => {
+  const onPrimarySettled = () => {
     publishStopReceipt();
     fileMutationTracker.clear();
     if (!isActive()) return;
     orchestrator!.onAgentSettled();
+  };
+  pi.on("agent_settled", async () => {
+    // Pi's settled event is the strongest lifecycle boundary: the run and all
+    // of its listeners have completed. OMP 18.2.4 does not emit this legacy
+    // event, so its agent_end fallback below owns settlement there.
+    if (!ompHost) onPrimarySettled();
+  });
+  pi.on("agent_end", async event => {
+    if (!ompHost) return;
+    const ompEvent = event as typeof event & { willContinue?: boolean; messages?: AgentMessage[] };
+    // OMP does not emit message_end for every abort path. In particular, an
+    // abort while a tool is running reports the synthetic aborted assistant
+    // only in agent_end.messages; latch it before a late blocker can restart.
+    if (ompAgentEndWasAborted(ompEvent.messages)) primaryInterruption.suppress();
+    // OMP marks intermediate loop ends that already have an automatic retry,
+    // compaction, or queued continuation. Only its terminal end substitutes
+    // for Pi's stronger agent_settled event.
+    if (!ompEvent.willContinue) onPrimarySettled();
   });
 
   // A normal interactive/RPC prompt permits future advisor-driven turns.
@@ -880,7 +935,7 @@ export default function (pi: ExtensionAPI) {
         }
         ctx.ui.notify(`pi-omp-advisor config saved to ${filePath}`, "info");
         if (runtimeEnabled) await startOrchestrator(ctx);
-        else ctx.ui.notify("pi-omp-advisor is off for this session (/advisor off) — saved, but not applied until /advisor on.", "info");
+        else ctx.ui.notify(`pi-omp-advisor is off for this session (${advisorCommandName()} off) — saved, but not applied until ${advisorCommandName()} on.`, "info");
         return;
       }
       if (choice.startsWith("Shared instructions:")) {
@@ -1022,15 +1077,15 @@ export default function (pi: ExtensionAPI) {
       [
         "pi-omp-advisor controls",
         "",
-        "/advisor — open the interactive control menu",
-        "/advisor status — show runtime, model, backlog, and queue details",
-        "/advisor inbox — inspect, deliver, or dismiss queued notes",
-        "/advisor pause | resume — stop or restart observation without releasing the queue",
-        "/advisor clear — immediately discard every queued note",
-        "/advisor on | off — enable or disable this session",
-        "/advisor config — edit project or user WATCHDOG.yml",
-        "/advisor main on|off — persist the normal-session default",
-        "/advisor subagents on|off — set the default for newly spawned subagents",
+        `${advisorCommandName()} — open the interactive control menu`,
+        `${advisorCommandName()} status — show runtime, model, backlog, and queue details`,
+        `${advisorCommandName()} inbox — inspect, deliver, or dismiss queued notes`,
+        `${advisorCommandName()} pause | resume — stop or restart observation without releasing the queue`,
+        `${advisorCommandName()} clear — immediately discard every queued note`,
+        `${advisorCommandName()} on | off — enable or disable this session`,
+        `${advisorCommandName()} config — edit project or user WATCHDOG.yml`,
+        `${advisorCommandName()} main on|off — persist the normal-session default`,
+        `${advisorCommandName()} subagents on|off — set the default for newly spawned subagents`,
         "",
         `${ADVISOR_INBOX_SHORTCUT}: inbox · ${ADVISOR_PAUSE_SHORTCUT}: pause/resume · ${ADVISOR_CLEAR_SHORTCUT}: clear queue`,
         "Use Tab to accept the highlighted command or subcommand completion.",
@@ -1109,7 +1164,7 @@ export default function (pi: ExtensionAPI) {
   async function showAdvisorStreamCommand(ctx: ExtensionCommandContext, name?: string): Promise<void> {
     const snapshots = orchestrator?.transcriptSnapshot() ?? [];
     if (snapshots.length === 0) {
-      ctx.ui.notify("No running advisors to watch. /advisor status shows why.", "info");
+      ctx.ui.notify(`No running advisors to watch. ${advisorCommandName()} status shows why.`, "info");
       return;
     }
     let target = name
@@ -1183,7 +1238,7 @@ export default function (pi: ExtensionAPI) {
       const value = subagentsArg === "on";
       process.env[PI_ADVISOR_SUBAGENTS_ENV] = value ? "1" : "0";
       ctx.ui.notify(
-        `pi-omp-advisor: subagents spawned from this process tree from now on will default ${value ? "on" : "off"} (session-tree only — not written to disk; use /advisor config to persist across process trees).`,
+        `pi-omp-advisor: subagents spawned from this process tree from now on will default ${value ? "on" : "off"} (session-tree only — not written to disk; use ${advisorCommandName()} config to persist across process trees).`,
         "info",
       );
       return;
@@ -1237,7 +1292,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     if (first !== "status") {
-      ctx.ui.notify(`Unknown advisor command: ${parts.join(" ")}. Use /advisor to open the menu or /advisor help.`, "warning");
+      ctx.ui.notify(`Unknown advisor command: ${parts.join(" ")}. Use ${advisorCommandName()} to open the menu or ${advisorCommandName()} help.`, "warning");
       await showAdvisorHelp(ctx);
       return;
     }
@@ -1267,17 +1322,17 @@ export default function (pi: ExtensionAPI) {
       : isActive()
         ? `on — watching with: ${orchestrator!.advisorNames.join(", ")} (${overview.map(describe).join(", ")})`
         : runtimeOverride === false
-        ? "off (disabled for this session via /advisor off)"
+        ? `off (disabled for this session via ${advisorCommandName()} off)`
         : unusable.length > 0
           ? `off — every configured advisor failed to start: ${unusable.map(describe).join(", ")}. ` +
-            `Fix the \`model:\` values in WATCHDOG.yml (use "<provider>/<id>" from a model you have credentials for), or run /advisor config.`
-          : "off (no WATCHDOG.yml/.yaml roster found, or not opted in for this process type — run /advisor on, or /advisor config)";
+            `Fix the \`model:\` values in WATCHDOG.yml (use "<provider>/<id>" from a model you have credentials for), or run ${advisorCommandName()} config.`
+          : `off (no WATCHDOG.yml/.yaml roster found, or not opted in for this process type — run ${advisorCommandName()} on, or ${advisorCommandName()} config)`;
     ctx.ui.notify(`pi-omp-advisor: ${state}${subagentNote}`, "info");
   }
 
-  // `/advisor` matches upstream's own command name, so muscle memory transfers.
-  // Registered exactly once — pi resolves commands by name, so a second
-  // registration of the same name would be a self-conflict.
+  // `/advisor` matches upstream Pi muscle memory. OMP reserves that name for
+  // its native advisor even when the native runtime is disabled, so the
+  // namespaced alias remains available there.
   pi.registerShortcut(ADVISOR_INBOX_SHORTCUT, {
     description: "Open the queued advisor inbox",
     handler: showAdvisorInbox,
@@ -1291,8 +1346,8 @@ export default function (pi: ExtensionAPI) {
     handler: clearAdvisorInbox,
   });
 
-  pi.registerCommand("advisor", {
-    description: "Open advisor controls, inbox, status, and configuration",
+  pi.registerCommand(ompHost ? "pi-advisor" : "advisor", {
+    description: "Open pi-omp-advisor controls, inbox, status, and configuration",
     getArgumentCompletions: getAdvisorArgumentCompletions,
     handler: handleCommand,
   });

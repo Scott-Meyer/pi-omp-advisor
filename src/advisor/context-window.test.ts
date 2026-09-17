@@ -146,6 +146,61 @@ test("failed partial tool calls do not poison the next observation", () => {
   }
 });
 
+test("OMP's provider hook bounds tool followups and recovers after a failed streamed call", async () => {
+  type ProviderContext = { messages: AgentMessage[]; systemPrompt: string[]; tools: unknown[] };
+  let beforeModelCall: ((context: ProviderContext, signal?: AbortSignal) => void | Promise<void>) | undefined;
+  let removed = false;
+  const state = {
+    messages: [] as AgentMessage[],
+    systemPrompt: ["Review observations.", "Follow standing policy."],
+    tools: [],
+    model: { contextWindow: 8192 },
+  };
+  const ompAgent = {
+    state,
+    subscribe: () => () => {},
+    addBeforeModelCall(callback: typeof beforeModelCall) {
+      beforeModelCall = callback;
+      return () => { removed = true; };
+    },
+  } as unknown as Agent;
+  const memory = installAdvisorContextWindow(ompAgent, 2048);
+  assert.ok(beforeModelCall);
+
+  const failed = assistant([{ type: "toolCall", id: "omp-failed", name: "read_file", arguments: {} }], "error");
+  const wrapper = {
+    name: "read_file",
+    description: "Read a file",
+    parameters: { type: "object", properties: {} },
+    runnerBackreference: "not provider-visible ".repeat(20_000),
+  };
+  const first: ProviderContext = {
+    systemPrompt: state.systemPrompt,
+    tools: [wrapper],
+    messages: [user("old"), failed, result("omp-failed", "synthetic result"), user("retry review")],
+  };
+  await beforeModelCall!(first);
+  assert.doesNotMatch(body(first.messages), /omp-failed|synthetic result/);
+  assert.match(body(first.messages), /bounded recent context window|retry review/);
+
+  // OMP also retains the failed assistant/result pair in raw Agent history.
+  // Completed-update trimming must remove both before the next observation.
+  state.messages = [user("old"), failed, result("omp-failed", "synthetic result"), user("retry review")];
+  memory.trimRetainedHistory();
+  assert.doesNotMatch(body(state.messages), /omp-failed|synthetic result/);
+  state.messages.push(assistant([{ type: "text", text: "Recovered review." }]), user("next review"));
+  const second: ProviderContext = {
+    systemPrompt: state.systemPrompt,
+    tools: [wrapper],
+    messages: [...state.messages],
+  };
+  await beforeModelCall!(second);
+  assert.match(body(second.messages), /Recovered review|next review/);
+  assert.ok(second.messages.length > 0);
+  memory.dispose();
+  assert.equal(removed, true);
+});
+
 test("a real Agent applies the bound again after a large investigative tool result", async () => {
   let requests = 0;
   const requestsSeen: string[] = [];
