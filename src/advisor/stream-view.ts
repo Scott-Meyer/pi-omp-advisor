@@ -88,12 +88,10 @@ class AdvisorStreamPanel implements Component {
       this.#scrollTop -= SCROLL_STEP;
     } else if (matchesKey(data, "down")) {
       this.#scrollTop += SCROLL_STEP;
-    } else if (data === "\u001b[5~") {
-      // Page keys have no KeyId in pi-tui's key set, so this stays a legacy
-      // xterm match; up/down/home/end/end-adjacent keys are protocol-aware.
+    } else if (matchesKey(data, "pageUp")) {
       this.#follow = false;
       this.#scrollTop -= PAGE_STEP;
-    } else if (data === "\u001b[6~") {
+    } else if (matchesKey(data, "pageDown")) {
       this.#scrollTop += PAGE_STEP;
     } else if (matchesKey(data, "home")) {
       this.#follow = false;
