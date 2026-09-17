@@ -5,7 +5,10 @@ import type { PrimaryStopAccess } from "./primary-stop.ts";
 export const ADVISOR_STOP_TOOLS = ["current_tool", "request_stop"] as const;
 
 /** Exposed only when this advisor has an explicit request_stop grant. */
-export function makeStopTools(access: PrimaryStopAccess): ReturnType<typeof defineTool>[] {
+export function makeStopTools(
+  access: PrimaryStopAccess,
+  currentModel: (toolCallId: string) => string | undefined = () => undefined,
+): ReturnType<typeof defineTool>[] {
   const current = defineTool({
     name: "current_tool",
     label: "Current primary tool",
@@ -24,8 +27,8 @@ export function makeStopTools(access: PrimaryStopAccess): ReturnType<typeof defi
       targetId: Type.String({ minLength: 1, description: "Unique execution targetId from the intended call's runtime update/current_tool (not its toolCallId). A concern about an older call does not justify stopping a newer one." }),
       reason: Type.String({ minLength: 1, maxLength: 1000, description: "Concrete reason stopping this operation now is warranted. Shown to the user and recorded in the session." }),
     }),
-    async execute(_id, params) {
-      const result = access.requestStop(params.targetId, params.reason);
+    async execute(toolCallId, params) {
+      const result = access.requestStop(params.targetId, params.reason, currentModel(toolCallId));
       return { content: [{ type: "text", text: result.message }], details: result };
     },
   });

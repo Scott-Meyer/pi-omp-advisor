@@ -23,6 +23,8 @@ export interface AdvisorNote {
   note: string;
   severity?: AdvisorSeverity;
   advisor?: string;
+  /** Provider/model route that generated this note, attached by the host. */
+  model?: string;
   /** Optional human-readable title naming the note's point in a few words. */
   shortTitle?: string;
   /** Stable receipt shared by deferred advice and the preserved inbox. */
@@ -40,7 +42,7 @@ export interface PendingAdvisorNote extends AdvisorNote {
 /** Scoped by the host to one advisor; handed-off or removed IDs cannot be edited. */
 export interface PendingAdviceAccess {
   list(): PendingAdvisorNote[];
-  revise(adviceId: string, note: string, shortTitle?: string, severity?: AdvisorSeverity): boolean;
+  revise(adviceId: string, note: string, shortTitle?: string, severity?: AdvisorSeverity, model?: string): boolean;
   withdraw(adviceId: string): boolean;
 }
 
@@ -273,6 +275,7 @@ export class AdviseState {
     note: string,
     shortTitle?: string,
     severity?: AdvisorSeverity,
+    model?: string,
   ): { changed: boolean; text: string; adviceId: string; outcome: "updated_pending" | "delivered_followup" | "dismissed" | "created_new"; oldNote?: string } {
     if (!note.trim()) {
       return { changed: false, text: "An empty update is not advice. Note text is required.", adviceId, outcome: "updated_pending" };
@@ -286,6 +289,7 @@ export class AdviseState {
       pending.note = note;
       if (shortTitle !== undefined) pending.shortTitle = shortTitle || undefined;
       if (severity !== undefined) pending.severity = severity;
+      if (model !== undefined) pending.model = model;
       pending.updatedAt = Date.now();
       this.#trackedNotes.set(adviceId, { ...pending });
 
@@ -307,7 +311,7 @@ export class AdviseState {
     if (queued) {
       const finalSeverity = severity ?? queued.severity;
       const finalTitle = shortTitle !== undefined ? (shortTitle || undefined) : queued.shortTitle;
-      const updatedRecord: PendingAdvisorNote = { ...queued, note, shortTitle: finalTitle, severity: finalSeverity, updatedAt: Date.now() };
+      const updatedRecord: PendingAdvisorNote = { ...queued, note, shortTitle: finalTitle, severity: finalSeverity, ...(model ? { model } : {}), updatedAt: Date.now() };
 
       // Only treat an actual severity increase from non-blocker to blocker as immediate escalation
       if (finalSeverity === "blocker" && queued.severity !== "blocker") {
@@ -318,7 +322,7 @@ export class AdviseState {
         }
       }
 
-      if (this.pendingAccess!.revise(adviceId, note, shortTitle, severity)) {
+      if (this.pendingAccess!.revise(adviceId, note, shortTitle, severity, model)) {
         const key = advisorNoteDedupeKey(note);
         this.#deliveredNoteSeverities.set(key, Math.max(
           this.#deliveredNoteSeverities.get(key) ?? 0, advisorSeverityRank(finalSeverity),
@@ -336,7 +340,7 @@ export class AdviseState {
       const baseTitle = shortTitle ?? streamed.shortTitle;
       const followupTitle = baseTitle ? (baseTitle.startsWith("Update:") ? baseTitle : `Update: ${baseTitle}`) : "Update";
       const followupSeverity = severity ?? streamed.severity;
-      const res = this.submit(note, followupSeverity, followupTitle, adviceId);
+      const res = this.submit(note, followupSeverity, followupTitle, adviceId, model);
       if (!res.adviceId) {
         const statusText = `Update on ${adviceId}${originalTitle} was ignored as duplicate content.\n\n${this.formatQueueSnapshot()}`;
         return { changed: false, text: statusText, adviceId, outcome: "delivered_followup" };
@@ -360,18 +364,20 @@ export class AdviseState {
   }
 
   /** Replace content, not urgency; revisions neither create notes nor spend a new-note slot. */
-  revise(adviceId: string, note: string, shortTitle?: string): { changed: boolean; text: string; oldNote?: string } {
+  revise(adviceId: string, note: string, shortTitle?: string, model?: string): { changed: boolean; text: string; oldNote?: string } {
     if (!note.trim()) return { changed: false, text: "An empty revision is not advice. Use withdraw_advice to remove it." };
     const pending = this.#deferredNotes.find(item => item.adviceId === adviceId);
     if (pending) {
       const oldNote = pending.note;
       pending.note = note;
       if (shortTitle !== undefined) pending.shortTitle = shortTitle || undefined;
+      if (model !== undefined) pending.model = model;
       pending.updatedAt = Date.now();
+      this.#trackedNotes.set(adviceId, { ...pending });
       return { changed: true, text: `Updated pending advice ${adviceId}.`, oldNote };
     }
     const queued = this.pendingAccess?.list().find(item => item.adviceId === adviceId);
-    if (queued && this.pendingAccess!.revise(adviceId, note, shortTitle)) {
+    if (queued && this.pendingAccess!.revise(adviceId, note, shortTitle, undefined, model)) {
       // This note was already routed to a queue. Its new text belongs in the
       // delivered history too, even if the user later dismisses that queue item.
       const key = advisorNoteDedupeKey(note);
@@ -428,15 +434,16 @@ export class AdviseState {
   }
 
   /** Returns an ID only for accepted advice, whether deferred or routed to the host. */
-  submit(note: string, severity: AdvisorSeverity | undefined, shortTitle?: string, updateOnId?: string): { text: string; delivered: boolean; adviceId?: string } {
+  submit(note: string, severity: AdvisorSeverity | undefined, shortTitle?: string, updateOnId?: string, model?: string): { text: string; delivered: boolean; adviceId?: string } {
     const key = advisorNoteDedupeKey(note);
     if ((this.#deliveredNoteSeverities.get(key) ?? 0) >= advisorSeverityRank(severity)) {
       return { text: "Duplicate advice ignored.", delivered: false };
     }
     const existing = this.#deferredNotes.find(item => advisorNoteDedupeKey(item.note) === key);
     const now = Date.now();
-    const record: PendingAdvisorNote = existing ?? { adviceId: randomUUID(), note, severity, shortTitle, updateOnId, createdAt: now, updatedAt: now };
+    const record: PendingAdvisorNote = existing ?? { adviceId: randomUUID(), note, severity, shortTitle, updateOnId, ...(model ? { model } : {}), createdAt: now, updatedAt: now };
     if (existing && advisorSeverityRank(severity) > advisorSeverityRank(existing.severity)) existing.severity = severity;
+    if (existing && model !== undefined) existing.model = model;
     if (existing && shortTitle !== undefined) existing.shortTitle = shortTitle || undefined;
     if (existing && updateOnId !== undefined) existing.updateOnId = updateOnId;
     this.#trackedNotes.set(record.adviceId, { ...record });

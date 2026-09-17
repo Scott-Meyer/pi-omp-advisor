@@ -23,6 +23,11 @@ export function isOmpExtensionApi(api: object): boolean {
   return "runtime" in api && "pi" in api;
 }
 
+/** Avoid OMP's native advisor renderer while preserving Pi transcript compatibility. */
+export function advisorCustomMessageType(api: object): "advisor" | "pi-omp-advisor" {
+  return isOmpExtensionApi(api) ? "pi-omp-advisor" : "advisor";
+}
+
 /** OMP exposes its newer read-only `models` facade; Pi currently does not. */
 export function isOmpHost(ctx: ExtensionContext): boolean {
   return "models" in (ctx as object);

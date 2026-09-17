@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test, { type TestContext } from "node:test";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Theme } from "@earendil-works/pi-coding-agent";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import { showAdvisorStream, type AdvisorStreamSnapshot } from "./stream-view.ts";
 
 const plainTheme = {
@@ -27,7 +28,7 @@ function assistantMessage(text: string): AgentMessage {
 test("the stream popup renders the advisor context live, follows the end, and closes cleanly", async t => {
   t.mock.timers.enable({ apis: ["setInterval"] });
   const snapshots: AgentMessage[] = [userMessage("marker-1 observed"), assistantMessage("marker-1 reviewed")];
-  const snapshot = (): AdvisorStreamSnapshot => ({ name: "reviewer", streaming: false, messages: [...snapshots] });
+  const snapshot = (): AdvisorStreamSnapshot => ({ name: "reviewer", model: "openai-codex/gpt-5.6-sol-long-route", streaming: false, messages: [...snapshots] });
 
   let mounted: Mounted | undefined;
   const closed = showAdvisorStream(
@@ -43,7 +44,10 @@ test("the stream popup renders the advisor context live, follows the end, and cl
   // The initial sync ran inside the factory: content is already rendered.
   const initial = mounted!.render(80);
   assert.ok(initial.join("\n").includes("marker-1 observed"), "the advisor's own context is visible");
-  assert.ok(initial.join("\n").includes("Advisor stream · reviewer · IDLE"), "the header names the advisor and state");
+  assert.ok(initial.join("\n").includes("Advisor stream · reviewer · openai-codex/gpt-5.6-sol-long-route · IDLE"), "the header names the advisor, model, and state");
+  const narrow = mounted!.render(50);
+  assert.ok(narrow.join("\n").includes("openai-codex/gpt-5.6-sol-long-route"), "a long route wraps instead of being clipped");
+  assert.ok(narrow.every(line => visibleWidth(line) <= 50), "every wrapped stream line stays within the overlay width");
 
   // A new observation arrives; the next poll picks it up.
   snapshots.push(userMessage("marker-2 observed"), assistantMessage("marker-2 reviewed"));
@@ -65,12 +69,14 @@ test("scrolling up pins the view and landing back at the end resumes following",
   t.mock.timers.enable({ apis: ["setInterval"] });
   const messages: AgentMessage[] = [userMessage("marker-turn-first")];
   for (let i = 2; i <= 40; i++) messages.push(userMessage(`marker-turn-${i}`));
-  const snapshot = (): AdvisorStreamSnapshot => ({ name: "reviewer", streaming: true, messages: [...messages] });
+  const snapshot = (): AdvisorStreamSnapshot => ({ name: "reviewer", model: "openai-codex/gpt-5.6-sol-long-route", streaming: true, messages: [...messages] });
 
   let mounted: Mounted | undefined;
+  let overlayOptions: any;
   const closed = showAdvisorStream(
-    ((factory: any, _opts: any) =>
+    ((factory: any, opts: any) =>
       new Promise<string | null>(resolve => {
+        overlayOptions = opts.overlayOptions;
         mounted = factory({ requestRender: () => {} }, plainTheme, {}, (value: string | null) => resolve(value)) as Mounted;
       })) as any,
     snapshot,
@@ -80,6 +86,10 @@ test("scrolling up pins the view and landing back at the end resumes following",
   // Default view is pinned to the end: the newest turn is on screen, the first is not.
   assert.ok(visible("marker-turn-40"), "follows the end by default");
   assert.ok(!visible("marker-turn-first"));
+  overlayOptions.visible(40, 16);
+  const capped = mounted!.render(40);
+  assert.ok(capped.length <= Math.floor(16 * 0.8), "wrapped header plus body stays within the host overlay height cap");
+  assert.ok(capped.join("\n").includes("marker-turn-40"), "header wrapping does not clip the newest followed transcript line");
 
   // Home key reaches the oldest content at top, and new content does not yank the view.
   mounted!.handleInput("\u001b[H");

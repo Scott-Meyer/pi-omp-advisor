@@ -34,6 +34,7 @@ export async function makeAdviseTool(
   stopAccess?: PrimaryStopAccess,
   rememberRevision: (note: string) => void = () => {},
   forgetNote: (note: string) => void = () => {},
+  currentModel: (toolCallId: string) => string | undefined = () => undefined,
 ): Promise<{ tool: ReturnType<typeof defineTool>; controlTools: ReturnType<typeof defineTool>[]; state: AdviseState }> {
   const fs = await import("node:fs/promises");
   const description = await fs.readFile(adviseDescription, "utf8");
@@ -47,7 +48,7 @@ export async function makeAdviseTool(
       severity: Type.Optional(adviseSeverity),
       ShortTitle: Type.Optional(Type.String({ description: "Optional: a few plain words naming the point, e.g. \"Test gap in flush logic\". The inbox UI leads with this when present, so someone skimming ten advisories can tell them apart at a glance." })),
     }),
-    async execute(_toolCallId, params) {
+    async execute(toolCallId, params) {
       const shortTitle = params.ShortTitle;
       if (process.env.PI_ADVISOR_DEBUG === "1") {
         console.error(`[advisor:debug] advise() called severity=${params.severity ?? "nit"} title=${JSON.stringify(shortTitle ?? "")} note=${JSON.stringify(params.note.slice(0, 160))}`);
@@ -72,7 +73,7 @@ export async function makeAdviseTool(
           useless: true,
         };
       }
-      const result = state.submit(params.note, params.severity as AdvisorSeverity | undefined, shortTitle);
+      const result = state.submit(params.note, params.severity as AdvisorSeverity | undefined, shortTitle, undefined, currentModel(toolCallId));
       const allowanceTag = allowance ? ` [Review allowance: ${allowance.used} of ${allowance.total} used this cycle]` : "";
       const textWithAllowance = result.text.includes("Recorded advice")
         ? result.text.replace("Recorded advice", "Recorded advice" + allowanceTag)
@@ -96,8 +97,8 @@ export async function makeAdviseTool(
       ShortTitle: Type.Optional(Type.String({ description: "Optional: Updated short title for the note. Omit to keep the original title." })),
       severity: Type.Optional(adviseSeverity),
     }),
-    async execute(_id, params) {
-      const result = state.update(params.targetId, params.note, params.ShortTitle, params.severity as AdvisorSeverity | undefined);
+    async execute(toolCallId, params) {
+      const result = state.update(params.targetId, params.note, params.ShortTitle, params.severity as AdvisorSeverity | undefined, currentModel(toolCallId));
       if (result.changed) {
         if (result.oldNote) forgetNote(result.oldNote);
         rememberRevision(params.note);
@@ -130,8 +131,8 @@ export async function makeAdviseTool(
       note: Type.String({ minLength: 1, description: "Replacement advice text." }),
       ShortTitle: Type.Optional(Type.String({ description: "Optional replacement title; omit to keep the current one." })),
     }),
-    async execute(_id, params) {
-      const result = state.revise(params.adviceId, params.note, params.ShortTitle);
+    async execute(toolCallId, params) {
+      const result = state.revise(params.adviceId, params.note, params.ShortTitle, currentModel(toolCallId));
       if (result.changed) {
         if (result.oldNote) forgetNote(result.oldNote);
         rememberRevision(params.note);
@@ -152,5 +153,5 @@ export async function makeAdviseTool(
       return { content: [{ type: "text", text: result.text }], details: result };
     },
   });
-  return { tool, controlTools: [updateAdvice, pending, revise, withdraw, ...(stopAccess ? makeStopTools(stopAccess) : [])], state };
+  return { tool, controlTools: [updateAdvice, pending, revise, withdraw, ...(stopAccess ? makeStopTools(stopAccess, currentModel) : [])], state };
 }

@@ -36,7 +36,7 @@ export class AdvisorInbox {
       .map(({ id: _id, ...note }) => ({ ...note }));
   }
 
-  revise(advisor: string | undefined, adviceId: string, note: string, shortTitle?: string, severity?: AdvisorSeverity): boolean {
+  revise(advisor: string | undefined, adviceId: string, note: string, shortTitle?: string, severity?: AdvisorSeverity, model?: string): boolean {
     if (!note.trim()) return false;
     const index = this.#items.findIndex(item => item.adviceId === adviceId && item.advisor === advisor);
     if (index < 0) return false;
@@ -45,6 +45,7 @@ export class AdvisorInbox {
       note,
       ...(shortTitle !== undefined ? { shortTitle: shortTitle || undefined } : {}),
       ...(severity !== undefined ? { severity } : {}),
+      ...(model !== undefined ? { model } : {}),
       updatedAt: Date.now(),
     };
     return true;

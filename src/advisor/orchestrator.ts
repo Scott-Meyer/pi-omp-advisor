@@ -140,6 +140,25 @@ export type AdvisorRuntimeStatus = "running" | "paused" | "quota_exhausted" | "e
 
 type AdvisorSession = Awaited<ReturnType<typeof createAgentSession>>["session"];
 
+/** Exact generating route for a tool call; live session state is only a fallback. */
+function advisorToolModelLabel(session: AdvisorSession, toolCallId: string): string | undefined {
+  const state = session.agent.state as typeof session.agent.state & { streamMessage?: AgentMessage | null };
+  const candidates = [state.streamingMessage ?? state.streamMessage, ...[...state.messages].reverse()]
+    .filter((message): message is AgentMessage => Boolean(message));
+  for (const message of candidates) {
+    if (message.role !== "assistant") continue;
+    const content = message.content;
+    if (!Array.isArray(content) || !content.some(part => part.type === "toolCall" && part.id === toolCallId)) continue;
+    if (typeof message.provider === "string" && typeof message.model === "string") {
+      return `${message.provider}/${message.model}`;
+    }
+  }
+  const active = state.model;
+  return active && typeof active.provider === "string" && typeof active.id === "string"
+    ? `${active.provider}/${active.id}`
+    : undefined;
+}
+
 function installAdvisorMemoryOrDispose(session: AdvisorSession, contextTokens?: number) {
   try {
     return installAdvisorContextWindow(session.agent, contextTokens);
@@ -197,6 +216,8 @@ interface ActiveAdvisor {
 
 export interface AdvisorStatusOverviewItem {
   name: string;
+  /** Live provider/model route, or the unresolved configured selector. */
+  model?: string;
   status: AdvisorRuntimeStatus;
   backlog: number;
   backlogMessages: number;
@@ -215,10 +236,10 @@ export interface OrchestratorHost {
   sendCustom(content: string, details: unknown, opts: { deliverAs: "steer"; triggerTurn?: boolean }): void;
   preserveAdvice(note: PendingAdvisorNote): void;
   pendingAdvice(advisor: string | undefined): PendingAdvisorNote[];
-  reviseAdvice(advisor: string | undefined, adviceId: string, note: string, shortTitle?: string, severity?: AdvisorSeverity): boolean;
+  reviseAdvice(advisor: string | undefined, adviceId: string, note: string, shortTitle?: string, severity?: AdvisorSeverity, model?: string): boolean;
   withdrawAdvice(advisor: string | undefined, adviceId: string): boolean;
   currentTool(): CurrentToolResult;
-  requestStop(advisor: string | undefined, targetId: string, reason: string): StopRequestResult;
+  requestStop(advisor: string | undefined, targetId: string, reason: string, model?: string): StopRequestResult;
   isStreaming(): boolean;
   isAborting(): boolean;
   /** Primary-owned latch, retained even when advisor runtimes are rebuilt. */
@@ -258,7 +279,7 @@ export class AdvisorOrchestrator {
   #immuneTurns: number = ADVISOR_IMMUNE_TURNS_DEFAULT;
   /** Advisors skipped because their explicit `model:` did not resolve, kept so
    *  `/advisor status` reports `no_model` rather than hiding them entirely. */
-  #noModelAdvisors: { name: string; status: AdvisorRuntimeStatus }[] = [];
+  #noModelAdvisors: { name: string; model?: string; status: AdvisorRuntimeStatus }[] = [];
 
   constructor(host: OrchestratorHost, private readonly createSession = createAgentSession) {
     this.#host = host;
@@ -266,6 +287,11 @@ export class AdvisorOrchestrator {
 
   get advisorNames(): string[] {
     return this.#advisors.map(a => a.config.name);
+  }
+
+  /** Human-visible advisor identities, always including the live model route. */
+  get advisorLabels(): string[] {
+    return this.#advisors.map(advisor => `${advisor.config.name} · ${this.#modelLabel(advisor) ?? "no model"}`);
   }
 
   /** Whether any live advisor intentionally follows the primary chat route. */
@@ -320,7 +346,7 @@ export class AdvisorOrchestrator {
    * to tail, so this reads the live agent state directly. Message arrays are
    * copied per call; contents are shared read-only with the advisor.
    */
-  transcriptSnapshot(name?: string): { name: string; streaming: boolean; messages: AgentMessage[] }[] {
+  transcriptSnapshot(name?: string): { name: string; model?: string; streaming: boolean; messages: AgentMessage[] }[] {
     const wanted = name?.toLowerCase();
     return this.#advisors
       .filter(a => !a.disposed && !a.halted)
@@ -332,6 +358,7 @@ export class AdvisorOrchestrator {
         const streamingMessage = state.streamingMessage ?? state.streamMessage;
         return {
           name: a.config.name,
+          model: this.#modelLabel(a),
           streaming: state.isStreaming,
           // Completed history excludes the in-flight response. Append its
           // read-only object so the viewer updates before message_end.
@@ -350,6 +377,7 @@ export class AdvisorOrchestrator {
     return [
       ...this.#advisors.map(a => ({
         name: a.config.name,
+        model: this.#modelLabel(a),
         status: a.status,
         backlog: a.queue.reduce((sum, item) => sum + item.turns, 0),
         backlogMessages: a.queue.reduce((sum, item) => sum + item.batch.length, 0),
@@ -365,6 +393,7 @@ export class AdvisorOrchestrator {
       })),
       ...this.#noModelAdvisors.map(a => ({
         name: a.name,
+        model: a.model,
         status: a.status,
         backlog: 0,
         backlogMessages: 0,
@@ -478,7 +507,7 @@ export class AdvisorOrchestrator {
         `[pi-omp-advisor] advisor "${config.name}": no model matched "${config.model}" — advisor not started. ` +
           `Expected "<provider>/<id>" naming a model pi has credentials for.`,
       );
-      this.#noModelAdvisors.push({ name: config.name, status: "no_model" });
+      this.#noModelAdvisors.push({ name: config.name, model: config.model, status: "no_model" });
       return undefined;
     }
 
@@ -504,12 +533,15 @@ export class AdvisorOrchestrator {
     // The emission guard gates at the tool-call boundary (passed into
     // makeAdviseTool), not here — see advise-tool.ts for why gating
     // downstream of AdviseState silently strands deferred notes.
+    let session!: AdvisorSession;
+    const currentModel = (toolCallId: string): string | undefined => advisorToolModelLabel(session, toolCallId);
     const routeAdvice = (note: PendingAdvisorNote) => this.#routeAdvice(sourceName, note);
     const { tool: adviseTool, controlTools, state: adviseState } = await makeAdviseTool(
       routeAdvice, note => emissionGuard.check(note), this.#pendingAccess(sourceName), undefined,
       stopEnabled ? this.#stopAccess(sourceName) : undefined,
       note => emissionGuard.remember(note),
       note => emissionGuard.forget(note),
+      currentModel,
     );
 
     const resourceLoader = new DefaultResourceLoader({
@@ -520,7 +552,6 @@ export class AdvisorOrchestrator {
     });
     await resourceLoader.reload();
 
-    let session: AdvisorSession;
     let memory: ReturnType<typeof installAdvisorContextWindow>;
     try {
       const created = await this.createSession({
@@ -780,6 +811,8 @@ export class AdvisorOrchestrator {
           ...ADVISOR_RESOURCE_ISOLATION,
         });
         await resourceLoader.reload();
+        let replacementSession!: AdvisorSession;
+        const currentModel = (toolCallId: string): string | undefined => advisorToolModelLabel(replacementSession, toolCallId);
         const routeAdvice = (note: PendingAdvisorNote) => this.#routeAdvice(advisor.sourceName, note);
         // Context rebuilds preserve the outbox and its IDs. The next review
         // receives a pending summary even though its model history is fresh.
@@ -789,6 +822,7 @@ export class AdvisorOrchestrator {
           advisor.stopEnabled ? this.#stopAccess(advisor.sourceName) : undefined,
           note => advisor.emissionGuard.remember(note),
           note => advisor.emissionGuard.forget(note),
+          currentModel,
         );
         const created = await this.createSession({
           sessionManager: SessionManager.inMemory(ctx.cwd),
@@ -801,6 +835,7 @@ export class AdvisorOrchestrator {
           customTools: [adviseTool, ...controlTools],
           resourceLoader,
         });
+        replacementSession = created.session;
         disableNestedHostAdvisor(ctx, created.session);
         const newMemory = installAdvisorMemoryOrDispose(created.session, advisor.config.contextTokens);
         if (advisor.disposed || advisor.generation !== rebuildGeneration) {
@@ -1102,8 +1137,8 @@ export class AdvisorOrchestrator {
     );
     return {
       currentTool: () => allowed() ? this.#host.currentTool() : { status: "disabled", activeCount: 0 },
-      requestStop: (targetId, reason) => allowed()
-        ? this.#host.requestStop(sourceName, targetId, reason)
+      requestStop: (targetId, reason, model) => allowed()
+        ? this.#host.requestStop(sourceName, targetId, reason, model)
         : { requested: false, status: "disabled", message: "This advisor is paused, disabled, or no longer active. No cancellation requested." },
     };
   }
@@ -1114,14 +1149,15 @@ export class AdvisorOrchestrator {
         ...this.#asideQueue.filter(note => note.advisor === sourceName).map(note => ({ ...note })),
         ...this.#host.pendingAdvice(sourceName),
       ],
-      revise: (adviceId, note, shortTitle, severity) => {
+      revise: (adviceId, note, shortTitle, severity, model) => {
         const index = this.#asideQueue.findIndex(item => item.adviceId === adviceId && item.advisor === sourceName);
-        if (index < 0) return this.#host.reviseAdvice(sourceName, adviceId, note, shortTitle, severity);
+        if (index < 0) return this.#host.reviseAdvice(sourceName, adviceId, note, shortTitle, severity, model);
         this.#asideQueue[index] = {
           ...this.#asideQueue[index]!,
           note,
           ...(shortTitle !== undefined ? { shortTitle: shortTitle || undefined } : {}),
           ...(severity !== undefined ? { severity } : {}),
+          ...(model !== undefined ? { model } : {}),
           updatedAt: Date.now(),
         };
         return true;
@@ -1133,6 +1169,13 @@ export class AdvisorOrchestrator {
         return true;
       },
     };
+  }
+
+  #modelLabel(advisor: ActiveAdvisor): string | undefined {
+    const model = advisor.session.agent.state.model;
+    return model && typeof model.provider === "string" && typeof model.id === "string"
+      ? `${model.provider}/${model.id}`
+      : undefined;
   }
 
   #deliveryChannel(severity: AdvisorSeverity | undefined) {
@@ -1159,7 +1202,14 @@ export class AdvisorOrchestrator {
       );
     }
 
-    const noteRecord: PendingAdvisorNote = { ...advice, advisor: sourceName };
+    const advisor = this.#advisors.find(candidate => candidate.sourceName === sourceName);
+    const noteRecord: PendingAdvisorNote = {
+      ...advice,
+      advisor: sourceName,
+      // New notes capture their generating route at tool execution. The
+      // fallback labels legacy/restored state that predates model provenance.
+      ...(!advice.model && advisor ? { model: this.#modelLabel(advisor) } : {}),
+    };
 
     if (this.#paused) {
       this.#host.preserveAdvice(noteRecord);

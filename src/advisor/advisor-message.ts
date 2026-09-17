@@ -88,13 +88,24 @@ class AdvisorMessageCard implements Component {
       blockers > 0 ? `${blockers} blocker${blockers === 1 ? "" : "s"}` : undefined,
       concerns > 0 ? `${concerns} concern${concerns === 1 ? "" : "s"}` : undefined,
     ].filter((part): part is string => part !== undefined);
+    const modelIdentities = new Set(this.notes
+      .filter(note => note.model)
+      .map(note => `${note.advisor ?? "default"} · ${note.model}`));
+    const sharedIdentity = this.notes.length > 0 && this.notes.every(note => note.model) && modelIdentities.size === 1
+      ? [...modelIdentities][0]
+      : undefined;
 
-    const header = truncateToWidth(`─ Advisor · ${summary.join(" · ")} `, insideWidth, "");
+    // Put the complete identity in the headline whenever the batch has one.
+    // The route is also repeated on a wrapped body line so narrow terminals
+    // never truncate away either the model or the ShortTitle.
+    const header = truncateToWidth(`─ Advisor${sharedIdentity ? ` · ${sharedIdentity}` : ""} · ${summary.join(" · ")} `, insideWidth, "");
     // A lone note with a title IS the card, so its title becomes the card's
     // headline in the top rule; multi-note cards keep titles on their own
     // label lines below so the header stays an honest summary.
     const loneTitle = this.notes.length === 1 ? this.notes[0]!.shortTitle : undefined;
-    const headline = loneTitle ? truncateToWidth(`─ ${loneTitle} `, insideWidth - visibleWidth(header), "") : "";
+    const fullHeadline = loneTitle ? `─ ${loneTitle} ` : "";
+    const titleInHeader = Boolean(loneTitle) && visibleWidth(fullHeadline) <= insideWidth - visibleWidth(header);
+    const headline = titleInHeader ? fullHeadline : "";
     const headerFill = "─".repeat(Math.max(0, insideWidth - visibleWidth(header) - visibleWidth(headline)));
     const lines: string[] = [border(`╭${header}${loneTitle ? this.theme.bold(headline) : ""}${headerFill}╮`)];
 
@@ -120,9 +131,13 @@ class AdvisorMessageCard implements Component {
         if (index > 0) frameLine("");
         const updateSuffix = note.updateOnId ? " (UPDATE)" : "";
         const label = (note.severity?.toUpperCase() ?? "NOTE") + updateSuffix;
-        const source = note.advisor ? `  ${this.theme.fg("dim", note.advisor)}` : "";
-        const title = note.shortTitle && !loneTitle ? `  ${this.theme.bold(note.shortTitle)}` : "";
-        frameLine(`${this.theme.fg(severityColor(note.severity), this.theme.bold(label))}${source}${title}`);
+        if (note.model) {
+          const route = `${note.advisor ?? "default"} · ${note.model}`;
+          for (const part of wrapped(this.theme.fg("dim", `MODEL  ${route}`))) frameLine(part);
+        }
+        const source = !sharedIdentity && note.advisor ? `  ${this.theme.fg("dim", note.advisor)}` : "";
+        const title = note.shortTitle && (!loneTitle || !titleInHeader) ? `  ${this.theme.bold(note.shortTitle)}` : "";
+        for (const part of wrapped(`${this.theme.fg(severityColor(note.severity), this.theme.bold(label))}${source}${title}`)) frameLine(part);
 
         for (const line of note.note.split("\n")) {
           for (const part of wrapped(this.theme.fg("customMessageText", line))) frameLine(part);

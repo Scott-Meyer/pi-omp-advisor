@@ -1,7 +1,7 @@
 {
   "name": "pi-omp-advisor",
-  "version": "0.5.2",
-  "description": "A live advisor for pi that watches your session as it works and sends advice mid-run — a port of oh-my-pi's advisor/watchdog onto pi's own Agent SDK.",
+  "version": "0.5.3",
+  "description": "A live advisor for pi and Oh My Pi that watches your session as it works and sends advice mid-run.",
   "license": "MIT",
   "author": "Scott Meyer",
   "type": "module",

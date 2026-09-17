@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Api, Model } from "@earendil-works/pi-ai";
-import { advisorSessionToolOptions, disableNestedHostAdvisor, findAdvisorModel, isOmpExtensionApi, isOmpHost, isOmpUserResumeMessage, ompAgentEndWasAborted, piHostModelRuntime } from "./host-compat.ts";
+import { advisorCustomMessageType, advisorSessionToolOptions, disableNestedHostAdvisor, findAdvisorModel, isOmpExtensionApi, isOmpHost, isOmpUserResumeMessage, ompAgentEndWasAborted, piHostModelRuntime } from "./host-compat.ts";
 
 const model = { provider: "fixture", id: "reviewer" } as Model<Api>;
 
@@ -13,8 +13,12 @@ test("host model lookup accepts OMP and Pi registry contracts", () => {
 });
 
 test("the initialization API distinguishes OMP before session_start", () => {
-  assert.equal(isOmpExtensionApi({ runtime: {}, pi: {} }), true);
-  assert.equal(isOmpExtensionApi({ registerCommand() {}, events: {} }), false);
+  const omp = { runtime: {}, pi: {} };
+  const pi = { registerCommand() {}, events: {} };
+  assert.equal(isOmpExtensionApi(omp), true);
+  assert.equal(isOmpExtensionApi(pi), false);
+  assert.equal(advisorCustomMessageType(omp), "pi-omp-advisor", "OMP avoids its native advisor renderer collision");
+  assert.equal(advisorCustomMessageType(pi), "advisor", "Pi retains its established transcript type");
 });
 
 test("OMP child sessions are restricted without passing string names as tool objects", () => {

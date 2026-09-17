@@ -43,7 +43,7 @@ async function harness(t: TestContext, review: Review, options?: { stop?: Primar
     sendCustom: (content, details, options) => { sent.push({ content, details, options }); },
     preserveAdvice: note => { inbox.enqueue(note); preserved.resolve(); },
     pendingAdvice: owner => inbox.pendingFor(owner),
-    reviseAdvice: (owner, id, note) => inbox.revise(owner, id, note),
+    reviseAdvice: (owner, id, note, shortTitle, severity, model) => inbox.revise(owner, id, note, shortTitle, severity, model),
     withdrawAdvice: (owner, id) => inbox.withdraw(owner, id),
     currentTool: () => options?.stop?.currentTool() ?? { status: "idle", activeCount: 0 },
     requestStop: (_advisor, id, reason) => options?.stop?.requestStop(id, reason) ?? { requested: false, status: "disabled", message: "No stop grant" },
@@ -90,6 +90,7 @@ async function harness(t: TestContext, review: Review, options?: { stop?: Primar
     const tools = options.customTools;
     const state = {
       messages: [] as AgentMessage[], isStreaming: false,
+      streamingMessage: undefined as AgentMessage | undefined,
       systemPrompt: options.resourceLoader?.getSystemPrompt() ?? "",
       tools,
       model: options.model ?? { contextWindow: 128_000 },
@@ -120,11 +121,25 @@ async function harness(t: TestContext, review: Review, options?: { stop?: Primar
             try {
               const view: AgentMessage[] = await session.agent.transformContext?.(state.messages, controller.signal) ?? state.messages;
               const text = view.map(message => JSON.stringify(message)).join("\n");
+              const requestModel = state.model as { provider?: string; id?: string };
               const result = await review(text, async (name, args = {}) => {
                 const tool = tools.find(candidate => candidate.name === name)!;
                 assert.ok(tool, `tool ${name} registered`);
-                const result = await tool.execute("test-call", args, controller.signal, undefined, {} as ExtensionContext);
-                return result.details;
+                const previousStreaming = state.streamingMessage;
+                if (typeof requestModel.provider === "string" && typeof requestModel.id === "string") {
+                  state.streamingMessage = {
+                    role: "assistant",
+                    provider: requestModel.provider,
+                    model: requestModel.id,
+                    content: [{ type: "toolCall", id: "test-call", name, arguments: args }],
+                  } as unknown as AgentMessage;
+                }
+                try {
+                  const result = await tool.execute("test-call", args, controller.signal, undefined, {} as ExtensionContext);
+                  return result.details;
+                } finally {
+                  state.streamingMessage = previousStreaming;
+                }
               }, controller.signal).catch(error => {
                 reviewFailures.push(error);
                 throw error;
@@ -206,6 +221,9 @@ test("a zero-config default advisor inherits the active chat model and thinking 
   });
 
   assert.deepEqual(result.orchestrator.advisorNames, ["default"]);
+  assert.deepEqual(result.orchestrator.advisorLabels, ["default · runtime-only/selected-with-cli"]);
+  assert.equal(result.orchestrator.statusOverview()[0]?.model, "runtime-only/selected-with-cli");
+  assert.equal(result.orchestrator.transcriptSnapshot()[0]?.model, "runtime-only/selected-with-cli");
   assert.equal(result.orchestrator.usesActiveChatModel, true);
   assert.equal(result.createdSessionOptions[0]?.model, activeModel);
   assert.equal(result.createdSessionOptions[0]?.thinkingLevel, "high");
@@ -215,6 +233,7 @@ test("a zero-config default advisor inherits the active chat model and thinking 
   assert.equal(result.sessionCount(), 1, "a model switch must not rebuild or discard the advisor runtime");
   assert.equal(result.advisorStates[0]?.model, switchedModel);
   assert.equal(result.advisorStates[0]?.thinkingLevel, "low");
+  assert.deepEqual(result.orchestrator.advisorLabels, ["default · runtime-only/switched-live"]);
 
   await result.orchestrator.resetRuntimesOnly();
   assert.equal(result.createdSessionOptions[1]?.model, switchedModel);
@@ -414,6 +433,37 @@ test("real review tools revise/withdraw deferred notes before review releases th
   assert.equal(await orchestrator.drainForExit(1000), true);
   assert.deepEqual(inbox.items.map(note => note.note), ["Check tag rule type"]);
   assert.equal(inbox.items[0]!.adviceId, firstId);
+});
+
+test("notes and revisions show the model that generated their tool call across a live route switch", async t => {
+  const oldRequestStarted = deferred();
+  const letOldModelAdvise = deferred();
+  let adviceId = "";
+  let review = 0;
+  const modelA = { provider: "route", id: "model-a", contextWindow: 128_000 } as NonNullable<ExtensionContext["model"]>;
+  const modelB = { provider: "route", id: "model-b", contextWindow: 128_000 } as NonNullable<ExtensionContext["model"]>;
+  const { orchestrator, inbox } = await harness(t, async (_text, call) => {
+    review++;
+    if (review === 1) {
+      oldRequestStarted.resolve();
+      await letOldModelAdvise.promise;
+      adviceId = (await call("advise", { note: "Generated by A", severity: "concern" })).adviceId;
+    } else {
+      await call("update_advice", { targetId: adviceId, note: "Revised by B" });
+    }
+  }, { activeModel: modelA });
+
+  update(orchestrator, true);
+  await oldRequestStarted.promise;
+  await orchestrator.followActiveChatModel(modelB, "low");
+  letOldModelAdvise.resolve();
+  assert.equal(await orchestrator.drainForExit(1000), true);
+  assert.equal(inbox.items[0]?.model, "route/model-a", "the in-flight A request is not mislabeled after live state switches to B");
+
+  update(orchestrator, true);
+  assert.equal(await orchestrator.drainForExit(1000), true);
+  assert.equal(inbox.items[0]?.note, "Revised by B");
+  assert.equal(inbox.items[0]?.model, "route/model-b", "an in-place revision adopts the route that generated its replacement text");
 });
 
 test("real review tools can withdraw deferred notes before review releases them", async t => {

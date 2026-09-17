@@ -4,14 +4,15 @@ This harness tests the npm-packed extension through a real, isolated OMP install
 
 It covers:
 
-- package manifest and extension loading;
+- package manifest, extension loading, zero-config default startup, and active-model following;
 - exact provider-visible child tool restrictions, including fail-closed removal of an explicitly requested `request_stop` grant because OMP 18.2.4 exposes no abort-in-progress state;
 - bounded provider context across large tool loops;
 - terminal settlement after OMP automatic continuation;
 - primary abort during a running tool, delayed blocker preservation, inbox delivery on a user-attributed `/skill:` RPC resume, and later blocker steering;
 - recovery after a malformed advisor tool stream, with provider-boundary validation that rejects orphaned, duplicate, or incomplete tool exchanges;
 - session-local disabling of OMP's native advisor inside the extension child while the primary native advisor remains enabled; and
-- the collision-free `/pi-advisor` command and host-aware help text.
+- the collision-free `/pi-advisor` command, host-aware help, and effective advisor model in detailed status;
+- with `RUN_TUI=1`, real PTY submission plus visible footer and delivered-card model identity.
 
 ## Run
 

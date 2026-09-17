@@ -228,6 +228,8 @@ test("a shortTitle rides with a note through delivery and rendering", () => {
   const rendered = formatAdvisorBatchContent(sent);
   assert.match(rendered, /title="Timer leak on early flush"/);
   assert.match(rendered, /guidance="weigh, don't blindly obey"/);
+  const withDisplayProvenance = formatAdvisorBatchContent([{ ...sent[0]!, model: "openai/gpt-5" }]);
+  assert.equal(withDisplayProvenance, rendered, "display-only model provenance must not change the primary model's advisory prompt");
 });
 
 test("the advise and revise tools accept the ShortTitle key end to end", async () => {

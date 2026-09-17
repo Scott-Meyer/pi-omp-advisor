@@ -65,11 +65,20 @@ with raw_path.open("wb") as log:
     child.expect_exact(b"\x1b[?25h\x1b[?7h", timeout=8)
     child.send(b"\r")
     try:
-        child.expect(b"extension-sentinel: running", timeout=10)
+        child.expect(b"extension-sentinel", timeout=10)
     except pexpect.TIMEOUT:
         # Preserve the full artifact; the assertions below report the missing
         # command result after a graceful exit attempt.
         pass
+    # Exercise actual note rendering too. The ordinary nit is preserved after
+    # the first completed response and is released above the next nonempty
+    # user prompt (OMP has no empty-Enter editor hook).
+    child.send(b"Reply exactly PRIMARY_COMPAT_OK.\r")
+    child.expect(b"PRIMARY_COMPAT_OK", timeout=12)
+    child.expect(b"Advisor inbox", timeout=12)
+    child.send(b"Continue with another short reply.\r")
+    child.expect(b"OMP extension sentinel", timeout=12)
+    wait_for_output_quiet(child, 0.2)
     child.sendcontrol("c")
     time.sleep(0.2)
     child.sendcontrol("c")
@@ -92,7 +101,14 @@ text = re.sub(r"\x1b[@-_]", "", text)
 text = text.replace("\r", "")
 text_path.write_text(text)
 
-required = ["pi-omp-advisor", "extension-sentinel: running", "caught up"]
+required = [
+    "pi-omp-advisor: extension-sentinel · compat/compat-model",
+    "extension-sentinel · compat/compat-model: running",
+    "caught up",
+    "Advisor · extension-sentinel · compat/compat-model",
+    "MODEL  extension-sentinel · compat/compat-model",
+    "OMP extension sentinel",
+]
 missing = [needle for needle in required if needle not in text]
 print(f"exitstatus={child.exitstatus} signalstatus={child.signalstatus}")
 print(f"raw={raw_path}")

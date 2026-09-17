@@ -24,11 +24,13 @@ export interface StopRequestResult {
 }
 export interface PrimaryStopAccess {
   currentTool(): CurrentToolResult;
-  requestStop(targetId: string, reason: string): StopRequestResult;
+  requestStop(targetId: string, reason: string, model?: string): StopRequestResult;
 }
 export interface StopReceipt {
   requestId: string;
   advisor?: string;
+  /** Advisor route that generated the stop request. */
+  model?: string;
   reason: string;
   target: PrimaryToolActivity;
   requestedAt: number;
@@ -98,7 +100,7 @@ export class PrimaryStopController {
     return { status: "ready", tool: { ...this.#tools.values().next().value!.target }, activeCount };
   }
 
-  requestStop(targetId: string, reason: string, advisor?: string): StopRequestResult {
+  requestStop(targetId: string, reason: string, advisor?: string, model?: string): StopRequestResult {
     const text = reason.trim();
     if (!text || text.length > 1000) {
       return { requested: false, status: "invalid_reason", message: "Give a concrete reason of 1–1000 characters. No cancellation requested." };
@@ -113,7 +115,7 @@ export class PrimaryStopController {
     // No await between target validation, latching, audit, and cancellation.
     // Reentrant or competing advisors cannot issue another request this run.
     const receipt: StopReceipt = {
-      requestId: randomUUID(), advisor, reason: text,
+      requestId: randomUUID(), advisor, model, reason: text,
       target: current.tool!, requestedAt: Date.now(),
     };
     this.#pending = receipt;

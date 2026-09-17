@@ -287,10 +287,20 @@ const text = JSON.stringify(report.events);
 if (!report.events.some(event => event.type === "response" && event.success)) throw new Error("/pi-advisor help failed");
 if (!text.includes("/pi-advisor status") || /\\?\/advisor (status|config|on|help)/.test(text)) throw new Error("OMP help used the native /advisor command name");
 NODE
+node "$ROOT/scripts/omp-compat/rpc-command-probe.mjs" "$OMP_BIN" "$WORK/zero-config-project" "/pi-advisor status" >"$WORK/status.rpc.json"
+node - "$WORK/status.rpc.json" <<'NODE'
+const fs = require("fs");
+const report = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+const text = JSON.stringify(report.events);
+if (!report.events.some(event => event.type === "response" && event.success)) throw new Error("/pi-advisor status failed");
+if (!text.includes("default · compat/compat-model")) throw new Error("OMP status omitted the advisor's effective model route");
+NODE
 
 if [[ "${RUN_TUI:-0}" == "1" ]]; then
-  printf '[tui] real PTY command submission\n'
+  printf '[tui] real PTY command submission and advisor-card rendering\n'
+  start_server direct-advice "$WORK/tui.requests.jsonl"
   python3 "$ROOT/scripts/omp-compat/tui-command-probe.py" "$OMP_BIN" "$WORK/project" "$WORK/tui"
+  stop_server
 fi
 
 printf 'OMP %s compatibility: PASS (%s)\n' "$actual_version" "$WORK"

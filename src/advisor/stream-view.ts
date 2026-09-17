@@ -20,6 +20,7 @@ import { formatSessionHistoryMarkdown } from "./session-history-format.ts";
 /** One advisor's current context, captured at a moment in time. */
 export interface AdvisorStreamSnapshot {
   name: string;
+  model?: string;
   streaming: boolean;
   messages: AgentMessage[];
 }
@@ -40,6 +41,8 @@ class AdvisorStreamPanel implements Component {
   #termHeight = 24;
   /** Wrapped-line count from the last render; scroll math operates on wrapped lines. */
   #lineCount = 0;
+  /** Body rows left after the overlay's wrapped header. */
+  #bodyRows = 6;
 
   constructor(
     private readonly theme: Theme,
@@ -64,13 +67,13 @@ class AdvisorStreamPanel implements Component {
 
   update(snapshot: AdvisorStreamSnapshot): void {
     const status = snapshot.streaming ? "THINKING" : "IDLE";
-    this.#header = `─ Advisor stream · ${snapshot.name} · ${status} · ↑↓ PgUp/PgDn Home/End · q/Esc closes `;
+    this.#header = `─ Advisor stream · ${snapshot.name}${snapshot.model ? ` · ${snapshot.model}` : ""} · ${status} · ↑↓ PgUp/PgDn Home/End · q/Esc closes `;
     this.#bodyLines = formatSessionHistoryMarkdown(snapshot.messages).split("\n");
     this.requestRender();
   }
 
   #clampScroll(): void {
-    const max = Math.max(0, this.#lineCount - this.#visibleRows);
+    const max = Math.max(0, this.#lineCount - this.#bodyRows);
     this.#scrollTop = Math.min(Math.max(0, this.#scrollTop), max);
   }
 
@@ -107,7 +110,7 @@ class AdvisorStreamPanel implements Component {
     }
     this.#clampScroll();
     // Landing on (or past) the end by scrolling resumes following new content.
-    if (this.#scrollTop >= this.#lineCount - this.#visibleRows) this.#follow = true;
+    if (this.#scrollTop >= this.#lineCount - this.#bodyRows) this.#follow = true;
     this.requestRender();
   }
 
@@ -118,14 +121,17 @@ class AdvisorStreamPanel implements Component {
     // inside the viewport, and the overlay's maxHeight would hide them.
     const wrapped = this.#bodyLines.flatMap(line => wrapTextWithAnsi(line, contentWidth));
     this.#lineCount = wrapped.length;
+    const header = wrapTextWithAnsi(this.theme.fg("accent", this.#header), contentWidth);
+    const overlayRows = Math.max(2, Math.floor(this.#termHeight * 0.8));
+    this.#bodyRows = Math.max(1, Math.min(this.#visibleRows, overlayRows - header.length));
     if (this.#follow) {
-      this.#scrollTop = Math.max(0, wrapped.length - this.#visibleRows);
+      this.#scrollTop = Math.max(0, wrapped.length - this.#bodyRows);
     }
     this.#clampScroll();
-    const visible = wrapped.slice(this.#scrollTop, this.#scrollTop + this.#visibleRows);
+    const visible = wrapped.slice(this.#scrollTop, this.#scrollTop + this.#bodyRows);
     // Always return the current frame. A `[]` return for an unchanged frame
     // hides the popup — the overlay only renders what this returns.
-    return [this.theme.fg("accent", this.#header), ...visible];
+    return [...header, ...visible];
   }
 }
 

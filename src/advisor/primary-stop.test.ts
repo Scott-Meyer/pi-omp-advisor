@@ -30,10 +30,11 @@ test("only an exact, sole active target with a reason can request cancellation",
   assert.equal(gate.requestStop(target.targetId, "Test").status, "parallel_tools");
   assert.deepEqual(events, []);
   gate.toolEnded("call-2", false, false);
-  const result = gate.requestStop(target.targetId, "Explicit cancellation test", "reviewer");
+  const result = gate.requestStop(target.targetId, "Explicit cancellation test", "reviewer", "openai/gpt-5");
   assert.equal(result.requested, true);
   assert.deepEqual(events, ["record", "abort"], "audit precedes the cancellation side effect");
   assert.equal(records[0]!.advisor, "reviewer");
+  assert.equal(records[0]!.model, "openai/gpt-5");
   assert.equal(records[0]!.reason, "Explicit cancellation test");
   assert.equal(records[0]!.target.toolCallId, "call-1");
 });

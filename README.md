@@ -1,7 +1,8 @@
 # pi-omp-advisor
 
-A live advisor that watches your [pi](https://github.com/earendil-works/pi)
-session as it works and can send it advice mid-run.
+A live advisor that watches [pi](https://github.com/earendil-works/pi) or
+[Oh My Pi (OMP)](https://github.com/can1357/oh-my-pi) as it works and can send
+it advice mid-run.
 
 > Not affiliated with, endorsed by, or supported by oh-my-pi / Stencil Labs, Inc.,
 > or by the pi project / Earendil Works. The name states what the code is a port
@@ -69,14 +70,19 @@ Queue and pause state are persisted as session metadata, so they survive
 extension reloads. Late ordinary notes, including default-severity nits, stay
 here for you to read and discard before submitting your next prompt. Typing alone
 does not release them. Asides queued during work are checked again at handoff in
-case the primary has since finished or been stopped. One more release gesture
-exists for the empty-chat case: with the session idle, the editor empty, and
-something queued, a bare `Enter` delivers the whole queue and starts the turn
-(pi drops empty submits before extensions' `input` event, so this hooks the
-editor's own input path). Because pi routes each keystroke to the focused
-component, an Enter claimed by any dialog, picker, or autocomplete never
-reaches this — it only fires on the honest empty-editor case. It also never
-fires while the advisor is paused or the agent is mid-run.
+case the primary has since finished or been stopped. On **pi**, one more release gesture exists for the empty-chat case: with the
+session idle, the editor empty, and something queued, a bare `Enter` delivers
+the whole queue and starts the turn (pi drops empty submits before extensions'
+`input` event, so this hooks the editor's own input path). An Enter claimed by a
+dialog, picker, or autocomplete never reaches it, and it never fires while the
+advisor is paused or the agent is mid-run.
+
+**OMP 18.2.4 does not expose pi's composable editor API**, so it cannot support
+that optional empty-Enter gesture. A preserved OMP note remains queued until the
+next accepted nonempty user prompt, or until you explicitly deliver it from
+`/pi-advisor inbox`. The inbox widget/card is not a receipt that the note already
+reached the primary agent; there is no automatic standalone delivery in this
+case.
 
 The advisor can inspect its own unsent notes with `pending_advice`, replace their
 text with `revise_advice`, or remove them with `withdraw_advice`. A small pending
@@ -116,10 +122,15 @@ without inventing missing results or treating the review as successful.
 Standing system/project instructions are not silently cut to make room.
 
 Use `/advisor config` to change each advisor's budget and primary-reasoning setting.
-`/advisor status` shows the effective estimated budget, retained message count,
-whole-history reset count, advisor wakes/model requests/tool calls, and pending
-turn batch. Changing this extension still requires `/reload` before the new
-policy is active.
+`/advisor status` shows each advisor's effective `provider/model`, estimated
+budget, retained message count, whole-history reset count, advisor wakes/model
+requests/tool calls, and pending turn batch. The live route also appears in the
+compact footer, stream selector/header, inbox labels, and delivered Advisor
+cards. Cards record the model that generated each `advise` tool call; an in-place
+revision updates that provenance to the model that generated the replacement
+text. Changing this extension still requires `/reload` before the new policy is
+active. On OMP, use the namespaced `/pi-advisor` command because `/advisor` is
+reserved by OMP's native advisor.
 
 ### Optional emergency stop
 
