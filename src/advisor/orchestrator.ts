@@ -54,6 +54,7 @@ import {
   advisorSessionToolOptions,
   disableNestedHostAdvisor,
   findAdvisorModel,
+  isOmpHost,
   loadAdvisorContextFiles,
   type AdvisorModel,
   type AdvisorModelRegistry,
@@ -150,6 +151,8 @@ function installAdvisorMemoryOrDispose(session: AdvisorSession, contextTokens?: 
 
 interface ActiveAdvisor {
   config: AdvisorConfig;
+  /** OMP 18.2.4 exposes abort() but no abort-in-progress state, so its stop grant must fail closed. */
+  stopEnabled: boolean;
   slug: string;
   /** Display source label — omitted (`undefined`) for the implicit/legacy
    *  default advisor so its rendered `<advisory>` output stays
@@ -418,8 +421,14 @@ export class AdvisorOrchestrator {
       return undefined;
     }
 
+    const stopRequested = config.tools?.includes("request_stop") === true;
+    const stopEnabled = stopRequested && !isOmpHost(ctx);
+    if (stopRequested && !stopEnabled) {
+      console.warn(`[pi-omp-advisor] advisor "${config.name}": request_stop is unavailable on OMP 18.2.4 because its extension context does not expose abort-in-progress state; the grant is disabled to fail closed.`);
+    }
     const toolNames = config.tools === undefined ? ADVISOR_DEFAULT_TOOL_NAMES : new Set(config.tools);
-    const resolvedToolNames = withAdviseTool([...toolNames].map(resolveAdvisorToolName));
+    const effectiveToolNames = [...toolNames].filter(name => stopEnabled || name !== "request_stop");
+    const resolvedToolNames = withAdviseTool(effectiveToolNames.map(resolveAdvisorToolName));
 
     const systemPrompt = await buildAdvisorSystemPrompt({
       watchdogBlocks,
@@ -437,7 +446,7 @@ export class AdvisorOrchestrator {
     const routeAdvice = (note: PendingAdvisorNote) => this.#routeAdvice(sourceName, note);
     const { tool: adviseTool, controlTools, state: adviseState } = await makeAdviseTool(
       routeAdvice, note => emissionGuard.check(note), this.#pendingAccess(sourceName), undefined,
-      config.tools?.includes("request_stop") ? this.#stopAccess(sourceName) : undefined,
+      stopEnabled ? this.#stopAccess(sourceName) : undefined,
       note => emissionGuard.remember(note),
       note => emissionGuard.forget(note),
     );
@@ -473,6 +482,7 @@ export class AdvisorOrchestrator {
 
     return {
       config,
+      stopEnabled,
       slug,
       sourceName,
       session,
@@ -687,7 +697,8 @@ export class AdvisorOrchestrator {
         const model = resolvedModel?.model;
         const thinkingLevel = resolvedModel?.thinkingLevel;
         const toolNames = advisor.config.tools === undefined ? ADVISOR_DEFAULT_TOOL_NAMES : new Set(advisor.config.tools);
-        const resolvedToolNames = withAdviseTool([...toolNames].map(resolveAdvisorToolName));
+        const effectiveToolNames = [...toolNames].filter(name => advisor.stopEnabled || name !== "request_stop");
+        const resolvedToolNames = withAdviseTool(effectiveToolNames.map(resolveAdvisorToolName));
         const systemPrompt = await buildAdvisorSystemPrompt({
           watchdogBlocks,
           sharedInstructions,
@@ -708,7 +719,7 @@ export class AdvisorOrchestrator {
         const { tool: adviseTool, controlTools, state: adviseState } = await makeAdviseTool(
           routeAdvice, note => advisor.emissionGuard.check(note),
           this.#pendingAccess(advisor.sourceName), advisor.adviseState,
-          advisor.config.tools?.includes("request_stop") ? this.#stopAccess(advisor.sourceName) : undefined,
+          advisor.stopEnabled ? this.#stopAccess(advisor.sourceName) : undefined,
           note => advisor.emissionGuard.remember(note),
           note => advisor.emissionGuard.forget(note),
         );
@@ -739,6 +750,8 @@ export class AdvisorOrchestrator {
         oldSession.dispose();
       } catch (err) {
         if (advisor.disposed || advisor.generation !== rebuildGeneration) continue;
+        oldMemory.dispose();
+        oldSession.dispose();
         advisor.status = "error";
         advisor.halted = true;
         console.error(`[pi-omp-advisor:${advisor.config.name}] failed to rebuild advisor session on context reset: ${String(err)}`);
@@ -919,7 +932,7 @@ export class AdvisorOrchestrator {
       // Tool events do not trigger reviews. If stop access was explicitly
       // granted, sample the controller only when a scheduled review is about
       // to run so queued metadata cannot point at a tool that has since ended.
-      if (advisor.config.tools?.includes("request_stop")) {
+      if (advisor.stopEnabled) {
         const currentTool = this.#host.currentTool();
         if (currentTool.status !== "idle") {
           const activity = `### Current primary tool state (live runtime metadata)\n${JSON.stringify(currentTool)}\nThis is a point-in-time snapshot. request_stop revalidates the target and fails closed if it ended, changed, became ambiguous, or is no longer the sole active call.`;
@@ -1018,7 +1031,7 @@ export class AdvisorOrchestrator {
 
   #stopAccess(sourceName: string | undefined): PrimaryStopAccess {
     const allowed = () => !this.#paused && this.#advisors.some(advisor =>
-      !advisor.disposed && advisor.sourceName === sourceName && advisor.config.tools?.includes("request_stop"),
+      !advisor.disposed && advisor.sourceName === sourceName && advisor.stopEnabled,
     );
     return {
       currentTool: () => allowed() ? this.#host.currentTool() : { status: "disabled", activeCount: 0 },
