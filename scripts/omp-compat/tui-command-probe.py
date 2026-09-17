@@ -23,6 +23,18 @@ child = pexpect.spawn(
     dimensions=(42, 150),
     timeout=8,
 )
+
+def wait_for_output_quiet(child: pexpect.spawn, quiet_seconds: float = 0.1) -> None:
+    # expect() can leave already-read repaint bytes in its search buffer. Drop
+    # those only after they have been recorded in logfile_read, then keep
+    # draining the PTY until the renderer has been quiet for one interval.
+    child.buffer = b""
+    while True:
+        try:
+            child.read_nonblocking(size=4096, timeout=quiet_seconds)
+        except pexpect.TIMEOUT:
+            return
+
 with raw_path.open("wb") as log:
     child.logfile_read = log
     # OMP's animated welcome screen consumes the first Enter as "skip". Wait
@@ -44,12 +56,12 @@ with raw_path.open("wb") as log:
     child.expect(b"pi-advisor  Open pi-omp-advisor", timeout=8)
     child.send(b"\t")
     child.send(b" status")
-    # Wait until the completion menu finishes painting before dismissing it;
-    # sending Escape while synchronized output is still active is flaky.
+    # Wait until the completion menu finishes painting before dismissing it.
+    # Otherwise its trailing cursor-show bytes can be mistaken for Escape's
+    # repaint and Escape+Enter can reach the input parser as Alt+Enter.
     child.expect(b"Show runtime, model, backlog, and queue state", timeout=8)
-    child.expect_exact(b"\x1b[?25h\x1b[?7h", timeout=8)
+    wait_for_output_quiet(child)
     child.send(b"\x1b")
-    # Likewise wait for the editor repaint before submitting the unchanged text.
     child.expect_exact(b"\x1b[?25h\x1b[?7h", timeout=8)
     child.send(b"\r")
     try:

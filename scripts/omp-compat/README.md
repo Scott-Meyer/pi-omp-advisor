@@ -33,4 +33,14 @@ Set `RUN_TUI=1` to include the real PTY command probe. It requires Python and `p
 OMP_BIN=/path/to/omp RUN_TUI=1 npm run test:omp
 ```
 
+By default the harness packs the current checkout. To validate the immutable package delivered by npm instead:
+
+```bash
+OMP_BIN=/path/to/omp \
+OMP_COMPAT_PACKAGE_SPEC=pi-omp-advisor@0.5.1 \
+RUN_TUI=1 npm run test:omp
+```
+
+The harness records that registry artifact's distribution metadata and the downloaded tarball's SHA-256 alongside its other evidence.
+
 The harness creates a temporary home, package staging directory, project, model configuration, and deterministic local OpenAI-compatible provider. Set `KEEP_OMP_COMPAT_WORK=1` to retain its artifacts, or `OMP_COMPAT_WORK_DIR=/absolute/path` to choose their location.

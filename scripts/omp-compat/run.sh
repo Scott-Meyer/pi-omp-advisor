@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 OMP_BIN=${OMP_BIN:-omp}
 EXPECTED_OMP_VERSION=${EXPECTED_OMP_VERSION:-18.2.4}
+PACKAGE_SPEC=${OMP_COMPAT_PACKAGE_SPEC:-}
 KEEP_OMP_COMPAT_WORK=${KEEP_OMP_COMPAT_WORK:-0}
 WORK=${OMP_COMPAT_WORK_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/pi-omp-advisor-omp.XXXXXX")}
 SERVER_PID=
@@ -31,8 +32,30 @@ fi
 
 mkdir -p "$WORK/pack" "$WORK/stage" "$WORK/home/.omp/agent" "$WORK/project/.omp/skills/resume-check"
 printf '{"private":true}\n' >"$WORK/stage/package.json"
-tarball=$(cd "$ROOT" && npm pack --silent --pack-destination "$WORK/pack")
+if [[ -n "$PACKAGE_SPEC" ]]; then
+  npm view "$PACKAGE_SPEC" version dist.integrity dist.shasum dist.tarball --json >"$WORK/npm-registry-dist.json"
+  tarball=$(npm pack "$PACKAGE_SPEC" --silent --pack-destination "$WORK/pack")
+else
+  tarball=$(cd "$ROOT" && npm pack --silent --pack-destination "$WORK/pack")
+fi
 npm install --prefix "$WORK/stage" --ignore-scripts --no-audit --no-fund "$WORK/pack/$tarball" >/dev/null
+shasum -a 256 "$WORK/pack/$tarball" >"$WORK/package-sha256.txt"
+if [[ -n "$PACKAGE_SPEC" ]]; then
+  node - "$WORK/npm-registry-dist.json" "$WORK/pack/$tarball" <<'NODE'
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const metadataValue = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+const metadata = Array.isArray(metadataValue) ? metadataValue[0] : metadataValue;
+const expectedSha1 = metadata?.dist?.shasum ?? metadata?.["dist.shasum"];
+const expectedIntegrity = metadata?.dist?.integrity ?? metadata?.["dist.integrity"];
+const tarball = fs.readFileSync(process.argv[3]);
+const sha1 = crypto.createHash("sha1").update(tarball).digest("hex");
+const integrity = `sha512-${crypto.createHash("sha512").update(tarball).digest("base64")}`;
+if (sha1 !== expectedSha1 || integrity !== expectedIntegrity) {
+  throw new Error("downloaded package checksums do not match npm registry metadata");
+}
+NODE
+fi
 
 export HOME="$WORK/home"
 export PI_CODING_AGENT_DIR="$HOME/.omp/agent"
