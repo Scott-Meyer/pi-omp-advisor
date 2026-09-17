@@ -263,6 +263,10 @@ the primary by its own round-trip time.
 - `/advisor status` — which advisors are running, and their state
 - `/advisor inbox` — inspect, deliver, or dismiss preserved advisories waiting
   for the next normal user prompt (`Ctrl+Shift+A` opens the same inbox)
+- `/advisor stream [name]` — open a read-only popup over one advisor's own
+  chat stream: its observations, reviews, and tool use as it works, updating
+  live. Deliberately rare-use — it exists for the cases where you really want
+  to see what the advisor is seeing, not as part of the normal loop
 - `/advisor pause` / `/advisor resume` — suspend or resume observation while
   retaining the queue (`Ctrl+Shift+R` toggles)
 - `/advisor clear` — immediately discard every queued advisory

@@ -13,7 +13,7 @@
  * `/advisor stream` command rather than any always-on surface.
  */
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { wrapTextWithAnsi, type Component } from "@earendil-works/pi-tui";
+import { matchesKey, wrapTextWithAnsi, type Component } from "@earendil-works/pi-tui";
 import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { formatSessionHistoryMarkdown } from "./session-history-format.ts";
 
@@ -75,41 +75,41 @@ class AdvisorStreamPanel implements Component {
   }
 
   handleInput(data: string): void {
-    // Close keys first: never swallowed by scrolling.
-    if (data === "q" || data === "\u001b") {
+    // Close keys first: never swallowed by scrolling. Terminal-aware
+    // matching (pi-tui matchesKey) so Kitty-protocol encodings (e.g. Esc as
+    // `\u001b[27u`) and alternate Home/End sequences work on every terminal
+    // pi supports, not just the legacy ones.
+    if (data === "q" || matchesKey(data, "escape")) {
       this.close();
       return;
     }
-    switch (data) {
-      case "\u001b[A":
-        this.#follow = false;
-        this.#scrollTop -= SCROLL_STEP;
-        break;
-      case "\u001b[B":
-        this.#scrollTop += SCROLL_STEP;
-        break;
-      case "\u001b[5~":
-        this.#follow = false;
-        this.#scrollTop -= PAGE_STEP;
-        break;
-      case "\u001b[6~":
-        this.#scrollTop += PAGE_STEP;
-        break;
-      case "\u001b[H":
-        this.#follow = false;
-        this.#scrollTop = 0;
-        break;
-      case "\u001b[F":
-        this.#scrollTop = this.#lineCount;
-        break;
-      default:
-        return; // Not a key we own; ignore rather than guess.
+    if (matchesKey(data, "up")) {
+      this.#follow = false;
+      this.#scrollTop -= SCROLL_STEP;
+    } else if (matchesKey(data, "down")) {
+      this.#scrollTop += SCROLL_STEP;
+    } else if (data === "\u001b[5~") {
+      // Page keys have no KeyId in pi-tui's key set, so this stays a legacy
+      // xterm match; up/down/home/end/end-adjacent keys are protocol-aware.
+      this.#follow = false;
+      this.#scrollTop -= PAGE_STEP;
+    } else if (data === "\u001b[6~") {
+      this.#scrollTop += PAGE_STEP;
+    } else if (matchesKey(data, "home")) {
+      this.#follow = false;
+      this.#scrollTop = 0;
+    } else if (matchesKey(data, "end")) {
+      this.#scrollTop = this.#lineCount;
+      // End is an explicit "show me the newest and keep following it" — set
+      // follow directly rather than via the at-end comparison, which fails
+      // for a transcript that currently fits the viewport (zero scroll).
+      this.#follow = true;
+    } else {
+      return; // Not a key we own; ignore rather than guess.
     }
     this.#clampScroll();
-    // Landing on (or past) the end resumes following new content.
-    if (this.#lineCount > this.#visibleRows && this.#scrollTop >= this.#lineCount - this.#visibleRows) {
-      this.#follow = true;
-    }
+    // Landing on (or past) the end by scrolling resumes following new content.
+    if (this.#scrollTop >= this.#lineCount - this.#visibleRows) this.#follow = true;
     this.requestRender();
   }
 

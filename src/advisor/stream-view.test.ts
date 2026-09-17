@@ -50,8 +50,9 @@ test("the stream popup renders the advisor context live, follows the end, and cl
   t.mock.timers.tick(800);
   assert.ok(mounted!.render(80).join("\n").includes("marker-2 reviewed"), "polling follows new content");
 
-  // Closing via q resolves the popup with no result value.
-  mounted!.handleInput("q");
+  // Closing via Kitty-protocol Escape (\u001b[27u) resolves the popup — the
+  // panel matches keys terminal-aware, not as raw legacy escape strings.
+  mounted!.handleInput("\u001b[27u");
   assert.equal(await closed, null);
 
   // dispose cleared the poll timer: no further updates reach a closed panel.
@@ -94,6 +95,34 @@ test("scrolling up pins the view and landing back at the end resumes following",
   t.mock.timers.tick(800);
   assert.ok(visible("marker-turn-42"), "following resumes once back at the end");
 
-  mounted!.handleInput("\u001b");
+  mounted!.handleInput("q");
   assert.equal(await closed, null, "Escape closes the popup");
+});
+
+test("End on a short transcript resumes following once content outgrows the viewport", async t => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  const messages: AgentMessage[] = [userMessage("short-1")];
+  const snapshot = (): AdvisorStreamSnapshot => ({ name: "reviewer", streaming: false, messages: [...messages] });
+
+  let mounted: Mounted | undefined;
+  const closed = showAdvisorStream(
+    ((factory: any, _opts: any) =>
+      new Promise<string | null>(resolve => {
+        mounted = factory({ requestRender: () => {} }, plainTheme, {}, (value: string | null) => resolve(value)) as Mounted;
+      })) as any,
+    snapshot,
+  );
+
+  // The transcript fits: Home disables following, End must restore it even
+  // though there was never anything to scroll.
+  mounted!.handleInput("\u001b[H");
+  mounted!.handleInput("\u001b[F");
+  for (let i = 2; i <= 40; i++) messages.push(userMessage(`grown-${i}`));
+  t.mock.timers.tick(800);
+  const visible = (text: string): boolean => mounted!.render(80).join("\n").includes(text);
+  assert.ok(visible("grown-40"), "the newest content is on screen after End + growth");
+  assert.ok(!visible("short-1"), "a full viewport shows the end, not the start");
+
+  mounted!.handleInput("q");
+  await closed;
 });
