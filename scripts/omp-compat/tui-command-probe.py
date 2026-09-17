@@ -44,9 +44,13 @@ with raw_path.open("wb") as log:
     child.expect(b"pi-advisor  Open pi-omp-advisor", timeout=8)
     child.send(b"\t")
     child.send(b" status")
-    # Enter would otherwise accept the highlighted argument completion first.
+    # Wait until the completion menu finishes painting before dismissing it;
+    # sending Escape while synchronized output is still active is flaky.
     child.expect(b"Show runtime, model, backlog, and queue state", timeout=8)
+    child.expect_exact(b"\x1b[?25h\x1b[?7h", timeout=8)
     child.send(b"\x1b")
+    # Likewise wait for the editor repaint before submitting the unchanged text.
+    child.expect_exact(b"\x1b[?25h\x1b[?7h", timeout=8)
     child.send(b"\r")
     try:
         child.expect(b"extension-sentinel: running", timeout=10)
