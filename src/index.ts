@@ -46,6 +46,8 @@
  *   process restarts. `/advisor config` exposes the same fields plus full
  *   roster editing.
  */
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
@@ -65,14 +67,18 @@ import { DEFAULT_ADVISOR_CONTEXT_TOKENS, MIN_ADVISOR_CONTEXT_TOKENS, type Contex
 import { FileMutationTracker } from "./advisor/file-diff.ts";
 import { advisorCustomMessageType, isOmpExtensionApi, isOmpHost, isOmpUserResumeMessage, ompAgentEndWasAborted, piHostModelRuntime } from "./advisor/host-compat.ts";
 import {
+  DEFAULT_FLUSH_ON_SETTLED,
   DEFAULT_FLUSH_TIMEOUT_MS,
   DEFAULT_MAX_BEHIND,
   discoverAdvisorConfigs,
+  isEnoent,
   loadWatchdogConfigFile,
   resolveAdvisorConfigEditPath,
   saveWatchdogConfigFile,
+  slugifyAdvisorName,
   type AdvisorConfig,
   type AdvisorConfigScope,
+  type DiscoveredAdvisors,
   type WatchdogConfigDoc,
 } from "./advisor/watchdog-config.ts";
 
@@ -112,6 +118,159 @@ export function getAdvisorArgumentCompletions(argumentPrefix: string): Autocompl
   const prefix = argumentPrefix.trimStart().toLowerCase();
   const matches = ADVISOR_COMMAND_COMPLETIONS.filter(item => item.value.startsWith(prefix));
   return matches.length > 0 ? [...matches] : null;
+}
+
+/**
+ * Extract a clean, human-readable model identifier by stripping
+ * gateway or provider prefix paths (e.g. "ai-gw-openai/openai/gpt-6-astra" -> "gpt-6-astra").
+ */
+export function cleanModelId(model: string | undefined): string | undefined {
+  if (!model) return undefined;
+  const trimmed = model.trim();
+  if (!trimmed) return undefined;
+  const segments = trimmed.split("/").filter(Boolean);
+  return segments.length > 0 ? segments[segments.length - 1] : trimmed;
+}
+
+/**
+ * Format the compact status footer string for ctx.ui.setStatus("advisor", ...).
+ */
+export function formatAdvisorStatusBar(options: {
+  runtimeEnabled: boolean;
+  paused: boolean;
+  starting?: boolean;
+  queuedCount?: number;
+  advisors?: Array<{ name: string; model?: string; status?: string }>;
+}): string {
+  const { runtimeEnabled, paused, starting = false, queuedCount = 0, advisors = [] } = options;
+  const queuedStr = queuedCount > 0 ? ` · ${queuedCount} queued` : "";
+
+  if (!runtimeEnabled) {
+    return "advisor: OFF";
+  }
+
+  if (starting) {
+    return "advisor: starting…";
+  }
+
+  const unusable = advisors.filter(a => a.status === "no_model");
+  if (advisors.length > 0 && unusable.length === advisors.length) {
+    return "advisor: OFF (no model)";
+  }
+
+  const activeAdvisors = advisors.filter(a => a.status === "running" || a.status === "paused");
+  if (activeAdvisors.length === 0) {
+    return paused ? `advisor: PAUSED${queuedStr}` : "advisor: OFF";
+  }
+
+  if (paused) {
+    if (activeAdvisors.length === 1) {
+      const clean = cleanModelId(activeAdvisors[0]!.model) ?? "no model";
+      return `advisor: ${clean} PAUSED${queuedStr}`;
+    }
+    return `advisors: ${activeAdvisors.length} PAUSED${queuedStr}`;
+  }
+
+  if (activeAdvisors.length === 1) {
+    const item = activeAdvisors[0]!;
+    const clean = cleanModelId(item.model) ?? "no model";
+    const name = item.name;
+    const label = (name === "default" || name === "advisor") ? clean : `${name} · ${clean}`;
+    return `advisor: ${label} ON${queuedStr}`;
+  }
+
+  return `advisors: ${activeAdvisors.length} active ON${queuedStr}`;
+}
+
+/**
+ * Format a human-readable summary of the current economy settings.
+ */
+export function formatEconomySummary(options: {
+  maxBehind?: number;
+  flushTimeoutMs?: number;
+}): string {
+  const turns = options.maxBehind ?? DEFAULT_MAX_BEHIND;
+  const ms = options.flushTimeoutMs ?? DEFAULT_FLUSH_TIMEOUT_MS;
+  const timeStr = ms >= 60_000 ? `${Math.round(ms / 60_000)}m` : `${Math.round(ms / 1000)}s`;
+  return `${turns} ${turns === 1 ? "turn" : "turns"}, ${timeStr} timeout`;
+}
+
+export type ApplyAdvisorModelResult =
+  | { cancelled: true }
+  | { cancelled?: false; filePath: string; doc: WatchdogConfigDoc };
+
+/**
+ * Apply a model selection to the appropriate configuration file, preserving
+ * the effective advisor's identity and custom settings (tools, instructions, enabled, etc.).
+ */
+export async function applyAdvisorModelSelection(options: {
+  cwd: string;
+  agentDir: string;
+  pickedModel: string | undefined;
+  targetScope?: AdvisorConfigScope;
+  targetAdvisorName?: string;
+  effectiveAdvisor?: AdvisorConfig;
+  askScope?: (choices: string[]) => Promise<string | undefined>;
+}): Promise<ApplyAdvisorModelResult> {
+  const dirs = { projectDir: options.cwd, agentDir: options.agentDir };
+  const projectFilePath = await resolveAdvisorConfigEditPath("project", dirs);
+  const userFilePath = await resolveAdvisorConfigEditPath("user", dirs);
+  const hasProjectConfig = await fs.access(projectFilePath).then(() => true).catch(() => false);
+  const hasUserConfig = await fs.access(userFilePath).then(() => true).catch(() => false);
+
+  let scope: AdvisorConfigScope;
+  if (options.targetScope) {
+    scope = options.targetScope;
+  } else if (!hasProjectConfig && hasUserConfig && options.askScope) {
+    const scopeChoice = await options.askScope([
+      `This project only (override in ${path.basename(projectFilePath)})`,
+      `Every project on this machine (update ${path.basename(userFilePath)})`,
+    ]);
+    if (!scopeChoice) return { cancelled: true };
+    scope = scopeChoice.startsWith("This project") ? "project" : "user";
+  } else {
+    scope = "project";
+  }
+
+  const filePath = scope === "user" ? userFilePath : projectFilePath;
+  const doc = await loadWatchdogConfigFile(filePath);
+
+  const isUserScope = scope === "user";
+  const targetName = options.targetAdvisorName ?? (
+    isUserScope
+      ? (doc.advisors[0]?.name ?? "default")
+      : (doc.advisors[0]?.name ?? options.effectiveAdvisor?.name ?? "default")
+  );
+  const targetSlug = slugifyAdvisorName(targetName);
+  let targetEntry = doc.advisors.find(a => slugifyAdvisorName(a.name) === targetSlug);
+
+  const baseline: AdvisorConfig = isUserScope
+    ? (targetEntry ?? { name: targetName })
+    : (targetEntry ?? options.effectiveAdvisor ?? { name: targetName });
+
+  if (!targetEntry) {
+    targetEntry = {
+      name: targetName,
+      ...(baseline.tools ? { tools: [...baseline.tools] } : {}),
+      ...(baseline.instructions ? { instructions: baseline.instructions } : {}),
+      ...(baseline.contextTokens !== undefined ? { contextTokens: baseline.contextTokens } : {}),
+      ...(baseline.includePrimaryThinking !== undefined ? { includePrimaryThinking: baseline.includePrimaryThinking } : {}),
+      ...(baseline.maxBehind !== undefined ? { maxBehind: baseline.maxBehind } : {}),
+      ...(baseline.flushTimeoutMs !== undefined ? { flushTimeoutMs: baseline.flushTimeoutMs } : {}),
+      ...(baseline.flushOnSettled !== undefined ? { flushOnSettled: baseline.flushOnSettled } : {}),
+      ...(baseline.enabled !== undefined ? { enabled: baseline.enabled } : {}),
+    };
+    doc.advisors.push(targetEntry);
+  }
+
+  if (options.pickedModel) {
+    targetEntry.model = options.pickedModel;
+  } else {
+    delete targetEntry.model;
+  }
+
+  await saveWatchdogConfigFile(filePath, doc);
+  return { cancelled: false, filePath, doc };
 }
 
 /**
@@ -168,6 +327,7 @@ export default function (pi: ExtensionAPI) {
   // changed again.
   let runtimeOverride: boolean | undefined;
   let runtimeEnabled = false; // effective value, recomputed by startOrchestrator / on|off
+  let isStarting = false;
   /** Run mode/host of the live session, captured at session_start. */
   let lastMode: ExtensionContext["mode"] | undefined;
   let ompHost = isOmpExtensionApi(pi);
@@ -186,9 +346,16 @@ export default function (pi: ExtensionAPI) {
   let advisorRosterAvailable = false;
   let lastDiscoveredMainEnabled: boolean | undefined; // last-discovered `main:` field, for the status line
   let lastDiscoveredSubagentsEnabled: boolean | undefined; // last-discovered `subagents:` field, for the status line
+  let lastDiscoveredConfigs: DiscoveredAdvisors | undefined;
   // Derived from configuration, not the momentarily live child list, so route
   // events remain well-defined while child state is changing.
   let inheritedRouteConfigured = true;
+
+  function getEffectiveAdvisor(name?: string): AdvisorConfig {
+    const targetName = name ?? orchestrator?.advisorNames[0] ?? lastDiscoveredConfigs?.advisors[0]?.name ?? "default";
+    const slug = slugifyAdvisorName(targetName);
+    return lastDiscoveredConfigs?.advisors.find(a => slugifyAdvisorName(a.name) === slug) ?? { name: targetName };
+  }
 
   function isActive(): boolean {
     return !advisorPaused && runtimeEnabled && advisorRosterAvailable && !!orchestrator && orchestrator.advisorNames.length > 0;
@@ -253,16 +420,14 @@ export default function (pi: ExtensionAPI) {
 
   function updateAdvisorStatus(ctx = sessionContext): void {
     if (!ctx?.hasUI) return;
-    if (advisorPaused) {
-      const routes = orchestrator?.advisorLabels.join(", ");
-      ctx.ui.setStatus("advisor", `pi-omp-advisor: paused${routes ? ` · ${routes}` : ""}${inbox.items.length > 0 ? ` · ${inbox.items.length} queued` : ""}`);
-      return;
-    }
-    if (!runtimeEnabled) {
-      ctx.ui.setStatus("advisor", "pi-omp-advisor: off");
-      return;
-    }
-    ctx.ui.setStatus("advisor", `pi-omp-advisor: ${orchestrator?.advisorLabels.join(", ") || "no advisors configured"}`);
+    const overview = orchestrator?.statusOverview();
+    const text = formatAdvisorStatusBar({
+      runtimeEnabled,
+      paused: advisorPaused,
+      queuedCount: inbox.items.length,
+      advisors: overview,
+    });
+    ctx.ui.setStatus("advisor", text);
   }
 
   function notePreview(item: QueuedAdvisorNote, limit = 100): string {
@@ -566,37 +731,44 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function startOrchestrator(ctx: ExtensionContext, force = false): Promise<void> {
-    await orchestrator?.disposeAll();
-    const agentDir = getAgentDir();
-    const discovered = await discoverAdvisorConfigs(ctx.cwd, agentDir);
-    lastDiscoveredMainEnabled = discovered.mainEnabled;
-    lastDiscoveredSubagentsEnabled = discovered.subagentsEnabled;
-    inheritedRouteConfigured = discovered.advisors.length === 0 ||
-      discovered.advisors.some(advisor => advisor.enabled !== false && advisor.model === undefined);
-    // Recompute the effective enablement unless the user already made an
-    // explicit /advisor on|off choice for this process, which always wins.
-    // A normal session defaults on even when discovery finds no YAML: the
-    // orchestrator turns the empty roster into the implicit `default` advisor.
-    runtimeEnabled = runtimeOverride ?? (force || configDefaultEnabled(discovered));
-    advisorRosterAvailable = discovered.advisors.length > 0 || discovered.configFound || runtimeEnabled || force;
-    if (!advisorRosterAvailable || !runtimeEnabled) {
-      orchestrator = undefined;
-      return;
-    }
-    // Preserve Pi's existing child-session runtime contract without forcing
-    // OMP to resolve Pi's unsupported static ModelRuntime export.
-    const piModelRuntime = isOmpHost(ctx)
-      ? undefined
-      : piHostModelRuntime(ctx) ?? await (await import("@earendil-works/pi-coding-agent")).ModelRuntime.create();
-    orchestrator = new AdvisorOrchestrator(makeHost(ctx));
-    // Armed here, not only in the `input` handler below: a headless caller must
-    // never have an advisor note silently start a turn, and waiting for the
-    // first `input` event leaves that unguarded from session_start until the
-    // first prompt.
-    orchestrator.setPreserveOnly(isHeadlessMode(ctx.mode));
-    await orchestrator.start(discovered, ctx, piModelRuntime ?? ctx.modelRegistry, agentDir, piModelRuntime, activeThinkingLevel(ctx));
-    if (advisorPaused) await orchestrator.setPaused(true);
+    isStarting = true;
     updateAdvisorStatus(ctx);
+    try {
+      await orchestrator?.disposeAll();
+      const agentDir = getAgentDir();
+      const discovered = await discoverAdvisorConfigs(ctx.cwd, agentDir);
+      lastDiscoveredConfigs = discovered;
+      lastDiscoveredMainEnabled = discovered.mainEnabled;
+      lastDiscoveredSubagentsEnabled = discovered.subagentsEnabled;
+      inheritedRouteConfigured = discovered.advisors.length === 0 ||
+        discovered.advisors.some(advisor => advisor.enabled !== false && advisor.model === undefined);
+      // Recompute the effective enablement unless the user already made an
+      // explicit /advisor on|off choice for this process, which always wins.
+      // A normal session defaults on even when discovery finds no YAML: the
+      // orchestrator turns the empty roster into the implicit `default` advisor.
+      runtimeEnabled = runtimeOverride ?? (force || configDefaultEnabled(discovered));
+      advisorRosterAvailable = discovered.advisors.length > 0 || discovered.configFound || runtimeEnabled || force;
+      if (!advisorRosterAvailable || !runtimeEnabled) {
+        orchestrator = undefined;
+        return;
+      }
+      // Preserve Pi's existing child-session runtime contract without forcing
+      // OMP to resolve Pi's unsupported static ModelRuntime export.
+      const piModelRuntime = isOmpHost(ctx)
+        ? undefined
+        : piHostModelRuntime(ctx) ?? await (await import("@earendil-works/pi-coding-agent")).ModelRuntime.create();
+      orchestrator = new AdvisorOrchestrator(makeHost(ctx));
+      // Armed here, not only in the `input` handler below: a headless caller must
+      // never have an advisor note silently start a turn, and waiting for the
+      // first `input` event leaves that unguarded from session_start until the
+      // first prompt.
+      orchestrator.setPreserveOnly(isHeadlessMode(ctx.mode));
+      await orchestrator.start(discovered, ctx, piModelRuntime ?? ctx.modelRegistry, agentDir, piModelRuntime, activeThinkingLevel(ctx));
+      if (advisorPaused) await orchestrator.setPaused(true);
+    } finally {
+      isStarting = false;
+      updateAdvisorStatus(ctx);
+    }
   }
 
   pi.on("session_start", async (_event, ctx) => {
@@ -806,56 +978,548 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  async function runConfigMenu(ctx: ExtensionCommandContext): Promise<void> {
-    const scopeChoice = await ctx.ui.select("Configure pi-omp-advisor's advisors for…", [
-      "This project only (WATCHDOG.yml)",
-      "Every project on this machine (~/.pi/agent/WATCHDOG.yml)",
-    ]);
-    if (scopeChoice === undefined) return;
-    const scope: AdvisorConfigScope = scopeChoice.startsWith("This project") ? "project" : "user";
+  async function pickAdvisorModel(
+    ctx: ExtensionCommandContext,
+    current: string | undefined,
+  ): Promise<string | undefined | null> {
+    const availableModels = ctx.modelRegistry.getAvailable();
+    const NO_OVERRIDE = "(use the current Pi session model — no override)";
+    const labels = [NO_OVERRIDE, ...availableModels.map(m => `${m.provider}/${m.id} — ${m.name}`)];
+    const choice = await ctx.ui.select(`Model (current: ${current ? (cleanModelId(current) ?? current) : "current Pi session model"})`, labels);
+    if (choice === undefined) return null;
+    if (choice === NO_OVERRIDE) return undefined;
+    const model = availableModels[labels.indexOf(choice) - 1];
+    return model ? `${model.provider}/${model.id}` : null;
+  }
+
+  async function pickAndApplyAdvisorModel(
+    ctx: ExtensionCommandContext,
+    targetScope?: AdvisorConfigScope,
+    targetAdvisorName?: string,
+    targetCurrentModel?: string,
+  ): Promise<boolean> {
+    const isUserScope = targetScope === "user";
+    const effective = getEffectiveAdvisor(targetAdvisorName);
+    const currentModel = targetCurrentModel !== undefined ? targetCurrentModel : (isUserScope ? undefined : effective.model);
+    const picked = await pickAdvisorModel(ctx, currentModel);
+    if (picked === null) return false;
+
+    try {
+      const result = await applyAdvisorModelSelection({
+        cwd: ctx.cwd,
+        agentDir: getAgentDir(),
+        pickedModel: picked,
+        targetScope,
+        targetAdvisorName,
+        effectiveAdvisor: effective,
+        askScope: choices => ctx.ui.select("Save advisor model change for…", choices),
+      });
+
+      if (result.cancelled) return false;
+
+      const clean = cleanModelId(picked);
+      const appliedName = targetAdvisorName ?? effective.name;
+      ctx.ui.notify(
+        picked
+          ? `Advisor "${appliedName}" model set to ${clean} (${picked}) in ${result.filePath}.`
+          : `Advisor "${appliedName}" set to follow session model in ${result.filePath}.`,
+        "info",
+      );
+      if (runtimeEnabled) {
+        await startOrchestrator(ctx);
+      } else {
+        const agentDir = getAgentDir();
+        lastDiscoveredConfigs = await discoverAdvisorConfigs(ctx.cwd, agentDir);
+      }
+      updateAdvisorStatus(ctx);
+      return true;
+    } catch (err) {
+      ctx.ui.notify(`Failed to save model: ${err instanceof Error ? err.message : String(err)}`, "error");
+      return false;
+    }
+  }
+
+  async function runEconomyMenu(
+    ctx: ExtensionCommandContext,
+    targetScope?: AdvisorConfigScope,
+  ): Promise<boolean> {
     const dirs = { projectDir: ctx.cwd, agentDir: getAgentDir() };
-    const filePath = await resolveAdvisorConfigEditPath(scope, dirs);
+    const projectFilePath = await resolveAdvisorConfigEditPath("project", dirs);
+    const userFilePath = await resolveAdvisorConfigEditPath("user", dirs);
+    const hasProjectConfig = await fs.access(projectFilePath).then(() => true).catch(() => false);
+    const hasUserConfig = await fs.access(userFilePath).then(() => true).catch(() => false);
+
+    let scope: AdvisorConfigScope;
+    if (targetScope) {
+      scope = targetScope;
+    } else if (!hasProjectConfig && hasUserConfig) {
+      const scopeChoice = await ctx.ui.select(
+        "Configure Economy & Cadence for…",
+        [
+          `This project only (${path.basename(projectFilePath)})`,
+          `Every project on this machine (${path.basename(userFilePath)})`,
+        ],
+      );
+      if (!scopeChoice) return false;
+      scope = scopeChoice.startsWith("This project") ? "project" : "user";
+    } else {
+      scope = "project";
+    }
+
+    const filePath = scope === "user" ? userFilePath : projectFilePath;
     let doc: WatchdogConfigDoc;
     try {
       doc = await loadWatchdogConfigFile(filePath);
     } catch (err) {
-      // Editing on top of a file we could not parse would save a blank config
-      // over it on the first Save. Refuse instead, and say which file.
       ctx.ui.notify(err instanceof Error ? err.message : String(err), "error");
-      return;
+      return false;
     }
 
-    const availableModels = ctx.modelRegistry.getAvailable();
-    const NO_OVERRIDE = "(use the current Pi session model — no override)";
+    const effective = getEffectiveAdvisor(doc.advisors[0]?.name);
+    const isUserScope = scope === "user";
+    const targetName = isUserScope
+      ? (doc.advisors[0]?.name ?? "default")
+      : (doc.advisors[0]?.name ?? effective.name ?? "default");
+    const targetSlug = slugifyAdvisorName(targetName);
 
-    async function showConfigHelp(): Promise<void> {
-      await ctx.ui.select(
-        [
-          "WATCHDOG.yml configuration",
-          "",
-          "Shared instructions apply to every configured advisor.",
-          "Main/subagents choose which Pi process types are watched by default.",
-          "Backpressure can briefly pause the primary when an advisor falls behind; off is the normal default.",
-          "Immune turns prevent repeated concerns from interrupting; blockers remain interrupting.",
-          "Each advisor can choose a model, tools, context budget, specialization instructions, and whether it is enabled.",
-          "The context budget covers estimated input tokens, including instructions and tools. Older history expires instead of being summarized.",
-          "Primary reasoning is excluded by default; including it is independent of the advisor model's own thinking level.",
-          "Changes are not written until you choose Save.",
-        ].join("\n"),
-        ["Back"],
-      );
+    const baseline: AdvisorConfig = isUserScope
+      ? (doc.advisors.find(a => slugifyAdvisorName(a.name) === targetSlug) ?? { name: targetName })
+      : (
+          doc.advisors.find(a => slugifyAdvisorName(a.name) === targetSlug) ??
+          {
+            ...effective,
+            name: targetName,
+            maxBehind: effective.maxBehind ?? lastDiscoveredConfigs?.maxBehind,
+            flushTimeoutMs: effective.flushTimeoutMs ?? lastDiscoveredConfigs?.flushTimeoutMs,
+            flushOnSettled: effective.flushOnSettled ?? lastDiscoveredConfigs?.flushOnSettled,
+          }
+        );
+
+    function ensureTargetEntry(): AdvisorConfig {
+      let entry = doc.advisors.find(a => slugifyAdvisorName(a.name) === targetSlug);
+      if (!entry) {
+        entry = {
+          name: targetName,
+          ...(baseline.model ? { model: baseline.model } : {}),
+          ...(baseline.tools ? { tools: [...baseline.tools] } : {}),
+          ...(baseline.instructions ? { instructions: baseline.instructions } : {}),
+          ...(baseline.contextTokens !== undefined ? { contextTokens: baseline.contextTokens } : {}),
+          ...(baseline.includePrimaryThinking !== undefined ? { includePrimaryThinking: baseline.includePrimaryThinking } : {}),
+          ...(baseline.maxBehind !== undefined ? { maxBehind: baseline.maxBehind } : {}),
+          ...(baseline.flushTimeoutMs !== undefined ? { flushTimeoutMs: baseline.flushTimeoutMs } : {}),
+          ...(baseline.flushOnSettled !== undefined ? { flushOnSettled: baseline.flushOnSettled } : {}),
+          ...(baseline.enabled !== undefined ? { enabled: baseline.enabled } : {}),
+        };
+        doc.advisors.push(entry);
+      }
+      return entry;
     }
 
-    async function pickModel(current: string | undefined): Promise<string | undefined | null> {
-      const labels = [NO_OVERRIDE, ...availableModels.map(m => `${m.provider}/${m.id} — ${m.name}`)];
-      const choice = await ctx.ui.select(`Model (current: ${current ?? "current Pi session model"})`, labels);
-      if (choice === undefined) return null;
-      if (choice === NO_OVERRIDE) return undefined;
-      const model = availableModels[labels.indexOf(choice) - 1];
-      return model ? `${model.provider}/${model.id}` : null;
+    let dirty = false;
+    while (true) {
+      const targetEntry = doc.advisors.find(a => slugifyAdvisorName(a.name) === targetSlug);
+      const currentMaxBehind = targetEntry?.maxBehind ?? doc.maxBehind ?? (isUserScope ? undefined : (effective.maxBehind ?? lastDiscoveredConfigs?.maxBehind)) ?? DEFAULT_MAX_BEHIND;
+      const currentFlushMs = targetEntry?.flushTimeoutMs ?? doc.flushTimeoutMs ?? (isUserScope ? undefined : (effective.flushTimeoutMs ?? lastDiscoveredConfigs?.flushTimeoutMs)) ?? DEFAULT_FLUSH_TIMEOUT_MS;
+      const currentFlushMin = Math.round(currentFlushMs / 60_000);
+      const flushDisplay = currentFlushMin >= 1 ? `${currentFlushMin}m (${currentFlushMs}ms)` : `${currentFlushMs}ms`;
+      const currentContext = targetEntry?.contextTokens ?? (isUserScope ? undefined : effective.contextTokens) ?? DEFAULT_ADVISOR_CONTEXT_TOKENS;
+      const currentThinking = (targetEntry?.includePrimaryThinking ?? (isUserScope ? undefined : effective.includePrimaryThinking)) === true;
+      const currentSettled = targetEntry?.flushOnSettled ?? doc.flushOnSettled ?? (isUserScope ? undefined : (effective.flushOnSettled ?? lastDiscoveredConfigs?.flushOnSettled)) ?? DEFAULT_FLUSH_ON_SETTLED;
+
+      const options = [
+        `Turn batching: ${currentMaxBehind} primary ${currentMaxBehind === 1 ? "turn" : "turns"} per wake`,
+        `Long-job reaction timeout: ${flushDisplay}`,
+        `Cache-friendly context budget: ${currentContext.toLocaleString()} estimated tokens`,
+        `Primary reasoning: ${currentThinking ? "Included" : "Excluded (recommended — saves tokens)"}`,
+        `Deliver on agent settled: ${currentSettled ? "Enabled (deliver when idle)" : "Disabled (wait for full batch)"}`,
+        "Help: How economy & cadence work",
+        "Save & Apply changes",
+        "Back (discard unapplied changes)",
+      ];
+
+      const choice = await ctx.ui.select(`Economy & Cadence (${scope}: ${path.basename(filePath)})`, options);
+      if (choice === undefined || choice.startsWith("Back")) return dirty;
+
+      if (choice === "Save & Apply changes") {
+        try {
+          await saveWatchdogConfigFile(filePath, doc);
+          ctx.ui.notify(`Economy settings saved to ${filePath}`, "info");
+          if (runtimeEnabled) {
+            await startOrchestrator(ctx);
+          } else {
+            const agentDir = getAgentDir();
+            lastDiscoveredConfigs = await discoverAdvisorConfigs(ctx.cwd, agentDir);
+          }
+          updateAdvisorStatus(ctx);
+          return true;
+        } catch (err) {
+          ctx.ui.notify(`Failed to save economy settings: ${err instanceof Error ? err.message : String(err)}`, "error");
+          return dirty;
+        }
+      }
+
+      if (choice === "Help: How economy & cadence work") {
+        await ctx.ui.select(
+          [
+            "How Economy & Cadence Work",
+            "",
+            "• Turn batching (maxBehind):",
+            "  Groups multi-step tool calls so the advisor doesn't call an LLM on every single micro-turn.",
+            "  Accumulates turns before waking the advisor. 3 turns is the sweet spot for high token savings.",
+            "",
+            "• Long-job reaction timeout (flushTimeoutMs):",
+            "  If a test run, build, or command takes a long time, the advisor wakes up mid-flight once this timer expires.",
+            "  Ensures you aren't left waiting without advice just because the primary hasn't finished its turn batch.",
+            "",
+            "• Cache-friendly context budget (contextTokens):",
+            "  The advisor context window preserves a stable history prefix so prompt caching hits turn after turn.",
+            "  When the estimated budget ceiling is reached, pre-update history expires cleanly at an update boundary.",
+            "",
+            "• Primary reasoning (includePrimaryThinking):",
+            "  Excluded by default. Passing primary thinking blocks can multiply input tokens and costs significantly.",
+            "",
+            "• Deliver on agent settled (flushOnSettled):",
+            "  Delivers any pending partial batch as soon as the agent finishes and settles, so you get advice immediately when idle.",
+          ].join("\n"),
+          ["Back"],
+        );
+        continue;
+      }
+
+      if (choice.startsWith("Turn batching:")) {
+        const picked = await ctx.ui.select(
+          "Primary turns to accumulate before waking advisor (saves tokens during active tool use)",
+          [
+            "3 turns (recommended default — high token efficiency)",
+            "1 turn (immediate review on every turn)",
+            "2 turns (balanced)",
+            "5 turns (ultra-economical — fewer LLM calls)",
+            "Custom number of turns…",
+          ],
+        );
+        if (picked !== undefined) {
+          let newTurns: number | undefined;
+          if (picked.startsWith("3 turns")) newTurns = 3;
+          else if (picked.startsWith("1 turn")) newTurns = 1;
+          else if (picked.startsWith("2 turns")) newTurns = 2;
+          else if (picked.startsWith("5 turns")) newTurns = 5;
+          else if (picked.startsWith("Custom")) {
+            const text = await ctx.ui.input("Enter turn count (min 1)", currentMaxBehind.toString());
+            if (text !== undefined && text.trim() !== "") {
+              const parsed = Number.parseInt(text.trim(), 10);
+              if (Number.isSafeInteger(parsed) && parsed >= 1) newTurns = parsed;
+              else ctx.ui.notify("Turn count must be an integer >= 1.", "warning");
+            }
+          }
+          if (newTurns !== undefined) {
+            doc.maxBehind = newTurns;
+            const entry = ensureTargetEntry();
+            entry.maxBehind = newTurns;
+            dirty = true;
+          }
+        }
+        continue;
+      }
+
+      if (choice.startsWith("Long-job reaction timeout:")) {
+        const picked = await ctx.ui.select(
+          "Wake advisor mid-job if a command or run takes longer than this (prevents stalling advice)",
+          [
+            "4 minutes (240,000ms — recommended default)",
+            "2 minutes (120,000ms — faster mid-run alerts)",
+            "1 minute (60,000ms — responsive)",
+            "Custom milliseconds…",
+          ],
+        );
+        if (picked !== undefined) {
+          let newTimeout: number | undefined;
+          if (picked.startsWith("4 minutes")) newTimeout = 240_000;
+          else if (picked.startsWith("2 minutes")) newTimeout = 120_000;
+          else if (picked.startsWith("1 minute")) newTimeout = 60_000;
+          else if (picked.startsWith("Custom")) {
+            const text = await ctx.ui.input("Enter timeout in milliseconds (min 100ms)", currentFlushMs.toString());
+            if (text !== undefined && text.trim() !== "") {
+              const parsed = Number.parseInt(text.trim(), 10);
+              if (Number.isSafeInteger(parsed) && parsed >= 100) newTimeout = parsed;
+              else ctx.ui.notify("Timeout must be an integer >= 100ms.", "warning");
+            }
+          }
+          if (newTimeout !== undefined) {
+            doc.flushTimeoutMs = newTimeout;
+            const entry = ensureTargetEntry();
+            entry.flushTimeoutMs = newTimeout;
+            dirty = true;
+          }
+        }
+        continue;
+      }
+
+      if (choice.startsWith("Cache-friendly context budget:")) {
+        const picked = await ctx.ui.select(
+          "Advisor context ceiling (stable history prefix preserved for prompt caching; resets pre-update history at ceiling)",
+          [
+            "32,000 tokens (recommended default)",
+            "16,000 tokens (lean memory)",
+            "64,000 tokens (large context)",
+            "Custom token budget…",
+          ],
+        );
+        if (picked !== undefined) {
+          let newBudget: number | undefined;
+          if (picked.startsWith("32,000")) newBudget = 32_000;
+          else if (picked.startsWith("16,000")) newBudget = 16_000;
+          else if (picked.startsWith("64,000")) newBudget = 64_000;
+          else if (picked.startsWith("Custom")) {
+            const text = await ctx.ui.input(`Enter estimated input token budget (minimum ${MIN_ADVISOR_CONTEXT_TOKENS})`, currentContext.toString());
+            if (text !== undefined && text.trim() !== "") {
+              const parsed = Number.parseInt(text.trim(), 10);
+              if (Number.isSafeInteger(parsed) && parsed >= MIN_ADVISOR_CONTEXT_TOKENS) newBudget = parsed;
+              else ctx.ui.notify(`Budget must be an integer >= ${MIN_ADVISOR_CONTEXT_TOKENS}.`, "warning");
+            }
+          }
+          if (newBudget !== undefined) {
+            const entry = ensureTargetEntry();
+            entry.contextTokens = newBudget;
+            dirty = true;
+          }
+        }
+        continue;
+      }
+
+      if (choice.startsWith("Primary reasoning:")) {
+        const nextVal = !currentThinking;
+        const entry = ensureTargetEntry();
+        entry.includePrimaryThinking = nextVal;
+        dirty = true;
+        continue;
+      }
+
+      if (choice.startsWith("Deliver on agent settled:")) {
+        const nextVal = !currentSettled;
+        doc.flushOnSettled = nextVal;
+        const entry = ensureTargetEntry();
+        entry.flushOnSettled = nextVal;
+        dirty = true;
+        continue;
+      }
+    }
+  }
+
+  async function runInstructionsMenu(
+    ctx: ExtensionCommandContext,
+    targetScope: AdvisorConfigScope = "project",
+  ): Promise<boolean> {
+    const dirs = { projectDir: ctx.cwd, agentDir: getAgentDir() };
+    const filePath = await resolveAdvisorConfigEditPath(targetScope, dirs);
+    let doc: WatchdogConfigDoc;
+    try {
+      doc = await loadWatchdogConfigFile(filePath);
+    } catch (err) {
+      ctx.ui.notify(err instanceof Error ? err.message : String(err), "error");
+      return false;
     }
 
-    async function editAdvisor(a: AdvisorConfig): Promise<"removed" | "done"> {
+    let dirty = false;
+    const watchdogMdPath = path.join(targetScope === "user" ? dirs.agentDir : ctx.cwd, "WATCHDOG.md");
+    let hasWatchdogMd = false;
+    try {
+      await fs.access(watchdogMdPath);
+      hasWatchdogMd = true;
+    } catch (err) {
+      if (isEnoent(err)) {
+        hasWatchdogMd = false;
+      } else {
+        ctx.ui.notify(`Cannot access WATCHDOG.md: ${err instanceof Error ? err.message : String(err)}`, "error");
+      }
+    }
+
+    while (true) {
+      const sharedPreview = doc.instructions ? `${doc.instructions.slice(0, 40)}…` : "(none)";
+      const attentionLabel = `${targetScope === "user" ? "User-default" : "Project"} attention in WATCHDOG.md: ${hasWatchdogMd ? "exists (click to edit)" : "(none — click to create)"}`;
+      const options = [
+        `Shared instructions in WATCHDOG.yml: ${sharedPreview}`,
+        attentionLabel,
+        "Save & Apply changes to WATCHDOG.yml",
+        "Back",
+      ];
+      const choice = await ctx.ui.select(`${targetScope === "project" ? "Project" : "User-default"} instructions & attention · ${filePath}`, options);
+      if (choice === undefined || choice === "Back") return dirty;
+
+      if (choice.startsWith("Save & Apply")) {
+        try {
+          await saveWatchdogConfigFile(filePath, doc);
+          ctx.ui.notify(`Instructions saved to ${filePath}`, "info");
+          if (runtimeEnabled) {
+            await startOrchestrator(ctx);
+          } else {
+            const agentDir = getAgentDir();
+            lastDiscoveredConfigs = await discoverAdvisorConfigs(ctx.cwd, agentDir);
+          }
+          updateAdvisorStatus(ctx);
+          return true;
+        } catch (err) {
+          ctx.ui.notify(`Failed to save instructions: ${err instanceof Error ? err.message : String(err)}`, "error");
+          return dirty;
+        }
+      }
+
+      if (choice.startsWith("Shared instructions in WATCHDOG.yml:")) {
+        const text = await ctx.ui.editor("Shared instructions for every advisor (blank = none)", doc.instructions ?? "");
+        if (text !== undefined) {
+          if (text.trim() === "") delete doc.instructions;
+          else doc.instructions = text;
+          dirty = true;
+        }
+        continue;
+      }
+
+      if (choice === attentionLabel) {
+        let existing = "";
+        try {
+          existing = await fs.readFile(watchdogMdPath, "utf8");
+          hasWatchdogMd = true;
+        } catch (err) {
+          if (isEnoent(err)) {
+            existing = "";
+            hasWatchdogMd = false;
+          } else {
+            ctx.ui.notify(`Cannot read WATCHDOG.md: ${err instanceof Error ? err.message : String(err)}`, "error");
+            continue;
+          }
+        }
+        const text = await ctx.ui.editor(`${targetScope === "user" ? "User-default" : "Project"} attention instructions (saved directly to ${watchdogMdPath})`, existing);
+        if (text !== undefined) {
+          if (text.trim() === "") {
+            if (hasWatchdogMd) {
+              const remove = await ctx.ui.confirm("Delete WATCHDOG.md?", `The text is empty. Remove ${watchdogMdPath}?`);
+              if (remove) {
+                try {
+                  await fs.rm(watchdogMdPath, { force: true });
+                  hasWatchdogMd = false;
+                  ctx.ui.notify("Removed WATCHDOG.md.", "info");
+                  if (runtimeEnabled) await startOrchestrator(ctx);
+                } catch (err) {
+                  ctx.ui.notify(`Failed to delete WATCHDOG.md: ${String(err)}`, "error");
+                }
+              }
+            }
+          } else {
+            try {
+              await fs.writeFile(watchdogMdPath, text, "utf8");
+              hasWatchdogMd = true;
+              ctx.ui.notify(`Saved WATCHDOG.md directly to ${watchdogMdPath}.`, "info");
+              if (runtimeEnabled) await startOrchestrator(ctx);
+            } catch (err) {
+              ctx.ui.notify(`Failed to save WATCHDOG.md: ${String(err)}`, "error");
+            }
+          }
+        }
+        continue;
+      }
+    }
+  }
+
+  async function runGeneralSettingsMenu(
+    ctx: ExtensionCommandContext,
+    targetScope: AdvisorConfigScope = "project",
+  ): Promise<boolean> {
+    const dirs = { projectDir: ctx.cwd, agentDir: getAgentDir() };
+    const filePath = await resolveAdvisorConfigEditPath(targetScope, dirs);
+    let doc: WatchdogConfigDoc;
+    try {
+      doc = await loadWatchdogConfigFile(filePath);
+    } catch (err) {
+      ctx.ui.notify(err instanceof Error ? err.message : String(err), "error");
+      return false;
+    }
+
+    const inherited = targetScope === "project"
+      ? await discoverAdvisorConfigs(ctx.cwd, dirs.agentDir, { excludePaths: [filePath] })
+      : undefined;
+    let dirty = false;
+    let mainTouched = false;
+    let subagentsTouched = false;
+    while (true) {
+      const mainValue = doc.main ?? inherited?.mainEnabled ?? true;
+      const subagentsValue = doc.subagents ?? inherited?.subagentsEnabled ?? false;
+      const mainSource = doc.main !== undefined ? "set here" : inherited?.mainEnabled !== undefined ? "inherited" : "built-in default";
+      const subagentsSource = doc.subagents !== undefined ? "set here" : inherited?.subagentsEnabled !== undefined ? "inherited" : "built-in default";
+      const options = [
+        `Watch main sessions by default: ${mainValue ? "on" : "off"} (${mainSource})`,
+        `Watch sub-agent sessions by default: ${subagentsValue ? "on" : "off"} (${subagentsSource})`,
+        ...(doc.main !== undefined ? ["Reset main-session default to inherit"] : []),
+        ...(doc.subagents !== undefined ? ["Reset sub-agent default to inherit"] : []),
+        "Save & Apply changes",
+        "Back",
+      ];
+      const choice = await ctx.ui.select(`Advisor ON/OFF defaults · ${filePath}`, options);
+      if (choice === undefined || choice === "Back") return dirty;
+
+      if (choice === "Save & Apply changes") {
+        try {
+          await saveWatchdogConfigFile(filePath, doc);
+        } catch (err) {
+          ctx.ui.notify(`Failed to save settings: ${err instanceof Error ? err.message : String(err)}`, "error");
+          return dirty;
+        }
+        ctx.ui.notify(`Advisor ON/OFF defaults saved to ${filePath}`, "info");
+        try {
+          // A changed saved default replaces any temporary override for this kind of session.
+          if (isSubagentProcess() ? subagentsTouched : mainTouched) runtimeOverride = undefined;
+          await startOrchestrator(ctx);
+          updateAdvisorStatus(ctx);
+        } catch (err) {
+          ctx.ui.notify(`Settings were saved, but could not apply to this session: ${err instanceof Error ? err.message : String(err)}`, "warning");
+        }
+        return true;
+      }
+
+      if (choice.startsWith("Watch main sessions by default:")) {
+        doc.main = !mainValue;
+        mainTouched = true;
+        dirty = true;
+        continue;
+      }
+
+      if (choice.startsWith("Watch sub-agent sessions by default:")) {
+        doc.subagents = !subagentsValue;
+        subagentsTouched = true;
+        dirty = true;
+        continue;
+      }
+
+      if (choice === "Reset main-session default to inherit") {
+        delete doc.main;
+        mainTouched = true;
+        dirty = true;
+        continue;
+      }
+      if (choice === "Reset sub-agent default to inherit") {
+        delete doc.subagents;
+        subagentsTouched = true;
+        dirty = true;
+        continue;
+      }
+    }
+  }
+
+  async function runAdvancedMenu(
+    ctx: ExtensionCommandContext,
+    targetScope: AdvisorConfigScope = "project",
+  ): Promise<boolean> {
+    const dirs = { projectDir: ctx.cwd, agentDir: getAgentDir() };
+    const filePath = await resolveAdvisorConfigEditPath(targetScope, dirs);
+    let doc: WatchdogConfigDoc;
+    try {
+      doc = await loadWatchdogConfigFile(filePath);
+    } catch (err) {
+      ctx.ui.notify(err instanceof Error ? err.message : String(err), "error");
+      return false;
+    }
+
+    let dirty = false;
+
+    async function editAdvisorDetails(a: AdvisorConfig): Promise<"removed" | "done"> {
       while (true) {
         const options = [
           `Model: ${a.model ?? "(current Pi session model)"}`,
@@ -872,10 +1536,11 @@ export default function (pi: ExtensionAPI) {
         const choice = await ctx.ui.select(`Advisor: ${a.name}`, options);
         if (choice === undefined || choice === "Back") return "done";
         if (choice.startsWith("Model:")) {
-          const picked = await pickModel(a.model);
+          const picked = await pickAdvisorModel(ctx, a.model);
           if (picked !== null) {
             if (picked === undefined) delete a.model;
             else a.model = picked;
+            dirty = true;
           }
           continue;
         }
@@ -885,6 +1550,7 @@ export default function (pi: ExtensionAPI) {
             const parsed = text.split(",").map(t => t.trim()).filter(Boolean);
             if (parsed.length === 0) delete a.tools;
             else a.tools = parsed;
+            dirty = true;
           }
           continue;
         }
@@ -894,14 +1560,17 @@ export default function (pi: ExtensionAPI) {
             if (text.trim() === "") delete a.contextTokens;
             else {
               const value = Number(text);
-              if (Number.isSafeInteger(value) && value >= MIN_ADVISOR_CONTEXT_TOKENS) a.contextTokens = value;
-              else ctx.ui.notify(`Use an integer of at least ${MIN_ADVISOR_CONTEXT_TOKENS}. Budget unchanged.`, "warning");
+              if (Number.isSafeInteger(value) && value >= MIN_ADVISOR_CONTEXT_TOKENS) {
+                a.contextTokens = value;
+                dirty = true;
+              } else ctx.ui.notify(`Use an integer of at least ${MIN_ADVISOR_CONTEXT_TOKENS}. Budget unchanged.`, "warning");
             }
           }
           continue;
         }
         if (choice.startsWith("Include primary reasoning:")) {
           a.includePrimaryThinking = a.includePrimaryThinking !== true;
+          dirty = true;
           continue;
         }
         if (choice.startsWith("Primary turns per advisor wake:")) {
@@ -910,8 +1579,10 @@ export default function (pi: ExtensionAPI) {
             if (text.trim() === "") delete a.maxBehind;
             else {
               const value = Number(text);
-              if (Number.isSafeInteger(value) && value >= 1) a.maxBehind = value;
-              else ctx.ui.notify("Use an integer >= 1. Unchanged.", "warning");
+              if (Number.isSafeInteger(value) && value >= 1) {
+                a.maxBehind = value;
+                dirty = true;
+              } else ctx.ui.notify("Use an integer >= 1. Unchanged.", "warning");
             }
           }
           continue;
@@ -922,8 +1593,10 @@ export default function (pi: ExtensionAPI) {
             if (text.trim() === "") delete a.flushTimeoutMs;
             else {
               const value = Number(text);
-              if (Number.isSafeInteger(value) && value >= 100) a.flushTimeoutMs = value;
-              else ctx.ui.notify("Use an integer >= 100. Unchanged.", "warning");
+              if (Number.isSafeInteger(value) && value >= 100) {
+                a.flushTimeoutMs = value;
+                dirty = true;
+              } else ctx.ui.notify("Use an integer >= 100. Unchanged.", "warning");
             }
           }
           continue;
@@ -933,89 +1606,100 @@ export default function (pi: ExtensionAPI) {
           if (text !== undefined) {
             if (text.trim() === "") delete a.instructions;
             else a.instructions = text;
+            dirty = true;
           }
           continue;
         }
         if (choice.startsWith("Enabled:")) {
           a.enabled = !(a.enabled !== false);
+          dirty = true;
           continue;
         }
         if (choice === "Delete this advisor") {
           const ok = await ctx.ui.confirm("Delete advisor?", `Remove '${a.name}' from WATCHDOG.yml?`);
-          if (ok) return "removed";
+          if (ok) {
+            dirty = true;
+            return "removed";
+          }
           continue;
         }
       }
     }
 
     while (true) {
-      const advisorLabels = doc.advisors.map(
-        a => `Advisor: ${a.name} (${a.model ?? "current session model"}${a.enabled === false ? ", disabled" : ""})`,
-      );
+      const rosterLabel = `Multi-advisor roster (${doc.advisors.length} configured)…`;
+      const backpressureLabel = `Backpressure: pause primary when advisor falls behind: ${
+        doc.syncBacklog === undefined
+          ? "off (default)"
+          : doc.syncBacklog === "off"
+          ? "off"
+          : typeof doc.syncBacklog === "object"
+          ? `pause at ${doc.syncBacklog.pauseAt}, resume at ${doc.syncBacklog.resumeAt}`
+          : `${doc.syncBacklog} queued turns`
+      }`;
+      const immuneLabel = `Turns where later concerns stop interrupting: ${doc.immuneTurns ?? "3 (default)"}`;
+
       const options = [
-        `Shared instructions: ${doc.instructions ? `${doc.instructions.slice(0, 40)}…` : "(none)"}`,
-        `Watch the main session by default: ${doc.main === true ? "on" : doc.main === false ? "off" : "on (unset, default)"}`,
-        `Watch sub-agent sessions too: ${doc.subagents === true ? "on" : doc.subagents === false ? "off" : "off (unset)"}`,
-        `Backpressure: pause the primary when an advisor falls behind: ${
-          doc.syncBacklog === undefined
-            ? "off (default)"
-            : doc.syncBacklog === "off"
-            ? "off"
-            : typeof doc.syncBacklog === "object"
-            ? `pause at ${doc.syncBacklog.pauseAt}, resume at ${doc.syncBacklog.resumeAt}`
-            : `${doc.syncBacklog} queued turns`
-        }`,
-        `Primary turns per advisor wake: ${doc.maxBehind ?? `${DEFAULT_MAX_BEHIND} turns (default)`}`,
-        `Maximum wait for a partial batch: ${doc.flushTimeoutMs ? `${doc.flushTimeoutMs}ms` : `${DEFAULT_FLUSH_TIMEOUT_MS}ms (default)`}`,
-        `Turns where later concerns stop interrupting: ${doc.immuneTurns ?? "3 (default)"}`,
-        ...advisorLabels,
-        "+ Add advisor",
-        "Help: what these settings mean",
-        "Save",
-        "Discard",
+        rosterLabel,
+        backpressureLabel,
+        immuneLabel,
+        "Save & Apply changes",
+        "Back",
       ];
-      const choice = await ctx.ui.select(`WATCHDOG.yml (${scope})`, options);
-      if (choice === undefined || choice === "Discard") {
-        ctx.ui.notify("pi-omp-advisor config: discarded, nothing written.", "info");
-        return;
-      }
-      if (choice === "Save") {
+      const choice = await ctx.ui.select(`Advanced Settings (${targetScope})`, options);
+      if (choice === undefined || choice === "Back") return dirty;
+
+      if (choice === "Save & Apply changes") {
         try {
           await saveWatchdogConfigFile(filePath, doc);
+          ctx.ui.notify(`Advanced settings saved to ${filePath}`, "info");
+          if (runtimeEnabled) {
+            await startOrchestrator(ctx);
+          } else {
+            const agentDir = getAgentDir();
+            lastDiscoveredConfigs = await discoverAdvisorConfigs(ctx.cwd, agentDir);
+          }
+          updateAdvisorStatus(ctx);
+          return true;
         } catch (err) {
-          ctx.ui.notify(`pi-omp-advisor config NOT saved: ${err instanceof Error ? err.message : String(err)}`, "error");
-          return;
+          ctx.ui.notify(`Failed to save advanced settings: ${err instanceof Error ? err.message : String(err)}`, "error");
+          return dirty;
         }
-        ctx.ui.notify(`pi-omp-advisor config saved to ${filePath}`, "info");
-        if (runtimeEnabled) await startOrchestrator(ctx);
-        else ctx.ui.notify(`pi-omp-advisor is off for this session (${advisorCommandName()} off) — saved, but not applied until ${advisorCommandName()} on.`, "info");
-        return;
       }
-      if (choice.startsWith("Shared instructions:")) {
-        const text = await ctx.ui.editor("Shared instructions for every advisor (blank = none)", doc.instructions ?? "");
-        if (text !== undefined) {
-          if (text.trim() === "") delete doc.instructions;
-          else doc.instructions = text;
+
+      if (choice === rosterLabel) {
+        while (true) {
+          const labels = doc.advisors.map(
+            a => `Advisor: ${a.name} (${cleanModelId(a.model) ?? "session model"}${a.enabled === false ? ", disabled" : ""})`,
+          );
+          const rosterChoices = [
+            ...labels,
+            "+ Add specialized advisor",
+            "Back",
+          ];
+          const sub = await ctx.ui.select(`Multi-Advisor Roster (${doc.advisors.length} advisors)`, rosterChoices);
+          if (sub === undefined || sub === "Back") break;
+          if (sub === "+ Add specialized advisor") {
+            const name = await ctx.ui.input("New advisor name (e.g. security, performance, reviewer)", "reviewer");
+            if (name?.trim()) {
+              doc.advisors.push({ name: name.trim() });
+              dirty = true;
+            }
+            continue;
+          }
+          const idx = labels.indexOf(sub);
+          if (idx >= 0) {
+            const result = await editAdvisorDetails(doc.advisors[idx]!);
+            if (result === "removed") {
+              doc.advisors.splice(idx, 1);
+              dirty = true;
+            }
+          }
         }
         continue;
       }
-      if (choice.startsWith("Watch the main session by default:")) {
-        // Unset is effectively "on" (the pre-existing default), so toggling
-        // from unset flips to explicit false; toggling from false flips to
-        // explicit true. Once touched it stays explicit (no way back to
-        // "unset" from here — delete the file's `main:` line by hand if that's
-        // truly wanted).
-        doc.main = doc.main === false ? true : false;
-        continue;
-      }
-      if (choice.startsWith("Watch sub-agent sessions too:")) {
-        doc.subagents = !(doc.subagents === true);
-        continue;
-      }
-      if (choice.startsWith("Backpressure: pause the primary when an advisor falls behind:")) {
-        // Matches upstream's `advisor.syncBacklog` values exactly, with support
-        // for hysteresis ({ pauseAt, resumeAt }) to avoid stutter. "off" means
-        // the primary is never gated on a lagging advisor (upstream default).
+
+      if (choice === backpressureLabel) {
         const picked = await ctx.ui.select(
           "Pause the main agent for up to 30s when an advisor falls behind",
           [
@@ -1037,10 +1721,12 @@ export default function (pi: ExtensionAPI) {
           } else {
             doc.syncBacklog = Number.parseInt(picked, 10);
           }
+          dirty = true;
         }
         continue;
       }
-      if (choice.startsWith("Turns where later concerns stop interrupting:")) {
+
+      if (choice === immuneLabel) {
         const text = await ctx.ui.input(
           "After an interrupt, stop later CONCERNS from interrupting for how many turns? Blockers always interrupt. (blank = 3)",
           doc.immuneTurns === undefined ? "" : String(doc.immuneTurns),
@@ -1049,61 +1735,84 @@ export default function (pi: ExtensionAPI) {
           const trimmed = text.trim();
           if (trimmed === "") {
             delete doc.immuneTurns;
+            dirty = true;
           } else {
             const parsed = Number.parseInt(trimmed, 10);
-            if (Number.isFinite(parsed) && parsed >= 0) doc.immuneTurns = parsed;
-            else ctx.ui.notify("Not a non-negative number — unchanged.", "warning");
+            if (Number.isFinite(parsed) && parsed >= 0) {
+              doc.immuneTurns = parsed;
+              dirty = true;
+            } else ctx.ui.notify("Not a non-negative number — unchanged.", "warning");
           }
         }
         continue;
       }
-      if (choice.startsWith("Primary turns per advisor wake:")) {
-        const text = await ctx.ui.input(
-          "Completed primary turns to accumulate per advisor wake (blank = 3, min 1)",
-          doc.maxBehind === undefined ? "" : String(doc.maxBehind),
-        );
-        if (text !== undefined) {
-          const trimmed = text.trim();
-          if (trimmed === "") {
-            delete doc.maxBehind;
-          } else {
-            const parsed = Number.parseInt(trimmed, 10);
-            if (Number.isFinite(parsed) && parsed >= 1) doc.maxBehind = parsed;
-            else ctx.ui.notify("Must be an integer >= 1 — unchanged.", "warning");
-          }
-        }
+    }
+  }
+
+  async function runConfigMenu(ctx: ExtensionCommandContext, selectedScope?: AdvisorConfigScope): Promise<void> {
+    let scope = selectedScope;
+    if (!scope) {
+      const scopeChoice = await ctx.ui.select("Which settings do you want to edit?", [
+        "This project only (WATCHDOG.yml)",
+        "User defaults (all projects unless overridden, ~/.pi/agent/WATCHDOG.yml)",
+      ]);
+      if (scopeChoice === undefined) return;
+      scope = scopeChoice.startsWith("This project") ? "project" : "user";
+    }
+    const dirs = { projectDir: ctx.cwd, agentDir: getAgentDir() };
+
+    while (true) {
+      const filePath = await resolveAdvisorConfigEditPath(scope, dirs);
+      let doc: WatchdogConfigDoc;
+      try {
+        doc = await loadWatchdogConfigFile(filePath);
+      } catch (err) {
+        ctx.ui.notify(err instanceof Error ? err.message : String(err), "error");
+        return;
+      }
+
+      const defaults = scope === "project" ? await discoverAdvisorConfigs(ctx.cwd, dirs.agentDir) : undefined;
+      const mainEnabled = doc.main ?? defaults?.mainEnabled ?? true;
+      const subagentsEnabled = doc.subagents ?? defaults?.subagentsEnabled ?? false;
+      const enablementLabel = `Advisor ON/OFF ${scope === "project" ? "for this project" : "user defaults"} (main ${mainEnabled ? "ON" : "OFF"}, subagents ${subagentsEnabled ? "ON" : "OFF"})…`;
+      const firstAdvisor = doc.advisors[0];
+      const inherited = scope === "project" ? getEffectiveAdvisor(firstAdvisor?.name) : undefined;
+      const model = firstAdvisor?.model ?? inherited?.model;
+      const modelLabel = `Advisor model: ${cleanModelId(model) ?? "follows session"}${model && !firstAdvisor?.model ? " (inherited)" : ""}…`;
+      const currentMax = firstAdvisor?.maxBehind ?? doc.maxBehind ?? inherited?.maxBehind ?? (scope === "project" ? lastDiscoveredConfigs?.maxBehind : undefined) ?? DEFAULT_MAX_BEHIND;
+      const currentMs = firstAdvisor?.flushTimeoutMs ?? doc.flushTimeoutMs ?? inherited?.flushTimeoutMs ?? (scope === "project" ? lastDiscoveredConfigs?.flushTimeoutMs : undefined) ?? DEFAULT_FLUSH_TIMEOUT_MS;
+      const timingLabel = `Timing & cost (${formatEconomySummary({ maxBehind: currentMax, flushTimeoutMs: currentMs })})…`;
+      const options = [
+        enablementLabel,
+        modelLabel,
+        timingLabel,
+        "Shared instructions & attention (WATCHDOG.yml / WATCHDOG.md)…",
+        `Advanced (advisors, tools, backpressure: ${doc.advisors.length} configured)…`,
+        "Back to advisor controls",
+      ];
+
+      const choice = await ctx.ui.select(`${scope === "project" ? "Project settings" : "User defaults (unless project overrides)"} · ${filePath}`, options);
+      if (choice === undefined || choice === "Back to advisor controls") return;
+
+      if (choice === modelLabel) {
+        await pickAndApplyAdvisorModel(ctx, scope, firstAdvisor?.name, firstAdvisor?.model);
         continue;
       }
-      if (choice.startsWith("Maximum wait for a partial batch:")) {
-        const text = await ctx.ui.input(
-          `Maximum age of the oldest accumulated turn before an advisor wake (blank = ${DEFAULT_FLUSH_TIMEOUT_MS}ms, min 100ms)`,
-          doc.flushTimeoutMs === undefined ? "" : String(doc.flushTimeoutMs),
-        );
-        if (text !== undefined) {
-          const trimmed = text.trim();
-          if (trimmed === "") {
-            delete doc.flushTimeoutMs;
-          } else {
-            const parsed = Number.parseInt(trimmed, 10);
-            if (Number.isFinite(parsed) && parsed >= 100) doc.flushTimeoutMs = parsed;
-            else ctx.ui.notify("Must be an integer >= 100 — unchanged.", "warning");
-          }
-        }
+      if (choice === timingLabel) {
+        await runEconomyMenu(ctx, scope);
         continue;
       }
-      if (choice === "Help: what these settings mean") {
-        await showConfigHelp();
+      if (choice.startsWith("Shared instructions")) {
+        await runInstructionsMenu(ctx, scope);
         continue;
       }
-      if (choice === "+ Add advisor") {
-        const name = await ctx.ui.input("Advisor name", "reviewer");
-        if (name?.trim()) doc.advisors.push({ name: name.trim() });
+      if (choice === enablementLabel) {
+        await runGeneralSettingsMenu(ctx, scope);
         continue;
       }
-      const idx = advisorLabels.indexOf(choice);
-      if (idx >= 0) {
-        const result = await editAdvisor(doc.advisors[idx]);
-        if (result === "removed") doc.advisors.splice(idx, 1);
+      if (choice.startsWith("Advanced")) {
+        await runAdvancedMenu(ctx, scope);
+        continue;
       }
     }
   }
@@ -1117,8 +1826,6 @@ export default function (pi: ExtensionAPI) {
   async function persistTopLevelFlag(ctx: ExtensionCommandContext, field: "main" | "subagents", value: boolean): Promise<string> {
     const dirs = { projectDir: ctx.cwd, agentDir: getAgentDir() };
     const filePath = await resolveAdvisorConfigEditPath("project", dirs);
-    // A read/parse failure throws rather than yielding an empty document, so this
-    // one-field toggle can never blank out a config it failed to understand.
     const doc = await loadWatchdogConfigFile(filePath);
     doc[field] = value;
     await saveWatchdogConfigFile(filePath, doc);
@@ -1130,13 +1837,15 @@ export default function (pi: ExtensionAPI) {
       [
         "pi-omp-advisor controls",
         "",
-        `${advisorCommandName()} — open the interactive control menu`,
+        `${advisorCommandName()} — session controls plus project settings and user defaults`,
+        `${advisorCommandName()} model — choose or pin the advisor model`,
+        `${advisorCommandName()} economy — configure turn batching, reaction timer & token budget`,
         `${advisorCommandName()} status — show runtime, model, backlog, and queue details`,
         `${advisorCommandName()} inbox — inspect, deliver, or dismiss queued notes`,
         `${advisorCommandName()} pause | resume — stop or restart observation without releasing the queue`,
         `${advisorCommandName()} clear — immediately discard every queued note`,
         `${advisorCommandName()} on | off — enable or disable this session`,
-        `${advisorCommandName()} config — edit project or user WATCHDOG.yml`,
+        `${advisorCommandName()} config — save project or user-default ON/OFF and other settings`,
         `${advisorCommandName()} main on|off — persist the normal-session default`,
         `${advisorCommandName()} subagents on|off — set the default for newly spawned subagents`,
         "",
@@ -1150,66 +1859,91 @@ export default function (pi: ExtensionAPI) {
 
   function advisorMenuState(): string {
     const queued = `${inbox.items.length} queued`;
-    if (advisorPaused) return `paused · ${queued}`;
-    if (isActive()) return `running: ${orchestrator!.advisorLabels.join(", ")} · ${queued}`;
-    if (runtimeOverride === false || !runtimeEnabled) return `off · ${queued}`;
+    const overview = orchestrator?.statusOverview() ?? [];
+    if (advisorPaused) {
+      if (overview.length === 1) {
+        const clean = cleanModelId(overview[0]?.model) ?? "no model";
+        return `PAUSED · ${clean} · ${queued}`;
+      }
+      return `PAUSED · ${queued}`;
+    }
+    if (isActive()) {
+      if (overview.length === 1) {
+        const clean = cleanModelId(overview[0]?.model) ?? "no model";
+        const routeType = inheritedRouteConfigured ? "session model" : "pinned";
+        return `ON · ${clean} (${routeType}) · ${queued}`;
+      }
+      return `ON · ${overview.length} advisors · ${queued}`;
+    }
+    if (runtimeOverride === false || !runtimeEnabled) return `OFF · ${queued}`;
     return `not running · ${queued}`;
   }
 
   async function runAdvisorMenu(ctx: ExtensionCommandContext): Promise<void> {
     while (true) {
-      const inboxChoice = `Inbox (${inbox.items.length} queued)`;
       const toggleChoice = advisorPaused
-        ? "Resume advisor"
+        ? "Resume advisor (this session only)"
         : isActive()
-          ? "Pause advisor"
-          : "Enable or restart advisor for this session";
+          ? "Pause advisor (this session only)"
+          : "Turn advisor ON now (this session only)";
+
+      const inboxLabel = `Inbox (${inbox.items.length} queued)`;
+
       const options = [
-        inboxChoice,
         toggleChoice,
-        ...(runtimeEnabled || advisorPaused ? ["Disable advisor for this session"] : []),
+        ...(runtimeEnabled || advisorPaused ? ["Turn advisor OFF now (this session only)"] : []),
+        inboxLabel,
         ...(inbox.items.length > 0 ? [`Clear all ${inbox.items.length} queued advisories now`] : []),
-        "Configure advisors…",
         "Status details",
+        "Settings for this project…",
+        "User defaults for all projects…",
         "Help & shortcuts",
         "Close",
       ];
+
       const choice = await ctx.ui.select(`pi-omp-advisor · ${advisorMenuState()}`, options);
       if (choice === undefined || choice === "Close") return;
-      if (choice === inboxChoice) {
-        await showAdvisorInbox(ctx);
+
+      if (choice === toggleChoice) {
+        if (advisorPaused) await setAdvisorPaused(false, ctx);
+        else if (isActive()) await setAdvisorPaused(true, ctx);
+        else await handleCommand("on", ctx);
         continue;
       }
-      if (choice === "Pause advisor") {
-        await setAdvisorPaused(true, ctx);
-        continue;
-      }
-      if (choice === "Resume advisor") {
-        await setAdvisorPaused(false, ctx);
-        continue;
-      }
-      if (choice === "Enable or restart advisor for this session") {
-        await handleCommand("on", ctx);
-        continue;
-      }
-      if (choice === "Disable advisor for this session") {
+
+      if (choice === "Turn advisor OFF now (this session only)") {
         await handleCommand("off", ctx);
         continue;
       }
+
+      if (choice === inboxLabel) {
+        await showAdvisorInbox(ctx);
+        continue;
+      }
+
       if (choice.startsWith("Clear all ")) {
         clearAdvisorInbox(ctx);
         continue;
       }
-      if (choice === "Configure advisors…") {
-        await runConfigMenu(ctx);
+
+      if (choice === "Settings for this project…") {
+        await runConfigMenu(ctx, "project");
         continue;
       }
+
+      if (choice === "User defaults for all projects…") {
+        await runConfigMenu(ctx, "user");
+        continue;
+      }
+
       if (choice === "Status details") {
         await handleCommand("status", ctx);
         continue;
       }
+
       if (choice === "Help & shortcuts") {
         await showAdvisorHelp(ctx);
+        continue;
       }
     }
   }
@@ -1243,6 +1977,11 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function handleCommand(args: string, ctx: ExtensionCommandContext): Promise<void> {
+    const agentDir = getAgentDir();
+    if (!lastDiscoveredConfigs) {
+      lastDiscoveredConfigs = await discoverAdvisorConfigs(ctx.cwd, agentDir);
+    }
+
     const parts = args.trim().toLowerCase().split(/\s+/).filter(Boolean);
     const [first, second] = parts;
 
@@ -1256,6 +1995,14 @@ export default function (pi: ExtensionAPI) {
     }
     if (first === "config") {
       await runConfigMenu(ctx);
+      return;
+    }
+    if (first === "model") {
+      await pickAndApplyAdvisorModel(ctx);
+      return;
+    }
+    if (first === "economy") {
+      await runEconomyMenu(ctx);
       return;
     }
     if (first === "inbox" || first === "queue") {
@@ -1319,7 +2066,7 @@ export default function (pi: ExtensionAPI) {
         await orchestrator?.disposeAll();
         orchestrator = undefined;
         persistInbox();
-        ctx.ui.setStatus("advisor", "pi-omp-advisor: off");
+        ctx.ui.setStatus("advisor", formatAdvisorStatusBar({ runtimeEnabled: false, paused: false }));
         ctx.ui.notify("pi-omp-advisor disabled for this session.", "info");
       });
       return;
@@ -1332,7 +2079,7 @@ export default function (pi: ExtensionAPI) {
         advisorPaused = false;
         advisorPauseRequests.apply(false);
         if (!orchestrator || orchestrator.advisorNames.length === 0) {
-          ctx.ui.setStatus("advisor", "pi-omp-advisor: starting…");
+          ctx.ui.setStatus("advisor", formatAdvisorStatusBar({ runtimeEnabled: true, paused: false, starting: true }));
           await startOrchestrator(ctx, /* force */ true);
         } else {
           await orchestrator.setPaused(false);

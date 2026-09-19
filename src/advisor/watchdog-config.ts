@@ -206,7 +206,7 @@ async function gitRoot(cwd: string): Promise<string | null> {
   }
 }
 
-function isEnoent(err: unknown): boolean {
+export function isEnoent(err: unknown): boolean {
   return typeof err === "object" && err !== null && (err as { code?: string }).code === "ENOENT";
 }
 
@@ -410,11 +410,18 @@ function validateAdvisorEntry(entry: WatchdogYamlAdvisorEntry, sourcePath: strin
  * same search path as `WATCHDOG.md`. Advisors are keyed by slug; a
  * more-specific file (project leaf > project ancestor > user) replaces an
  * earlier entry with the same slug. Top-level `instructions` across all
- * files concatenate into the shared baseline. A malformed file is logged
- * and skipped — never thrown.
+ * files concatenate into the shared baseline. `excludePaths` can omit a
+ * specific file to inspect what it would inherit without that override.
+ * A malformed file is logged and skipped — never thrown.
  */
-export async function discoverAdvisorConfigs(cwd: string, agentDir?: string): Promise<DiscoveredAdvisors> {
-  const items = await collectConfigCandidates(cwd, agentDir, ["WATCHDOG.yml", "WATCHDOG.yaml"]);
+export async function discoverAdvisorConfigs(
+  cwd: string,
+  agentDir?: string,
+  options?: { excludePaths?: readonly string[] },
+): Promise<DiscoveredAdvisors> {
+  const excluded = new Set(options?.excludePaths?.map(p => path.resolve(p)) ?? []);
+  const items = (await collectConfigCandidates(cwd, agentDir, ["WATCHDOG.yml", "WATCHDOG.yaml"]))
+    .filter(item => !excluded.has(path.resolve(item.path)));
   const advisors = new Map<string, AdvisorConfig>();
   const sharedParts: string[] = [];
   let subagentsEnabled: boolean | undefined;

@@ -274,8 +274,11 @@ advisor's judgment always lags the primary by its own round-trip time.
 > `subagents:` for that child. Without `PI_SUBAGENT_CHILD=1` a child is treated as
 > an ordinary main session and follows `main:` — setting `PI_ADVISOR_SUBAGENTS`
 > alone does nothing.
-- `/advisor` — open the interactive control menu; subcommands also provide
-  descriptions and Tab completion
+- `/advisor` — open the control menu. **ON/OFF now (this session only)** is
+  temporary; to save ON/OFF, open **Settings for this project** or **User defaults
+  for all projects**, then choose the first item, **Advisor ON/OFF**. The saved
+  main-session and subagent defaults are separate; project settings override
+  user defaults. Subcommands also provide descriptions and Tab completion
 - `/advisor status` — which advisors are running, and their state
 - `/advisor inbox` — inspect, deliver, or dismiss preserved advisories waiting
   for the next normal user prompt (`Ctrl+Shift+A` opens the same inbox)
@@ -287,7 +290,8 @@ advisor's judgment always lags the primary by its own round-trip time.
   retaining the queue (`Ctrl+Shift+R` toggles)
 - `/advisor clear` — immediately discard every queued advisory
   (`Ctrl+Shift+X`; no confirmation)
-- `/advisor config` — interactive editor for `WATCHDOG.yml`
+- `/advisor config` — choose the project or user-default `WATCHDOG.yml` editor;
+  each also edits its own `WATCHDOG.md` attention instructions
 - `/advisor help` — command, shortcut, queue, and pause behavior reference
 
 ## Security and privacy
