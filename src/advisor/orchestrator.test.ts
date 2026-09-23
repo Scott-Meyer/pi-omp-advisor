@@ -100,6 +100,12 @@ async function harness(t: TestContext, review: Review, options?: { stop?: Primar
     let controller = new AbortController();
     let inFlight = Promise.resolve();
     const listeners = new Set<(event: AgentEvent, signal: AbortSignal) => void>();
+    const emit = (event: AgentEvent) => { for (const listener of listeners) listener(event, controller.signal); };
+    const finishMessage = (message: AgentMessage) => {
+      emit({ type: "message_start", message });
+      state.messages.push(message);
+      emit({ type: "message_end", message });
+    };
     const session = {
       // Faithful to AgentSession: its wrapper flag is not set by Agent.prompt.
       get isStreaming() { return false; },
@@ -115,8 +121,9 @@ async function harness(t: TestContext, review: Review, options?: { stop?: Primar
         prompt(messages: AgentMessage[]): Promise<void> {
           controller = new AbortController();
           state.isStreaming = true;
-          for (const listener of listeners) listener({ type: "agent_start" }, controller.signal);
-          state.messages.push(...messages);
+          emit({ type: "agent_start" });
+          emit({ type: "turn_start" });
+          for (const message of messages) finishMessage(message);
           inFlight = (async () => {
             try {
               const view: AgentMessage[] = await session.agent.transformContext?.(state.messages, controller.signal) ?? state.messages;
@@ -125,26 +132,27 @@ async function harness(t: TestContext, review: Review, options?: { stop?: Primar
               const result = await review(text, async (name, args = {}) => {
                 const tool = tools.find(candidate => candidate.name === name)!;
                 assert.ok(tool, `tool ${name} registered`);
-                const previousStreaming = state.streamingMessage;
-                if (typeof requestModel.provider === "string" && typeof requestModel.id === "string") {
-                  state.streamingMessage = {
-                    role: "assistant",
-                    provider: requestModel.provider,
-                    model: requestModel.id,
-                    content: [{ type: "toolCall", id: "test-call", name, arguments: args }],
-                  } as unknown as AgentMessage;
-                }
-                try {
-                  const result = await tool.execute("test-call", args, controller.signal, undefined, {} as ExtensionContext);
-                  return result.details;
-                } finally {
-                  state.streamingMessage = previousStreaming;
-                }
+                const toolMessage = {
+                  role: "assistant", provider: requestModel.provider ?? "fixture", model: requestModel.id ?? "fixture",
+                  content: [{ type: "toolCall", id: "test-call", name, arguments: args }], stopReason: "toolUse",
+                } as AssistantMessage;
+                finishMessage(toolMessage);
+                emit({ type: "tool_execution_start", toolCallId: "test-call", toolName: name, args });
+                const result = await tool.execute("test-call", args, controller.signal, undefined, {} as ExtensionContext);
+                emit({ type: "tool_execution_end", toolCallId: "test-call", toolName: name, result, isError: false });
+                const toolResult = { role: "toolResult", toolCallId: "test-call", toolName: name, content: result.content, isError: false, timestamp: Date.now() } as const;
+                finishMessage(toolResult);
+                emit({ type: "turn_end", message: toolMessage, toolResults: [toolResult] });
+                emit({ type: "turn_start" });
+                return result.details;
               }, controller.signal).catch(error => {
                 reviewFailures.push(error);
                 throw error;
               });
-              state.messages.push({ role: "assistant", content: [], stopReason: controller.signal.aborted ? "aborted" : result ?? "stop" } as unknown as AgentMessage);
+              const message = { role: "assistant", content: [], stopReason: controller.signal.aborted ? "aborted" : result ?? "stop" } as unknown as AgentMessage;
+              finishMessage(message);
+              emit({ type: "turn_end", message, toolResults: [] });
+              emit({ type: "agent_end", messages: state.messages });
             } finally {
               state.isStreaming = false;
             }
@@ -160,7 +168,7 @@ async function harness(t: TestContext, review: Review, options?: { stop?: Primar
         state.model = model;
       },
       setThinkingLevel(level: NonNullable<ExtensionContext["thinkingLevel"]>) { state.thinkingLevel = level; },
-      dispose() { sessionDisposals++; controller.abort(); },
+      dispose() { sessionDisposals++; controller.abort(); assert.equal(listeners.size, 0, "advisor listeners detach before session disposal"); },
     };
     if (sessionCount === unsupportedContextOnSession) delete (session.agent as { transformContext?: unknown }).transformContext;
     return { session } as unknown as Awaited<ReturnType<typeof createAgentSession>>;
@@ -211,6 +219,128 @@ function update(orchestrator: AdvisorOrchestrator, final: boolean) {
   if (final) orchestrator.onAgentSettled();
   else orchestrator.onTurnStart();
 }
+
+test("the advisor sees who said what under budget pressure, plus its session status", async t => {
+  let reviews = 0;
+  const { orchestrator } = await harness(t, async request => {
+    reviews++;
+    const view = request.split("\n").map(line => JSON.parse(line));
+    assert.equal(view.length, 2, "one window notice and one batched update");
+    const [windowNotice, batch] = view;
+    assert.match(windowNotice.content[0].text, /Session status/);
+    assert.match(batch.content[0].text, /Watched conversation/);
+    assert.match(batch.content[1].text, /### User/);
+    assert.match(batch.content[2].text, /Content omitted by the advisor context budget/);
+    assert.match(batch.content[3].text, /### Tool · bash · completed/);
+    assert.match(batch.content[5].text, /Session status/);
+  }, { contextTokens: 8_000 });
+  orchestrator.onMessage({ role: "user", content: "Please check the release. " + "context ".repeat(20_000), timestamp: 1 });
+  orchestrator.onMessage({ role: "assistant", content: [{ type: "toolCall", id: "c", name: "bash", arguments: { command: "npm test" } }] } as unknown as AgentMessage);
+  orchestrator.onMessage({ role: "toolResult", toolName: "bash", toolCallId: "c", content: [{ type: "text", text: "ok" }], isError: false, timestamp: 1 });
+  orchestrator.onTurnEnd();
+  orchestrator.onAgentSettled();
+  assert.equal(await orchestrator.drainForExit(2_000), true);
+  assert.equal(reviews, 1);
+});
+
+test("a tool that finishes in a later update is shown with the command it ran", async t => {
+  const requests: string[] = [];
+  const { orchestrator } = await harness(t, async request => { requests.push(request); });
+  orchestrator.onMessage({ role: "assistant", content: [{ type: "toolCall", id: "long", name: "bash", arguments: { command: "npm run slow-suite" } }] } as unknown as AgentMessage);
+  orchestrator.onTurnEnd();
+  orchestrator.onAgentSettled();
+  assert.equal(await orchestrator.drainForExit(2_000), true);
+  orchestrator.onMessage({ role: "toolResult", toolName: "bash", toolCallId: "long", content: [{ type: "text", text: "SUITE_OUTPUT" }], isError: false, timestamp: 1 });
+  orchestrator.onTurnEnd();
+  orchestrator.onAgentSettled();
+  assert.equal(await orchestrator.drainForExit(2_000), true);
+  assert.equal(requests.length, 2);
+  assert.match(requests[0]!, /Tool · bash · awaiting result/);
+  const latest = requests[1]!.split("\n").at(-1)!;
+  assert.match(latest, /Tool · bash · completed · started earlier/);
+  assert.match(latest, /npm run slow-suite/);
+  assert.doesNotMatch(requests.join("\n"), /SUITE_OUTPUT/);
+});
+
+test("a failed review with primary reasoning retries without resending that reasoning", async t => {
+  const cwd = await mkdtemp(join(tmpdir(), "advisor-retry-"));
+  const agentDir = join(cwd, "agent-config");
+  await mkdir(agentDir);
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  await writeFile(join(cwd, "WATCHDOG.yml"), "main: true\nmaxBehind: 1\nadvisors:\n  - name: reviewer\n    includePrimaryThinking: true\n");
+  const requests: string[] = [];
+  const host: OrchestratorHost = {
+    sendCustom() {}, preserveAdvice() {}, pendingAdvice: () => [],
+    reviseAdvice: () => false, withdrawAdvice: () => false,
+    currentTool: () => ({ status: "idle", activeCount: 0 }),
+    requestStop: () => ({ requested: false, status: "disabled", message: "Not enabled" }),
+    isStreaming: () => false, isAborting: () => false, isAutoResumeSuppressed: () => false, hasQueuedWork: () => false, setStatus() {},
+  };
+  const model = { id: "fixture", name: "fixture", provider: "fixture", api: "openai-completions", reasoning: false, input: ["text"], contextWindow: 100_000, maxTokens: 4096, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } } as NonNullable<ExtensionContext["model"]>;
+  const createSession: typeof createAgentSession = async options => {
+    const agent = new Agent({
+      initialState: {
+        model, systemPrompt: options?.resourceLoader?.getSystemPrompt() ?? "",
+        tools: options!.customTools!.map(tool => ({ ...tool, execute: (id, args, signal, onUpdate) => tool.execute(id, args, signal, onUpdate, {} as ExtensionContext) })),
+      },
+      streamFn: (_model, context) => {
+        requests.push(JSON.stringify(context.messages));
+        const number = requests.length;
+        const message: AssistantMessage = {
+          role: "assistant", provider: model.provider, model: model.id, api: model.api, timestamp: number,
+          content: [{ type: "text", text: number === 1 ? "" : "Reviewed." }],
+          stopReason: number === 1 ? "error" : "stop",
+          usage: { input: 100 * number, output: 30 * number, reasoning: 20 * number, cacheRead: 50 * number, cacheWrite: 10 * number, totalTokens: 190 * number, cost: { input: 0.01 * number, output: 0.01 * number, cacheRead: 0.01 * number, cacheWrite: 0.01 * number, total: 0.04 * number } },
+        };
+        const stream = createAssistantMessageEventStream();
+        if (message.stopReason === "error") stream.push({ type: "error", reason: "error", error: message });
+        else stream.push({ type: "done", reason: "stop", message });
+        stream.end();
+        return stream;
+      },
+    });
+    // A host can expire retained history as a run settles. Accounting and the
+    // success decision must use events, not an index into that mutable history.
+    const detach = agent.subscribe(event => { if (event.type === "agent_end") agent.state.messages = []; });
+    return { session: { agent, dispose: () => { detach(); agent.abort(); } } } as unknown as Awaited<ReturnType<typeof createAgentSession>>;
+  };
+  const orchestrator = new AdvisorOrchestrator(host, createSession);
+  t.after(() => orchestrator.disposeAll());
+  await orchestrator.start(await discoverAdvisorConfigs(cwd, agentDir), { cwd, model } as ExtensionContext, {}, agentDir);
+  orchestrator.onMessage({ role: "assistant", content: [
+    { type: "thinking", thinking: "PRIVATE_PRIMARY_REASONING" },
+    { type: "text", text: "VISIBLE_TEXT" },
+  ], stopReason: "stop" } as unknown as AgentMessage);
+  orchestrator.onTurnEnd();
+  orchestrator.onAgentSettled();
+  assert.equal(await orchestrator.drainForExit(2_000), true);
+  assert.equal(requests.length, 2, "the failed review, then its retry");
+  assert.match(requests[0]!, /PRIVATE_PRIMARY_REASONING/);
+  assert.doesNotMatch(requests[1]!, /PRIVATE_PRIMARY_REASONING/, "the failed attempt's history isn't resent");
+  assert.match(requests[1]!, /VISIBLE_TEXT/);
+  assert.match(requests[1]!, /history cleared after a failed review/);
+  assert.equal(orchestrator.statusOverview()[0]?.includePrimaryThinking, false);
+  const usage = orchestrator.statusOverview()[0]!.usage!;
+  assert.equal(usage.modelRequests, 2, "the failed attempt counts");
+  assert.equal(usage.modelResponses, 2);
+  assert.equal(usage.toolRequests, 0);
+  assert.deepEqual(usage.tokens, { input: 300, output: 90, cacheRead: 150, cacheWrite: 30 });
+  assert.equal(usage.responsesWithUsage, 2);
+  assert.equal(usage.responsesWithCost, 2);
+  assert.ok(Math.abs(usage.estimatedCostUsd - 0.12) < 1e-9);
+  assert.deepEqual(orchestrator.statusOverview()[0]!.usage, usage, "status reads never recount retained history");
+  await orchestrator.setPaused(true);
+  await orchestrator.setPaused(false);
+  await orchestrator.resetRuntimesOnly();
+  assert.deepEqual(orchestrator.statusOverview()[0]!.usage, usage, "pause and model-context rebuild retain the runtime ledger");
+  update(orchestrator, true);
+  assert.equal(await orchestrator.drainForExit(2_000), true);
+  assert.equal(orchestrator.statusOverview()[0]!.usage!.modelResponses, 3);
+  assert.doesNotMatch(requests[2]!, /PRIVATE_PRIMARY_REASONING/);
+  assert.equal(orchestrator.statusOverview()[0]!.status, "running");
+  await orchestrator.start(await discoverAdvisorConfigs(cwd, agentDir), { cwd, model } as ExtensionContext, {}, agentDir);
+  assert.equal(orchestrator.statusOverview()[0]!.usage!.modelResponses, 0, "a fresh runtime starts a new ledger");
+});
 
 test("a zero-config default advisor inherits the active chat model and thinking level", async t => {
   const activeModel = { provider: "runtime-only", id: "selected-with-cli", contextWindow: 128_000 } as ExtensionContext["model"];

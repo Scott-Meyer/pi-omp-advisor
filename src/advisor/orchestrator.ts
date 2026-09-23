@@ -22,7 +22,7 @@
 import type { ExtensionContext, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { createAgentSession, DefaultResourceLoader, SessionManager } from "@earendil-works/pi-coding-agent";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage } from "@earendil-works/pi-ai";
+import type { ToolCall } from "@earendil-works/pi-ai";
 // `ThinkingLevel` must come from pi-agent-core, which is what
 // `CreateAgentSessionOptions.thinkingLevel` is typed against (`sdk.d.ts:1`).
 // pi-ai exports a NARROWER type of the same name that omits "off", so importing
@@ -42,7 +42,9 @@ import {
 } from "./advise-logic.ts";
 import { ADVISOR_COMMUNICATION_TOOLS, makeAdviseTool } from "./advise-tool.ts";
 import { AdvisorEmissionGuard } from "./emission-guard.ts";
-import { renderAdvisorDeltaMessages } from "./delta-render.ts";
+import { AdvisorUsageLedger, type AdvisorUsageConnection, type AdvisorUsageStatus } from "./usage.ts";
+import { openToolCallsAfter, renderAdvisorDeltaMessages } from "./delta-render.ts";
+import { advisorObservationContent } from "./observations.ts";
 import { SerializedTransition } from "./serialized-transition.ts";
 import { installAdvisorContextWindow, type ContextWindowStatus } from "./context-window.ts";
 import { ADVISOR_STOP_TOOLS } from "./stop-tools.ts";
@@ -118,7 +120,7 @@ const ADVISOR_THINKING_LEVEL_SUFFIXES: ReadonlySet<string> = new Set([
  * The communication tools (advise plus pending-note controls) are included
  * alongside the investigative tools, even with an explicit tools: allowlist.
  */
-function withAdviseTool(toolNames: string[]): string[] {
+function withAdvisorTools(toolNames: string[]): string[] {
   return [...new Set([
     ...toolNames, ...ADVISOR_COMMUNICATION_TOOLS,
     ...(toolNames.includes("request_stop") ? ADVISOR_STOP_TOOLS : []),
@@ -183,6 +185,8 @@ interface ActiveAdvisor {
   adviseState: ReturnType<typeof makeAdviseTool> extends Promise<{ state: infer S }> ? S : never;
   pendingMessages: AgentMessage[];
   awaitingBatch: AgentMessage[] | undefined;
+  /** Calls already shown to the advisor that haven't completed, for pairing late results. */
+  openCalls: ReadonlyMap<string, ToolCall>;
   /** Completed primary turns represented by `awaitingBatch`. */
   awaitingTurns: number;
   /**
@@ -210,8 +214,8 @@ interface ActiveAdvisor {
   flushOnSettled: boolean;
   flushTimer: NodeJS.Timeout | undefined;
   wakeCount: number;
-  modelRequestCount: number;
-  toolCallCount: number;
+  usage: AdvisorUsageLedger;
+  usageConnection: AdvisorUsageConnection;
 }
 
 export interface AdvisorStatusOverviewItem {
@@ -228,6 +232,7 @@ export interface AdvisorStatusOverviewItem {
   wakes: number;
   modelRequests: number;
   toolCalls: number;
+  usage?: AdvisorUsageStatus;
   context?: ContextWindowStatus;
   includePrimaryThinking?: boolean;
 }
@@ -375,22 +380,26 @@ export class AdvisorOrchestrator {
     // being prompted — the honest "how far behind is this advisor" number, shown in
     // `/advisor status` rather than logged to stderr every time it happens.
     return [
-      ...this.#advisors.map(a => ({
-        name: a.config.name,
-        model: this.#modelLabel(a),
-        status: a.status,
-        backlog: a.queue.reduce((sum, item) => sum + item.turns, 0),
-        backlogMessages: a.queue.reduce((sum, item) => sum + item.batch.length, 0),
-        pendingTurns: a.awaitingTurns,
-        wakeEveryTurns: a.maxBehind,
-        flushTimeoutMs: a.flushTimeoutMs,
-        flushOnSettled: a.flushOnSettled,
-        wakes: a.wakeCount,
-        modelRequests: a.modelRequestCount,
-        toolCalls: a.toolCallCount,
-        context: a.memory.window.status,
-        includePrimaryThinking: a.includeThinking,
-      })),
+      ...this.#advisors.map(a => {
+        const usage = a.usage.snapshot();
+        return {
+          name: a.config.name,
+          model: this.#modelLabel(a),
+          status: a.status,
+          backlog: a.queue.reduce((sum, item) => sum + item.turns, 0),
+          backlogMessages: a.queue.reduce((sum, item) => sum + item.batch.length, 0),
+          pendingTurns: a.awaitingTurns,
+          wakeEveryTurns: a.maxBehind,
+          flushTimeoutMs: a.flushTimeoutMs,
+          flushOnSettled: a.flushOnSettled,
+          wakes: a.wakeCount,
+          modelRequests: usage.modelRequests,
+          toolCalls: usage.toolRequests,
+          usage,
+          context: a.memory.window.status,
+          includePrimaryThinking: a.includeThinking,
+        };
+      }),
       ...this.#noModelAdvisors.map(a => ({
         name: a.name,
         model: a.model,
@@ -518,7 +527,7 @@ export class AdvisorOrchestrator {
     }
     const toolNames = config.tools === undefined ? ADVISOR_DEFAULT_TOOL_NAMES : new Set(config.tools);
     const effectiveToolNames = [...toolNames].filter(name => stopEnabled || name !== "request_stop");
-    const resolvedToolNames = withAdviseTool(effectiveToolNames.map(resolveAdvisorToolName));
+    const resolvedToolNames = withAdvisorTools(effectiveToolNames.map(resolveAdvisorToolName));
 
     const systemPrompt = await buildAdvisorSystemPrompt({
       watchdogBlocks,
@@ -572,6 +581,7 @@ export class AdvisorOrchestrator {
       return undefined;
     }
 
+    const usage = new AdvisorUsageLedger();
     return {
       config,
       stopEnabled,
@@ -582,6 +592,7 @@ export class AdvisorOrchestrator {
       emissionGuard,
       adviseState,
       pendingMessages: [],
+      openCalls: new Map(),
       awaitingBatch: undefined,
       awaitingTurns: 0,
       queue: [],
@@ -597,8 +608,8 @@ export class AdvisorOrchestrator {
       flushOnSettled: config.flushOnSettled ?? configs?.flushOnSettled ?? DEFAULT_FLUSH_ON_SETTLED,
       flushTimer: undefined,
       wakeCount: 0,
-      modelRequestCount: 0,
-      toolCallCount: 0,
+      usage,
+      usageConnection: usage.connect(session.agent),
     };
   }
 
@@ -746,6 +757,7 @@ export class AdvisorOrchestrator {
         // alone is not an awaitable cancellation barrier.
         await advisor.session.agent.waitForIdle();
       } finally {
+        advisor.usageConnection.dispose();
         advisor.memory.dispose();
         advisor.session.dispose();
       }
@@ -783,6 +795,7 @@ export class AdvisorOrchestrator {
       for (const note of discarded) advisor.emissionGuard.forget(note.note);
       const oldSession = advisor.session;
       const oldMemory = advisor.memory;
+      const oldUsageConnection = advisor.usageConnection;
       const rebuildGeneration = ++advisor.generation;
       advisor.contextNotice = "Your model context was rebuilt after a transcript change. Earlier history is not replayed; pending advice may refer to that older context.";
       try {
@@ -796,7 +809,7 @@ export class AdvisorOrchestrator {
         const thinkingLevel = resolvedModel?.thinkingLevel ?? (advisor.config.model === undefined ? this.#activeChatThinkingLevel : undefined);
         const toolNames = advisor.config.tools === undefined ? ADVISOR_DEFAULT_TOOL_NAMES : new Set(advisor.config.tools);
         const effectiveToolNames = [...toolNames].filter(name => advisor.stopEnabled || name !== "request_stop");
-        const resolvedToolNames = withAdviseTool(effectiveToolNames.map(resolveAdvisorToolName));
+        const resolvedToolNames = withAdvisorTools(effectiveToolNames.map(resolveAdvisorToolName));
         const systemPrompt = await buildAdvisorSystemPrompt({
           watchdogBlocks,
           sharedInstructions,
@@ -843,15 +856,18 @@ export class AdvisorOrchestrator {
           created.session.dispose();
           continue;
         }
+        advisor.usageConnection = advisor.usage.connect(created.session.agent);
         advisor.session = created.session;
         advisor.memory = newMemory;
         advisor.adviseState = adviseState;
         advisor.status = "running";
         advisor.halted = false;
+        oldUsageConnection.dispose();
         oldMemory.dispose();
         oldSession.dispose();
       } catch (err) {
         if (advisor.disposed || advisor.generation !== rebuildGeneration) continue;
+        oldUsageConnection.dispose();
         oldMemory.dispose();
         oldSession.dispose();
         advisor.status = "error";
@@ -869,7 +885,7 @@ export class AdvisorOrchestrator {
    * inputs.
    */
   onMessage(message: AgentMessage): void {
-    if (this.#paused) return;
+    if (this.#paused || (message.role === "bashExecution" && message.excludeFromContext)) return;
     for (const advisor of this.#advisors) {
       if (advisor.disposed || advisor.halted) continue;
       const hadPendingActivity = advisor.pendingMessages.length > 0 || Boolean(advisor.awaitingBatch);
@@ -1027,10 +1043,16 @@ export class AdvisorOrchestrator {
     const reviewSession = advisor.session;
     const reviewState = advisor.adviseState;
     const memory = advisor.memory;
+    const usageConnection = advisor.usageConnection;
     const generation = advisor.generation;
     const contextNotice = advisor.contextNotice;
+    let retryNotice: string | undefined;
+    // Both attempts render against the same earlier calls; the next batch sees this one's.
+    const earlierCalls = advisor.openCalls;
+    advisor.openCalls = openToolCallsAfter(earlierCalls, batch);
     const attempt = async (includeThinking: boolean): Promise<boolean> => {
-      const chunks = renderAdvisorDeltaMessages(batch, { wip, includeThinking }) ?? [];
+      const chunks = renderAdvisorDeltaMessages(batch, { wip, includeThinking, earlierCalls }) ?? [];
+      const runtimeContext: string[] = [];
       // Tool events do not trigger reviews. If stop access was explicitly
       // granted, sample the controller only when a scheduled review is about
       // to run so queued metadata cannot point at a tool that has since ended.
@@ -1038,42 +1060,31 @@ export class AdvisorOrchestrator {
         const currentTool = this.#host.currentTool();
         if (currentTool.status !== "idle") {
           const activity = `### Current primary tool state (live runtime metadata)\n${JSON.stringify(currentTool)}\nThis is a point-in-time snapshot. request_stop revalidates the target and fails closed if it ended, changed, became ambiguous, or is no longer the sole active call.`;
-          if (chunks.length === 0) chunks.push({ role: "user", text: activity });
-          else chunks[chunks.length - 1]!.text += `\n\n${activity}`;
+          runtimeContext.push(activity);
         }
       }
-      if (chunks.length === 0) return false;
+      if (chunks.length === 0 && runtimeContext.length === 0) return false;
       if (!updateBegun) {
         updateBegun = true;
         advisor.emissionGuard.beginUpdate();
         reviewState.beginUpdate(wip);
       }
-      if (contextNotice) chunks[chunks.length - 1]!.text += `\n\n### Observation context\n${contextNotice}`;
+      if (contextNotice) runtimeContext.push(`### Observation context\n${contextNotice}`);
+      if (retryNotice) runtimeContext.push(retryNotice);
       const pendingSummary = reviewState.pendingSummary();
-      if (pendingSummary) chunks[chunks.length - 1]!.text += `\n\n${pendingSummary}`;
-      const messages: AgentMessage[] = chunks.map(c => ({
-        role: "user",
-        content: [{ type: "text", text: c.text }],
-        timestamp: Date.now(),
-      })) as AgentMessage[];
-      // `session.prompt()` only accepts a single string; the underlying
-      // `Agent.prompt()` (exposed via `session.agent`) accepts
-      // `AgentMessage | AgentMessage[]` directly, which is what lets this
-      // send upstream's real one-user-message-per-source-message split
-      // instead of collapsing it back into one string.
-      const previousMessageCount = reviewSession.agent.state.messages.length;
-      let lastAssistant: AssistantMessage | undefined;
+      if (pendingSummary) runtimeContext.push(pendingSummary);
+      if (runtimeContext.length > 0) {
+        const content = advisorObservationContent("Session status", runtimeContext.join("\n\n"));
+        if (chunks.length === 0) chunks.push({ role: "user", content });
+        else chunks[0]!.content.push(...content);
+      }
+      const messages: AgentMessage[] = chunks.map(c => ({ ...c, timestamp: Date.now() }));
+      // One chronological update; provider text blocks preserve item boundaries
+      // so budgeting can shorten bodies without removing their headings.
+      const previousResponses = usageConnection.completedResponses;
       try {
         await reviewSession.agent.prompt(messages);
       } finally {
-        const generated = reviewSession.agent.state.messages.slice(previousMessageCount);
-        const assistantMessages = generated.filter(message => message.role === "assistant") as AssistantMessage[];
-        advisor.modelRequestCount += assistantMessages.length;
-        advisor.toolCallCount += assistantMessages.reduce(
-          (count, message) => count + message.content.filter(block => block.type === "toolCall").length,
-          0,
-        );
-        lastAssistant = assistantMessages.at(-1);
         // Model-input trimming also runs between investigative tool calls. Once
         // the Agent settles, expire the same material from retained history.
         memory.trimRetainedHistory();
@@ -1081,6 +1092,7 @@ export class AdvisorOrchestrator {
       if (memory.interrupted || this.#paused || advisor.disposed || advisor.generation !== generation) return false;
       // Resolved does not necessarily mean completed: length limits, provider
       // deferral, errors, and aborts can all resolve without a finished review.
+      const lastAssistant = usageConnection.completedResponses > previousResponses ? usageConnection.lastResponse : undefined;
       if (lastAssistant?.stopReason !== "stop") {
         throw new Error(lastAssistant?.errorMessage ?? `Advisor review did not complete (${lastAssistant?.stopReason ?? "no response"})`);
       }
@@ -1094,6 +1106,12 @@ export class AdvisorOrchestrator {
       if (this.#paused || advisor.disposed || advisor.generation !== generation) return;
       if (advisor.includeThinking) {
         advisor.includeThinking = false;
+        // The failed run already appended its prompt, reasoning included, to
+        // retained history. Filtering only the replacement batch would resend
+        // that older copy. prompt() has settled, so retire that history
+        // before the retry; pending advice remains in its independent store.
+        reviewSession.agent.state.messages = [];
+        retryNotice = "Advisor history cleared after a failed review. This retry excludes primary reasoning; pending advice may refer to the earlier context.";
         try {
           if (await attempt(false)) advisor.status = "running";
           return;

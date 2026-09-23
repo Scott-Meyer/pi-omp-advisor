@@ -98,15 +98,17 @@ copyright Scott Meyer, MIT (see `LICENSE`):
    without forcing a turn. Late ordinary notes, including nits, take this inbox
    path before aside routing. A queued aside is checked again before handoff in
    case the primary has completed or been stopped in the meantime.
-3. **Multi-message delta chunking** (omp's `delta-split.ts`, built for
-   provider prompt-cache locality) IS ported (`src/advisor/delta-render.ts`,
-   `renderAdvisorDeltaMessages`): each batch is split into one user message
-   per source message, sent to the advisor's underlying `Agent.prompt()`
-   (`AgentMessage[]` form, via `session.agent.prompt(...)` since the
-   higher-level `session.prompt()` wrapper only accepts a single string) —
-   not collapsed into one joined string. Cache-locality behavior itself
-   depends on the provider's own prompt caching, not verified here, but the
-   message-boundary shape matches upstream.
+3. **Card-shaped batches** differ from omp's `delta-split.ts`. One update per
+   batch is sent through `Agent.prompt()`, as a heading block and a body block
+   per item, so budgeting can shorten bodies while keeping who said what. The
+   visibility rules match the upstream digest: one line per tool call (primary
+   argument, status, size, first error line, bounded edit/write diffs).
+   Successful result bodies and ordinary read-file contents stay out. A call's
+   card updates in place when its result arrives with only other tool activity
+   in between; after intervening conversation, or in a later batch,
+   the completion appears where it arrived. Custom messages hidden in the UI are
+   skipped, and visible ones are labeled previews (peer name for Parley). The
+   turn/settlement/timer wake cadence is unchanged.
 4. **Session-file transcript recording** (omp's `AdvisorTranscriptRecorder`,
    `__advisor.jsonl`, its own stats/usage system) has no pi equivalent and is
    not ported. Advisor sessions are in-memory; their full transcript and tool
@@ -208,6 +210,14 @@ copyright Scott Meyer, MIT (see `LICENSE`):
    extension-generated inputs do not. This does not observe separate retry or
    compaction cancellation signals. `src/advisor/primary-interruption.ts` and
    its tests are original to this project (Scott Meyer, MIT).
+
+16. **History-independent usage accounting.** Finalized child-Agent responses
+   supply cumulative SDK-normalized token and tool-request totals; Agent turn starts
+   count model attempts, not provider-internal HTTP retries. Runtime totals survive
+   context expiry/rebuilds and appear only in human status, with explicit missing
+   usage/pricing coverage and non-invoice cost estimates. Review settlement follows
+   those finalized events too, rather than slicing a potentially shortened history.
+   `src/advisor/usage.ts` and its tests are original to this project (Scott Meyer, MIT).
 
 ## Corrections made after the initial port
 

@@ -56,8 +56,10 @@ import { Text, type AutocompleteItem } from "@earendil-works/pi-tui";
 import { formatAdvisorBatchContent, type AdvisorNote } from "./advisor/advise-logic.ts";
 import { attachEnterDelivery } from "./advisor/enter-delivery.ts";
 import { showAdvisorStream } from "./advisor/stream-view.ts";
+import { pickModel } from "./advisor/model-picker.ts";
 import { AdvisorInbox, type QueuedAdvisorNote } from "./advisor/advisor-inbox.ts";
 import { AdvisorOrchestrator, type AdvisorStatusOverviewItem, type OrchestratorHost } from "./advisor/orchestrator.ts";
+import { formatAdvisorUsage } from "./advisor/usage.ts";
 import { renderAdvisorMessage, type AdvisorMessageDetails } from "./advisor/advisor-message.ts";
 import { RequestedBooleanState, SerializedTransition } from "./advisor/serialized-transition.ts";
 import { PrimaryStopController, formatStopReceipt } from "./advisor/primary-stop.ts";
@@ -982,14 +984,13 @@ export default function (pi: ExtensionAPI) {
     ctx: ExtensionCommandContext,
     current: string | undefined,
   ): Promise<string | undefined | null> {
-    const availableModels = ctx.modelRegistry.getAvailable();
-    const NO_OVERRIDE = "(use the current Pi session model — no override)";
-    const labels = [NO_OVERRIDE, ...availableModels.map(m => `${m.provider}/${m.id} — ${m.name}`)];
-    const choice = await ctx.ui.select(`Model (current: ${current ? (cleanModelId(current) ?? current) : "current Pi session model"})`, labels);
-    if (choice === undefined) return null;
-    if (choice === NO_OVERRIDE) return undefined;
-    const model = availableModels[labels.indexOf(choice) - 1];
-    return model ? `${model.provider}/${model.id}` : null;
+    const pick = await pickModel(ctx.ui, ctx.mode, {
+      title: `Advisor model (current: ${current ? (cleanModelId(current) ?? current) : "current Pi session model"})`,
+      models: ctx.modelRegistry.getAvailable(),
+      current,
+    });
+    if (pick === null) return null;
+    return pick.kind === "follow-session" ? undefined : pick.model;
   }
 
   async function pickAndApplyAdvisorModel(
@@ -2115,11 +2116,12 @@ export default function (pi: ExtensionAPI) {
       ` · pending batch: ${s.pendingTurns}/${s.wakeEveryTurns} turn(s)` +
       ` · maxWait: ${s.flushTimeoutMs}ms` +
       (s.flushOnSettled === false ? " · waits for turn batch" : "") +
-      ` · wakes/requests/tools: ${s.wakes}/${s.modelRequests}/${s.toolCalls}` +
+      ` · wakes: ${s.wakes}` +
+      (s.usage ? `; ${formatAdvisorUsage(s.usage)}` : "") +
       (s.context ? `; context ~${s.context.estimatedTokens}/${s.context.limitTokens} tokens, ${s.context.retainedMessages} messages, ${s.context.resets} reset(s)${s.context.trimmed ? " (older content expired/shortened)" : ""}; primary reasoning ${s.includePrimaryThinking ? "included" : "excluded"}` : "");
     const unusable = overview.filter(s => s.status === "no_model");
     const state = advisorPaused
-      ? `paused — ${inbox.items.length} queued ${inbox.items.length === 1 ? "advisory" : "advisories"} retained; no new advisor work will start`
+      ? `paused — ${inbox.items.length} queued ${inbox.items.length === 1 ? "advisory" : "advisories"} retained; no new advisor work will start (${overview.map(describe).join(", ")})`
       : isActive()
         ? `on — watching with: ${orchestrator!.advisorLabels.join(", ")} (${overview.map(describe).join(", ")})`
         : runtimeOverride === false

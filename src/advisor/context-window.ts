@@ -1,6 +1,7 @@
 import type { Agent, AgentMessage } from "@earendil-works/pi-agent-core";
 import { estimateTokens } from "@earendil-works/pi-coding-agent";
 import type { ToolResultMessage, UserMessage } from "@earendil-works/pi-ai";
+import { advisorObservationContent, shortenAdvisorObservation } from "./observations.ts";
 
 export const DEFAULT_ADVISOR_CONTEXT_TOKENS = 32_000;
 export const MIN_ADVISOR_CONTEXT_TOKENS = 2_048;
@@ -82,11 +83,16 @@ function shortenMessage(message: AgentMessage, limit: number): AgentMessage | un
     ? { ...message, content: text }
     : { ...message, content: [{ type: "text", text }] };
   const candidate = (characters: number) => {
+    const observation = message.role === "user" ? shortenAdvisorObservation(message, characters, OMISSION) : undefined;
+    if (observation) return observation;
     const head = Math.ceil(characters / 2);
     const tail = Math.floor(characters / 2);
     return withText(source.slice(0, head) + OMISSION + (tail > 0 ? source.slice(-tail) : ""));
   };
-  if (estimateContextMessageTokens(candidate(0)) > limit) return undefined;
+  // A protected source envelope may exceed this candidate's share of the
+  // deficit. Still contribute its available savings; other messages can make
+  // up the rest. The caller enforces the total budget after all reductions.
+  if (estimateContextMessageTokens(candidate(0)) > limit) return candidate(0);
   let low = 0;
   let high = Math.max(0, source.length - 1);
   while (low < high) {
@@ -254,7 +260,7 @@ export class AdvisorContextWindow {
   }
 
   notice(): UserMessage {
-    return { role: "user", content: WINDOW_NOTICE, timestamp: 0 };
+    return { role: "user", content: advisorObservationContent("Session status", WINDOW_NOTICE), timestamp: 0 };
   }
 }
 

@@ -1,95 +1,74 @@
-/**
- * Ported from oh-my-pi `src/advisor/delta-split.ts` (npm
- * `@oh-my-pi/pi-coding-agent@17.4.1`) — renders one advisor delta as
- * MULTIPLE user-shaped messages, one per source message, instead of one
- * ever-growing block. Upstream's reason: provider prompt caches are
- * prefix-based, so a single message whose text keeps growing invalidates
- * the whole thing on every turn; splitting into per-source messages lets
- * cache_read grow with the session instead of pinning at the
- * instructions/tools boundary. Each source message is rendered
- * INDEPENDENTLY via `formatSessionHistoryMarkdown` in chunked mode (shared
- * `toolResultIndex` + `consumedToolCallIds` + `watchedRoleState` over the
- * WHOLE delta), so toolCall/toolResult pairings resolve across chunk
- * boundaries and consecutive same-role collapsing is byte-identical to a
- * single-block render. Concatenating the chunk texts reproduces the
- * single-block advisor context exactly.
- *
- * The heading stays on the FIRST chunk; the WIP marker stays on the LAST
- * chunk, so a wip/final flip never changes the stable prefix. See
- * ../../PROVENANCE.md.
- */
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { ToolResultMessage } from "@earendil-works/pi-ai";
-import { formatSessionHistoryMarkdown } from "./session-history-format.ts";
+import type { TextContent, ToolCall } from "@earendil-works/pi-ai";
+import { activityContent, advisorObservationBatch, observationCards, toolCard, type ActivityCard } from "./observations.ts";
 
-/** Exact upstream render options for the advisor's context (`ADVISOR_RENDER_OPTIONS`). */
-export const ADVISOR_RENDER_OPTIONS = {
-  includeToolIntent: true,
-  watchedRoles: true,
-  expandPrimaryContext: true,
-  expandEditDiffs: true,
-} as const;
-
+/** User is the transport role, not the author of the watched conversation. */
 export interface AdvisorDeltaMessage {
   role: "user";
-  text: string;
+  content: TextContent[];
 }
-
 export interface RenderAdvisorDeltaOptions {
   wip: boolean;
   includeThinking: boolean;
+  /** Calls from earlier batches still awaiting results, by tool-call ID. */
+  earlierCalls?: ReadonlyMap<string, ToolCall>;
 }
 
 /**
- * Render one batch of primary-transcript delta messages as a sequence of
- * advisor-facing user messages (one per source message that rendered to
- * non-empty text), or `null` if nothing in the batch was renderable.
+ * One chronological update. Each tool call is one card: when its result
+ * arrives with only other tool activity in between (parallel calls, say), the
+ * call's card becomes the completed card, much like the host's screen updates
+ * it in place. When conversation arrived in between, or the call was in an
+ * earlier batch, the completion appears where it arrived instead, so it never
+ * looks finished before a correction that came first.
  */
-export function renderAdvisorDeltaMessages(
-  delta: AgentMessage[],
-  opts: RenderAdvisorDeltaOptions,
-): AdvisorDeltaMessage[] | null {
-  if (delta.length === 0) return null;
-
-  const resultsByCallId = new Map<string, ToolResultMessage>();
-  for (const msg of delta) {
-    if (msg.role === "toolResult") resultsByCallId.set((msg as ToolResultMessage).toolCallId, msg as ToolResultMessage);
+export function renderAdvisorDeltaMessages(delta: AgentMessage[], opts: RenderAdvisorDeltaOptions): AdvisorDeltaMessage[] | null {
+  const cards: ActivityCard[] = [];
+  const open = new Map<string, { index: number; call: ToolCall }>();
+  let lastConversation = -1;
+  for (const message of delta) {
+    if (message.role === "toolResult") {
+      const local = open.get(message.toolCallId);
+      if (local && local.call.name === message.toolName) {
+        open.delete(message.toolCallId);
+        if (lastConversation < local.index) cards[local.index] = toolCard(local.call, message);
+        else cards.push(toolCard(local.call, message, true));
+        continue;
+      }
+      const earlier = opts.earlierCalls?.get(message.toolCallId);
+      const call = earlier?.name === message.toolName ? earlier : undefined;
+      cards.push(toolCard(call, message, Boolean(call)));
+      continue;
+    }
+    for (const card of observationCards(message, opts.includeThinking)) {
+      cards.push(card);
+      if (card.kind === "conversation") lastConversation = cards.length - 1;
+      else if (card.call) open.set(card.call.id, { index: cards.length - 1, call: card.call });
+    }
   }
-  const consumed = new Set<string>();
-  const watchedRoleState = { lastLabel: undefined as string | undefined };
-
-  const renderChunk = (chunk: AgentMessage[]): string =>
-    formatSessionHistoryMarkdown(chunk, {
-      ...ADVISOR_RENDER_OPTIONS,
-      includeThinking: opts.includeThinking,
-      toolResultIndex: resultsByCallId,
-      consumedToolCallIds: consumed,
-      watchedRoleState,
-    });
-
-  const heading = "### Session update";
-  const chunks: AdvisorDeltaMessage[] = [];
-  for (const msg of delta) {
-    const text = renderChunk([msg]);
-    if (!text.trim()) continue;
-    chunks.push({ role: "user", text });
-  }
-  if (chunks.length === 0) return null;
-
-  chunks[0].text = `${heading}\n\n${chunks[0].text}`;
-  if (opts.wip) {
-    const last = chunks[chunks.length - 1];
-    last.text += `\n\n---\n\n[in progress — more steps follow]`;
-  }
-  return chunks;
+  return cards.length === 0 ? null : [{ role: "user", content: advisorObservationBatch(cards.map(activityContent), opts.wip) }];
 }
 
-/**
- * Concatenate a chunked render back into one string, matching the
- * single-block render byte-for-byte (used where the host needs one string,
- * e.g. a single `session.prompt()` call rather than a multi-message
- * array).
- */
+/** Bound on remembered unresolved calls; the oldest are forgotten first. */
+const MAX_OPEN_CALLS = 256;
+
+/** Calls still awaiting results once `delta` has been seen, for pairing late completions. */
+export function openToolCallsAfter(earlier: ReadonlyMap<string, ToolCall>, delta: AgentMessage[]): Map<string, ToolCall> {
+  const open = new Map(earlier);
+  for (const message of delta) {
+    if (message.role === "assistant") {
+      for (const block of message.content) if (block.type === "toolCall") { open.delete(block.id); open.set(block.id, block); }
+    } else if (message.role === "toolResult") {
+      open.delete(message.toolCallId);
+    }
+  }
+  for (const id of open.keys()) {
+    if (open.size <= MAX_OPEN_CALLS) break;
+    open.delete(id);
+  }
+  return open;
+}
+
 export function joinAdvisorDeltaMessages(chunks: AdvisorDeltaMessage[]): string {
-  return chunks.map(c => c.text).join("\n");
+  return chunks.map(c => c.content.map(block => block.text).filter(Boolean).join("")).join("\n");
 }

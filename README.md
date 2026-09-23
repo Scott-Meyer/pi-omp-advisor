@@ -21,17 +21,20 @@ specific to this port; `PROVENANCE.md` documents those differences.
 
 On session start, pi-omp-advisor builds one live in-process `AgentSession` per
 configured advisor, each with its own model and its own throwaway context,
-and feeds it a compact digest of the primary agent's transcript — normally one
-batch per primary turn, one line per tool call. Its recent model context is
-bounded to **32,000 estimated input tokens** by default, and primary-agent
-reasoning is excluded unless explicitly enabled.
+and feeds it a compact skim of the primary session, much like someone glancing
+over your shoulder: normally one batch per primary turn, with your messages and the
+primary's replies in full and one short card per tool call. Successful tool-result
+bodies and ordinary read-file contents stay out; first-line error previews and
+bounded edit/write diffs may be included. Its recent model context is bounded to
+**32,000 estimated input
+tokens** by default, and primary-agent reasoning is excluded unless explicitly enabled.
 
 An advisor reaches the primary agent and operator through `advise(note, severity?, ShortTitle?)`
 and `update_advice(targetId, note, ShortTitle?, severity?)`.
 Alongside them, an advisor gets whatever investigative tools its config grants — by
 default the read-only set `read`, `grep`, `find` (configured as `glob` too) — so it can check a
-claim before raising it. Every tool response automatically includes a live snapshot of
-its pending queue and review allowance, eliminating multi-turn state-query churn. How a
+claim before raising it. Advice-management tool responses include a live snapshot of
+its pending queue and review allowance, avoiding separate state-query turns. How a
 note reaches the primary depends on severity and on what the primary is doing:
 
 | Situation | Channel |
@@ -106,7 +109,25 @@ before that review expires at once. Nothing summarizes or replays the reasoning
 path that filled the old context. Pending advice is stored separately, so a reset
 does not remove its IDs or prevent revision/withdrawal.
 
-The limit applies before **every model request**, including follow-ups after the
+### What the feed shows, and usage
+
+Each tool call is one card: the command, path, or main argument (up to 120
+characters), its status and size, the first line of an error, and a bounded diff
+for edits and writes. When calls run in parallel, each card updates in place as
+its result arrives. If conversation arrives before a result, such as your
+correction or a peer's message, the completion is shown where it arrived.
+Peer, extension, and advisor messages and summaries appear as labeled previews of
+up to 500 characters; messages hidden from your screen are hidden from the advisor too.
+
+`/advisor status` shows cumulative reported usage since the advisor runtime started:
+uncached input, cache-read/write, output (including reported reasoning), model
+attempts/responses, and tool requests. Counts survive model-context rebuilds and
+history expiry; a new runtime or reload starts fresh. SDK/provider dollar figures
+are estimates, not invoices. Missing usage or zero/missing pricing is shown as
+unavailable or partial, not free. Provider-internal retries can remain unreported.
+These counters don't add model requests, enter its prompt, or enforce a spending stop.
+
+The context limit applies before **every model request**, including follow-ups after the
 advisor's own tool calls. It counts estimated system/tool overhead as well as
 conversation text, and is reduced on small models to leave reply headroom.
 Estimates use Pi's character-based heuristic, not an exact provider tokenizer.
@@ -304,7 +325,7 @@ trust implications.
 routes. If `model:` names a different provider than your main session, all of this
 goes to a *second* vendor.
 
-1. **The per-turn digest** (`src/advisor/session-history-format.ts`), which is
+1. **The per-turn feed** (`src/advisor/observations.ts`), which is
    deliberately compact rather than a transcript dump:
 
    | Included | Form |
@@ -312,11 +333,12 @@ goes to a *second* vendor.
    | your messages | verbatim within the recent window; oversized text may be shortened |
    | assistant replies | verbatim within the recent window; oversized text may be shortened |
    | assistant reasoning | excluded by default; available text included only with `includePrimaryThinking: true` |
-   | tool calls | name + one primary argument, truncated to 120 chars (so file paths, commands, grep patterns, URLs) |
-   | successful tool results | status and size only — `⇒ ok · 31 lines`, **no body** |
+   | tool calls | tool name + one primary argument, truncated to 120 chars (so file paths, commands, grep patterns, URLs) |
+   | successful tool results | status and size only — `⇒ ok · 31 lines, 1204 characters`, **no body** |
    | failed tool results | status, size, and the **first line** of the error |
    | `edit`/`write` results | fenced unified diff (8 lines of context, max 200 lines); subject to the context window and shortening |
-   | your `!` bash runs | command preview + exit status + line count, no output |
+   | your `!` bash runs | command preview + exit status + size, no output; `!!` runs stay excluded |
+   | peer, extension, and advisor messages | labeled previews up to 500 chars; messages hidden in the UI are skipped |
 
    So ordinary file reads and command output do **not** leave as content — but
    your own prompts and applied diffs can. A context budget is not a secret-redaction policy.
@@ -391,10 +413,11 @@ for versioning, signed tags, and one-time owner setup.
 - `src/advisor/advise-tool.ts` — the `advise` tool, with the emission guard
   gating at its boundary
 - `src/advisor/context-window.ts` — per-request rolling memory budget, safe exchange eviction, and explicit shortening
+- `src/advisor/usage.ts` — finalized-response usage accounting, independent of retained history
 - `src/advisor/emission-guard.ts` — noise filter + one-note-per-update budget
-- `src/advisor/session-history-format.ts` — compact primary-transcript render
-- `src/advisor/delta-render.ts` — per-source-message chunking for prompt-cache
-  locality
+- `src/advisor/session-history-format.ts` — stream-view transcript rendering and one-line tool summaries
+- `src/advisor/observations.ts` — the advisor's skim: one card per message or tool call, heading-preserving shortening
+- `src/advisor/delta-render.ts` — per-batch rendering and pairing tool calls with results
 - `src/advisor/watchdog-config.ts` — `WATCHDOG.yml`/`.md` discovery and merge
 - `src/prompts/` — advisor system prompt and tool description
 

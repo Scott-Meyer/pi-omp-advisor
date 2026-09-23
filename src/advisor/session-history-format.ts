@@ -1,11 +1,10 @@
 /**
  * Ported from oh-my-pi `src/session/session-history-format.ts` (npm
  * `@oh-my-pi/pi-coding-agent@17.4.1`) — the exact markdown transcript
- * serializer used to build the advisor's rendered context
- * (`ADVISOR_RENDER_OPTIONS` in upstream `delta-split.ts`:
- * `{ includeToolIntent: true, watchedRoles: true, expandPrimaryContext: true,
- * expandEditDiffs: true }`). Algorithm is unchanged; only type imports are
- * switched to pi's own message shapes (`@earendil-works/pi-agent-core`,
+ * serializer, used by the stream viewer; its one-line tool summaries
+ * (`formatToolCallPrimaryArg`) also shape the advisor's tool cards in
+ * observations.ts. The transcript algorithm is unchanged;
+ * type imports use pi's own message shapes (`@earendil-works/pi-agent-core`,
  * `@earendil-works/pi-ai`), and message kinds with no pi equivalent are
  * dropped rather than approximated — see ../../PROVENANCE.md items 6.
  *
@@ -167,7 +166,7 @@ function fenceDiff(diff: string): string {
 }
 
 /** One line per tool call: `→ read(src/foo.ts:50-80) ⇒ ok · 31 lines`. */
-function toolCallLine(
+export function formatToolCallLine(
   name: string,
   args: Record<string, unknown> | undefined,
   result: ToolResultMessage | undefined,
@@ -277,7 +276,7 @@ export function formatSessionHistoryMarkdown(messages: AgentMessage[], opts?: Hi
             const result = resultsByCallId.get(block.id);
             if (result) consumed.add(block.id);
             body.push(
-              toolCallLine(block.name, block.arguments, result, opts?.includeToolIntent, opts?.expandEditDiffs),
+              formatToolCallLine(block.name, block.arguments, result, opts?.includeToolIntent, opts?.expandEditDiffs),
             );
           } else if (opts?.includeThinking && block.type === "thinking" && block.thinking.trim()) {
             body.push(`_thinking:_ ${block.thinking}`);
@@ -301,7 +300,7 @@ export function formatSessionHistoryMarkdown(messages: AgentMessage[], opts?: Hi
         const toolResult = msg as ToolResultMessage;
         if (consumed.has(toolResult.toolCallId)) break;
         lines.push(
-          toolCallLine(toolResult.toolName, undefined, toolResult, opts?.includeToolIntent, opts?.expandEditDiffs),
+          formatToolCallLine(toolResult.toolName, undefined, toolResult, opts?.includeToolIntent, opts?.expandEditDiffs),
           "",
         );
         lastWatchedLabel = undefined;
