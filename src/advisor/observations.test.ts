@@ -133,3 +133,25 @@ test("an impossible budget fails instead of dropping who said what", () => {
   const rendered = render(Array.from({ length: 1000 }, () => user("short input")));
   assert.throws(() => new AdvisorContextWindow(2048).trim(rendered.messages.map(message => ({ ...message, timestamp: 1 })), 0, 0, 0), AdvisorContextBudgetError);
 });
+
+test("a person's question answers show what they chose apart from what they wrote", () => {
+  const humanResponse = (via: string) => ({ humanResponse: { version: 1, outcome: "answered", answeredBy: { kind: "person", via },
+    answers: [{ question: "Keep the notebook minimal?", chose: ["Yes, minimal"], wrote: "yeah, sounds good", notes: "revisit later" }] } });
+  const { text } = render([
+    call("ask_user_question", "q", {}), result("ask_user_question", "q", "AI_FACING_TEXT", humanResponse("pi-tui")),
+    { role: "custom", customType: "threadroom.native.feedback.v1", content: "AI_FACING_FEEDBACK", display: true, timestamp: 3, details: humanResponse("pi-rpc-dialog") } as AgentMessage,
+  ]);
+  assert.match(text, /Answered by the person, in the interactive UI/);
+  assert.match(text, /Question: Keep the notebook minimal\?/);
+  assert.match(text, /Chose \(AI-written options\): Yes, minimal/);
+  assert.match(text, /Wrote:\n> yeah, sounds good/);
+  assert.match(text, /Notes:\n> revisit later/);
+  assert.match(text, /pi-rpc-dialog host, which may be automated/);
+  assert.doesNotMatch(text, /AI_FACING_TEXT|AI_FACING_FEEDBACK/);
+});
+
+test("a Parley message sent by an extension says so", () => {
+  const { text } = render([{ role: "custom", customType: "parley_message", content: "hello", display: true, timestamp: 2,
+    details: { from: { id: "x", name: "Avery" }, message: { provenance: { type: "extension_outbox", extensionName: "flightdeck" } } } } as AgentMessage]);
+  assert.match(text, /Peer · Avery · Parley · sent by extension flightdeck/);
+});
