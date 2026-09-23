@@ -144,13 +144,13 @@ export function formatAdvisorStatusBar(options: {
   starting?: boolean;
   queuedCount?: number;
   advisors?: Array<{ name: string; model?: string; status?: string }>;
-}): string {
+}): string | undefined {
   const { runtimeEnabled, paused, starting = false, queuedCount = 0, advisors = [] } = options;
   const queuedStr = queuedCount > 0 ? ` · ${queuedCount} queued` : "";
 
-  if (!runtimeEnabled) {
-    return "advisor: OFF";
-  }
+  // Off or paused takes no footer space. Queued notes stay visible in the
+  // inbox widget, which also marks a pause.
+  if (!runtimeEnabled || paused) return undefined;
 
   if (starting) {
     return "advisor: starting…";
@@ -162,17 +162,7 @@ export function formatAdvisorStatusBar(options: {
   }
 
   const activeAdvisors = advisors.filter(a => a.status === "running" || a.status === "paused");
-  if (activeAdvisors.length === 0) {
-    return paused ? `advisor: PAUSED${queuedStr}` : "advisor: OFF";
-  }
-
-  if (paused) {
-    if (activeAdvisors.length === 1) {
-      const clean = cleanModelId(activeAdvisors[0]!.model) ?? "no model";
-      return `advisor: ${clean} PAUSED${queuedStr}`;
-    }
-    return `advisors: ${activeAdvisors.length} PAUSED${queuedStr}`;
-  }
+  if (activeAdvisors.length === 0) return undefined;
 
   if (activeAdvisors.length === 1) {
     const item = activeAdvisors[0]!;

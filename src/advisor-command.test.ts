@@ -93,10 +93,10 @@ test("cleanModelId extracts readable model id from complex provider paths", () =
 });
 
 test("formatAdvisorStatusBar formats clear, concise status lines across all states", () => {
-  // Off state
+  // Off takes no footer space
   assert.equal(
     formatAdvisorStatusBar({ runtimeEnabled: false, paused: false }),
-    "advisor: OFF",
+    undefined,
   );
 
   // Starting state
@@ -108,7 +108,7 @@ test("formatAdvisorStatusBar formats clear, concise status lines across all stat
   // Settled empty/disabled roster (startup completed but no active advisors)
   assert.equal(
     formatAdvisorStatusBar({ runtimeEnabled: true, paused: false, starting: false, advisors: [] }),
-    "advisor: OFF",
+    undefined,
   );
 
   // Single default advisor running
@@ -141,7 +141,7 @@ test("formatAdvisorStatusBar formats clear, concise status lines across all stat
     "advisor: security · claude-3-5-sonnet ON",
   );
 
-  // Paused single advisor with queued notes
+  // Paused takes no footer space either; the inbox widget shows queued notes
   assert.equal(
     formatAdvisorStatusBar({
       runtimeEnabled: true,
@@ -149,7 +149,7 @@ test("formatAdvisorStatusBar formats clear, concise status lines across all stat
       queuedCount: 2,
       advisors: [{ name: "default", model: "openai/gpt-6-astra", status: "paused" }],
     }),
-    "advisor: gpt-6-astra PAUSED · 2 queued",
+    undefined,
   );
 
   // Multiple running advisors
@@ -176,7 +176,7 @@ test("formatAdvisorStatusBar formats clear, concise status lines across all stat
         { name: "security", model: "anthropic/claude-3-5-sonnet", status: "paused" },
       ],
     }),
-    "advisors: 2 PAUSED · 3 queued",
+    undefined,
   );
 
   // Mixed roster: 1 running, 1 unresolved no_model -> accurately counts 1 active!
@@ -818,7 +818,7 @@ test("saving a main-session default while OFF recomputes the current session", a
     const handler = registerAdvisorCommandForMenuTest();
     let controlsVisits = 0;
     let defaultsVisits = 0;
-    const statuses: string[] = [];
+    const statuses: (string | undefined)[] = [];
     const ctx = {
       cwd, mode: "tui", hasUI: true,
       modelRegistry: { getAvailable: () => [], runtime: { streamSimple() {}, getModel: () => undefined } },
@@ -837,7 +837,7 @@ test("saving a main-session default while OFF recomputes the current session", a
           }
           throw new Error(`Unexpected menu: ${title}`);
         },
-        notify: () => {}, setStatus: (_key: string, status: string) => statuses.push(status),
+        notify: () => {}, setStatus: (_key: string, status: string | undefined) => statuses.push(status),
       },
     };
     await handler("", ctx as any);
@@ -847,7 +847,7 @@ test("saving a main-session default while OFF recomputes the current session", a
 
     // Temporary OFF lasts until the user deliberately changes and saves the persistent default.
     await handler("off", ctx as any);
-    assert.equal(statuses.at(-1), "advisor: OFF");
+    assert.equal(statuses.at(-1), undefined, "off leaves the footer");
     const activations = statuses.filter(status => status === "advisor: OFF (no model)").length;
     await saveWatchdogConfigFile(filePath, { main: false, advisors: [{ name: "reviewer", model: "openai/unavailable" }] });
     controlsVisits = 0;
