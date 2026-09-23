@@ -81,33 +81,6 @@ function outcome(result: ToolResultMessage): string {
 }
 
 /**
- * Threadroom's published `details.humanResponse` (v1): what the person did
- * through a question UI. Chosen labels were written by the AI; only `wrote`
- * and `notes` are the person's words. The host surface is claimed, not verified.
- */
-function humanResponse(details: Record<string, unknown> | undefined): string | undefined {
-  const response = record(details?.humanResponse);
-  if (response?.version !== 1 || !Array.isArray(response.answers)) return undefined;
-  const via = record(response.answeredBy)?.via;
-  const surface = via === "pi-tui"
-    ? "the person, in the interactive UI"
-    : typeof via === "string" && /^pi-.+-dialog$/.test(via)
-      ? `a ${label(via)} host, which may be automated`
-      : `an unrecognized host surface${label(via) ? ` (${label(via)})` : ""}`;
-  const lines = [`**Answered by ${surface}** · ${label(response.outcome) ?? "unknown outcome"}`];
-  if (response.outcome === "cancelled") lines.push("They dismissed the question.");
-  for (const answer of response.answers.map(record)) {
-    if (!answer) continue;
-    lines.push(`Question: ${label(answer.question, 300) ?? "(unstated)"}`);
-    const chose = Array.isArray(answer.chose) ? answer.chose.map(item => label(item, 200)).filter(Boolean) : [];
-    if (chose.length > 0) lines.push(`Chose (AI-written options): ${chose.join("; ")}`);
-    if (typeof answer.wrote === "string" && answer.wrote.trim()) lines.push(`Wrote:\n${chat(preview(answer.wrote))}`);
-    if (typeof answer.notes === "string" && answer.notes.trim()) lines.push(`Notes:\n${chat(preview(answer.notes))}`);
-  }
-  return lines.join("\n");
-}
-
-/**
  * One card for a tool call, its result, or both. `startedEarlier` marks a
  * completion shown apart from its invocation, where it arrived.
  */
@@ -120,8 +93,6 @@ export function toolCard(call: ToolCall | undefined, result: ToolResultMessage |
     parts.push(outcome(result));
     const diff = record(result.details)?.diff;
     if (typeof diff === "string" && diff.trim()) parts.push(fence(truncateDiffLines(diff.trim()), "diff"));
-    const human = humanResponse(record(result.details));
-    if (human) parts.push(human);
   }
   return {
     title: `Tool · ${name} · ${state}${startedEarlier ? " · started earlier" : ""}`,
@@ -141,11 +112,7 @@ function customTitle(message: AgentMessage & { customType: string; details?: unk
   const details = record(message.details);
   if (message.customType === "parley_message") {
     const from = record(details?.from);
-    const provenance = record(record(details?.message)?.provenance);
-    const via = provenance?.type === "extension_outbox"
-      ? ` · sent by extension ${label(provenance.extensionName) ?? "unknown"}`
-      : label(provenance?.type) ? ` · provenance ${label(provenance?.type)}` : "";
-    return `Peer · ${label(from?.name) ?? label(from?.id, 32) ?? "unknown"} · Parley${via}`;
+    return `Peer · ${label(from?.name) ?? label(from?.id, 32) ?? "unknown"} · Parley`;
   }
   if (["advisor", "pi-omp-advisor"].includes(message.customType)) {
     const name = label(details?.advisor);
@@ -196,8 +163,7 @@ export function observationCards(message: AgentMessage, includeThinking: boolean
         const notes = advisorNoteCards(details);
         if (notes) return notes;
       }
-      const human = humanResponse(details);
-      return [conversation(customTitle(message), human ?? chat(preview(textContent(message.content))))];
+      return [conversation(customTitle(message), chat(preview(textContent(message.content))))];
     }
     case "bashExecution": {
       if (message.excludeFromContext) return [];
