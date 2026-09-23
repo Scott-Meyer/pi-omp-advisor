@@ -156,6 +156,14 @@ describe("loadWatchdogConfigFile", () => {
     assert.equal(reloaded.advisors[0]?.flushOnSettled, false);
   });
 
+  it("round-trips the notebook opt-in", async () => {
+    const file = await writeConfig("notebook.yml", "notebook: true\n");
+    const loaded = await loadWatchdogConfigFile(file);
+    assert.equal(loaded.notebook, true);
+    await fs.writeFile(file, await serializeWatchdogConfig(loaded), "utf8");
+    assert.equal((await loadWatchdogConfigFile(file)).notebook, true);
+  });
+
   it("refuses invalid maxBehind and flushTimeoutMs in advisor entries", async () => {
     for (const field of ["maxBehind: 0", "maxBehind: -1", "maxBehind: 1.5", "flushTimeoutMs: 50", "flushTimeoutMs: -100", "flushOnSettled: yes"]) {
       const file = await writeConfig("invalid-cadence.yml", `advisors:\n  - name: reviewer\n    ${field}\n`);

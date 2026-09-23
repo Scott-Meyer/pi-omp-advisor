@@ -41,6 +41,7 @@ import {
   type AdvisorSeverity,
 } from "./advise-logic.ts";
 import { ADVISOR_COMMUNICATION_TOOLS, makeAdviseTool } from "./advise-tool.ts";
+import { formatNotebookHandover, makeNotebookTool, NOTEBOOK_TOOL_NAME, type NotebookEntry } from "./notebook.ts";
 import { AdvisorEmissionGuard } from "./emission-guard.ts";
 import { AdvisorUsageLedger, type AdvisorUsageConnection, type AdvisorUsageStatus } from "./usage.ts";
 import { openToolCallsAfter, renderAdvisorDeltaMessages } from "./delta-render.ts";
@@ -120,10 +121,11 @@ const ADVISOR_THINKING_LEVEL_SUFFIXES: ReadonlySet<string> = new Set([
  * The communication tools (advise plus pending-note controls) are included
  * alongside the investigative tools, even with an explicit tools: allowlist.
  */
-function withAdvisorTools(toolNames: string[]): string[] {
+function withAdvisorTools(toolNames: string[], notebook = false): string[] {
   return [...new Set([
     ...toolNames, ...ADVISOR_COMMUNICATION_TOOLS,
     ...(toolNames.includes("request_stop") ? ADVISOR_STOP_TOOLS : []),
+    ...(notebook ? [NOTEBOOK_TOOL_NAME] : []),
   ])];
 }
 /** How long the primary may be paused waiting for a slow advisor to catch
@@ -161,9 +163,9 @@ function advisorToolModelLabel(session: AdvisorSession, toolCallId: string): str
     : undefined;
 }
 
-function installAdvisorMemoryOrDispose(session: AdvisorSession, contextTokens?: number) {
+function installAdvisorMemoryOrDispose(session: AdvisorSession, contextTokens?: number, handover?: () => string | undefined) {
   try {
-    return installAdvisorContextWindow(session.agent, contextTokens);
+    return installAdvisorContextWindow(session.agent, contextTokens, handover);
   } catch (err) {
     session.dispose();
     throw err;
@@ -247,6 +249,9 @@ export interface OrchestratorHost {
   requestStop(advisor: string | undefined, targetId: string, reason: string, model?: string): StopRequestResult;
   isStreaming(): boolean;
   isAborting(): boolean;
+  /** Durable storage for the optional notebook; without it, notes last for this orchestrator only. */
+  readNotebook?(advisor: string | undefined): NotebookEntry | undefined;
+  writeNotebook?(advisor: string | undefined, entry: NotebookEntry): void;
   /** Primary-owned latch, retained even when advisor runtimes are rebuilt. */
   isAutoResumeSuppressed(): boolean;
   hasQueuedWork(): boolean;
@@ -285,6 +290,8 @@ export class AdvisorOrchestrator {
   /** Advisors skipped because their explicit `model:` did not resolve, kept so
    *  `/advisor status` reports `no_model` rather than hiding them entirely. */
   #noModelAdvisors: { name: string; model?: string; status: AdvisorRuntimeStatus }[] = [];
+  #notebookEnabled = false;
+  #notebooks = new Map<string, NotebookEntry>();
 
   constructor(host: OrchestratorHost, private readonly createSession = createAgentSession) {
     this.#host = host;
@@ -463,6 +470,7 @@ export class AdvisorOrchestrator {
     this.#noModelAdvisors = [];
     this.#syncBacklog = configs.syncBacklog ?? BACKLOG_CATCHUP_DEFAULT;
     this.#immuneTurns = configs.immuneTurns ?? ADVISOR_IMMUNE_TURNS_DEFAULT;
+    this.#notebookEnabled = configs.notebook === true;
     this.#primaryTurnsCompleted = 0;
     this.#interruptImmuneTurnStart = undefined;
     this.#activeChatModel = ctx.model;
@@ -527,7 +535,7 @@ export class AdvisorOrchestrator {
     }
     const toolNames = config.tools === undefined ? ADVISOR_DEFAULT_TOOL_NAMES : new Set(config.tools);
     const effectiveToolNames = [...toolNames].filter(name => stopEnabled || name !== "request_stop");
-    const resolvedToolNames = withAdvisorTools(effectiveToolNames.map(resolveAdvisorToolName));
+    const resolvedToolNames = withAdvisorTools(effectiveToolNames.map(resolveAdvisorToolName), this.#notebookEnabled);
 
     const systemPrompt = await buildAdvisorSystemPrompt({
       watchdogBlocks,
@@ -535,6 +543,7 @@ export class AdvisorOrchestrator {
       advisorInstructions: config.instructions,
       cwd: ctx.cwd,
       contextFiles,
+      notebook: this.#notebookEnabled,
     });
 
     const emissionGuard = new AdvisorEmissionGuard();
@@ -570,11 +579,11 @@ export class AdvisorOrchestrator {
         ...(thinkingLevel ? { thinkingLevel } : {}),
         cwd: ctx.cwd,
         ...advisorSessionToolOptions(ctx, resolvedToolNames, piModelRuntime),
-        customTools: [adviseTool, ...controlTools],
+        customTools: [adviseTool, ...controlTools, ...this.#notebookTools(sourceName)],
         resourceLoader,
       });
       disableNestedHostAdvisor(ctx, created.session);
-      memory = installAdvisorMemoryOrDispose(created.session, config.contextTokens);
+      memory = installAdvisorMemoryOrDispose(created.session, config.contextTokens, this.#notebookHandover(sourceName));
       session = created.session;
     } catch (err) {
       console.error(`[pi-omp-advisor] advisor "${config.name}": failed to start: ${String(err)}`);
@@ -809,13 +818,14 @@ export class AdvisorOrchestrator {
         const thinkingLevel = resolvedModel?.thinkingLevel ?? (advisor.config.model === undefined ? this.#activeChatThinkingLevel : undefined);
         const toolNames = advisor.config.tools === undefined ? ADVISOR_DEFAULT_TOOL_NAMES : new Set(advisor.config.tools);
         const effectiveToolNames = [...toolNames].filter(name => advisor.stopEnabled || name !== "request_stop");
-        const resolvedToolNames = withAdvisorTools(effectiveToolNames.map(resolveAdvisorToolName));
+        const resolvedToolNames = withAdvisorTools(effectiveToolNames.map(resolveAdvisorToolName), this.#notebookEnabled);
         const systemPrompt = await buildAdvisorSystemPrompt({
           watchdogBlocks,
           sharedInstructions,
           advisorInstructions: advisor.config.instructions,
           cwd: ctx.cwd,
           contextFiles,
+          notebook: this.#notebookEnabled,
         });
         const resourceLoader = new DefaultResourceLoader({
           cwd: ctx.cwd,
@@ -845,12 +855,12 @@ export class AdvisorOrchestrator {
           ...(thinkingLevel ? { thinkingLevel } : {}),
           cwd: ctx.cwd,
           ...advisorSessionToolOptions(ctx, resolvedToolNames, piModelRuntime),
-          customTools: [adviseTool, ...controlTools],
+          customTools: [adviseTool, ...controlTools, ...this.#notebookTools(advisor.sourceName)],
           resourceLoader,
         });
         replacementSession = created.session;
         disableNestedHostAdvisor(ctx, created.session);
-        const newMemory = installAdvisorMemoryOrDispose(created.session, advisor.config.contextTokens);
+        const newMemory = installAdvisorMemoryOrDispose(created.session, advisor.config.contextTokens, this.#notebookHandover(advisor.sourceName));
         if (advisor.disposed || advisor.generation !== rebuildGeneration) {
           newMemory.dispose();
           created.session.dispose();
@@ -1149,6 +1159,25 @@ export class AdvisorOrchestrator {
     this.#preserveOnly = value;
   }
 
+  #readNotebook(sourceName: string | undefined): NotebookEntry | undefined {
+    return this.#host.readNotebook ? this.#host.readNotebook(sourceName) : this.#notebooks.get(sourceName ?? "");
+  }
+
+  #notebookTools(sourceName: string | undefined) {
+    if (!this.#notebookEnabled) return [];
+    return [makeNotebookTool({
+      read: () => this.#readNotebook(sourceName),
+      write: entry => {
+        this.#notebooks.set(sourceName ?? "", entry);
+        this.#host.writeNotebook?.(sourceName, entry);
+      },
+    })];
+  }
+
+  #notebookHandover(sourceName: string | undefined): (() => string | undefined) | undefined {
+    return this.#notebookEnabled ? () => formatNotebookHandover(this.#readNotebook(sourceName)) : undefined;
+  }
+
   #stopAccess(sourceName: string | undefined): PrimaryStopAccess {
     const allowed = () => !this.#paused && this.#advisors.some(advisor =>
       !advisor.disposed && advisor.sourceName === sourceName && advisor.stopEnabled,
@@ -1289,4 +1318,6 @@ export interface DiscoveredAdvisorsLike {
   flushTimeoutMs?: number;
   /** Deliver pending observations at settlement; defaults to true when unset. */
   flushOnSettled?: boolean;
+  /** Optional advisor notebook; off unless explicitly true. */
+  notebook?: boolean;
 }

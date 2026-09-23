@@ -7,6 +7,7 @@ import {
   AdvisorContextBudgetError, AdvisorContextWindow, DEFAULT_ADVISOR_CONTEXT_TOKENS,
   estimateContextMessageTokens, installAdvisorContextWindow,
 } from "./context-window.ts";
+import { formatNotebookHandover, NOTEBOOK_MAX_CHARS } from "./notebook.ts";
 
 const model = { id: "fixture", name: "fixture", provider: "fixture", api: "openai-completions", reasoning: false, input: ["text"], contextWindow: 100_000, maxTokens: 4096, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } } as Model<"openai-completions">;
 const user = (text: string): AgentMessage => ({ role: "user", content: text, timestamp: 1 });
@@ -320,3 +321,140 @@ for (const toolExecution of ["parallel", "sequential"] as const) {
     detach();
   });
 }
+
+test("the advisor's notebook returns whenever its context starts fresh, including a mid-review reset", async () => {
+  let version = 1;
+  const handover = () => `NOTE_V${version}`;
+  const replies: AssistantMessage[] = [];
+  const requestsSeen: string[] = [];
+  const agent = new Agent({
+    initialState: {
+      model, systemPrompt: "Review the current observation.", messages: [],
+      tools: [{ name: "read_file", label: "Read fixture", description: "Read test content", parameters: Type.Object({}),
+        execute: async () => ({ content: [{ type: "text", text: "READ " + "x".repeat(40_000) }], details: undefined }),
+      }],
+    },
+    streamFn: (_model, context) => {
+      requestsSeen.push(JSON.stringify(context.messages));
+      const message = replies.shift() ?? response("Reviewed.");
+      const stream = createAssistantMessageEventStream();
+      stream.push({ type: "done", reason: message.stopReason as "stop" | "toolUse", message });
+      stream.end();
+      return stream;
+    },
+  });
+  const memory = installAdvisorContextWindow(agent, 4096, handover);
+  const review = async (text: string) => {
+    requestsSeen.length = 0;
+    await agent.prompt(text);
+    memory.trimRetainedHistory();
+    return [...requestsSeen];
+  };
+  try {
+    const [fresh] = await review("first observation");
+    assert.match(fresh!, /Your notebook|NOTE_V1/);
+    assert.match(fresh!, /NOTE_V1/);
+
+    version = 2;
+    const [continued] = await review("small follow-up");
+    assert.doesNotMatch(continued!, /NOTE_V2/, "while earlier history remains, the advisor already has its own notebook calls");
+
+    version = 3;
+    replies.push(call("big-read"));
+    const [beforeRead, afterRead] = await review("short observation that triggers a large read");
+    assert.doesNotMatch(beforeRead!, /NOTE_V3/);
+    assert.match(beforeRead!, /first observation/, "earlier history still fit before the read");
+    assert.doesNotMatch(afterRead!, /first observation/, "the tool result forced a reset");
+    assert.match(afterRead!, /NOTE_V3/);
+
+    version = 4;
+    const [afterReset] = await review("large observation " + "y".repeat(20_000));
+    assert.doesNotMatch(afterReset!, /triggers a large read/);
+    assert.match(afterReset!, /NOTE_V4/);
+  } finally { memory.dispose(); }
+});
+
+test("a reset while settling a review hands the latest notebook to the next review", async () => {
+  let note = "SETTLE_NOTE_V1";
+  const replies: AssistantMessage[] = [];
+  const requestsSeen: string[] = [];
+  const agent = new Agent({
+    initialState: { model, systemPrompt: "Review.", messages: [], tools: [] },
+    streamFn: (_model, context) => {
+      requestsSeen.push(JSON.stringify(context.messages));
+      const message = replies.shift() ?? response("Reviewed.");
+      const stream = createAssistantMessageEventStream();
+      stream.push({ type: "done", reason: "stop", message });
+      stream.end();
+      return stream;
+    },
+  });
+  const memory = installAdvisorContextWindow(agent, 4096, () => note);
+  try {
+    await agent.prompt("EARLY observation " + "e".repeat(6_000));
+    memory.trimRetainedHistory();
+    note = "SETTLE_NOTE_V2";
+    replies.push(response("LONG_REVIEW " + "r".repeat(10_000)));
+    await agent.prompt("small observation");
+    assert.match(requestsSeen.at(-1)!, /EARLY observation/, "the input fit before the reply");
+    memory.trimRetainedHistory();
+    assert.doesNotMatch(body(agent.state.messages), /EARLY observation/, "the reply forced a reset while settling");
+    await agent.prompt("next observation");
+    assert.match(requestsSeen.at(-1)!, /SETTLE_NOTE_V2/);
+  } finally { memory.dispose(); }
+});
+
+test("OMP's provider hook shows the notebook when a review's view has no earlier history", async () => {
+  type ProviderContext = { messages: AgentMessage[]; systemPrompt: string[]; tools: unknown[] };
+  let beforeModelCall: ((context: ProviderContext) => void | Promise<void>) | undefined;
+  let listener: ((event: { type: string }) => void) | undefined;
+  const state = { messages: [] as AgentMessage[], systemPrompt: ["Review."], tools: [], model: { contextWindow: 100_000 } };
+  const ompAgent = {
+    state,
+    subscribe: (callback: typeof listener) => { listener = callback; return () => {}; },
+    addBeforeModelCall(callback: typeof beforeModelCall) { beforeModelCall = callback; return () => {}; },
+  } as unknown as Agent;
+  let note = "OMP_NOTE_V1";
+  const memory = installAdvisorContextWindow(ompAgent, 4096, () => note);
+  try {
+    listener!({ type: "agent_start" });
+    const fresh: ProviderContext = { systemPrompt: state.systemPrompt, tools: [], messages: [user("first")] };
+    await beforeModelCall!(fresh);
+    assert.match(body(fresh.messages), /OMP_NOTE_V1/);
+
+    note = "OMP_NOTE_V2";
+    listener!({ type: "agent_start" });
+    const continued: ProviderContext = { systemPrompt: state.systemPrompt, tools: [], messages: [user("first"), response("ok"), user("second")] };
+    await beforeModelCall!(continued);
+    assert.doesNotMatch(body(continued.messages), /OMP_NOTE_V2/);
+
+    listener!({ type: "agent_start" });
+    const reset: ProviderContext = { systemPrompt: state.systemPrompt, tools: [], messages: [user("first " + "z".repeat(20_000)), response("ok"), user("third")] };
+    await beforeModelCall!(reset);
+    assert.doesNotMatch(body(reset.messages), /first z/);
+    assert.match(body(reset.messages), /OMP_NOTE_V2/);
+  } finally { memory.dispose(); }
+});
+
+test("a notebook at its size limit still fits inside the advisor's input bound", async () => {
+  const note = formatNotebookHandover({ text: "x\n".repeat(NOTEBOOK_MAX_CHARS / 2), updatedAt: 0 });
+  let seen: AgentMessage[] = [];
+  const agent = new Agent({
+    initialState: { model, systemPrompt: "Review.", messages: [], tools: [] },
+    streamFn: (_model, context) => {
+      seen = context.messages;
+      const stream = createAssistantMessageEventStream();
+      stream.push({ type: "done", reason: "stop", message: response("Reviewed.") });
+      stream.end();
+      return stream;
+    },
+  });
+  const memory = installAdvisorContextWindow(agent, 4096, () => note);
+  try {
+    await agent.prompt("observation " + "y".repeat(40_000));
+    assert.match(body(seen), /Your notebook/);
+    const fixed = Math.ceil("Review.".length / 4) + 256;
+    const total = fixed + seen.reduce((sum, message) => sum + estimateContextMessageTokens(message), 0);
+    assert.ok(total <= 4096, `estimated input ${total} exceeds the 4096 bound`);
+  } finally { memory.dispose(); }
+});

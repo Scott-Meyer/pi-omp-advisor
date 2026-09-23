@@ -109,6 +109,23 @@ before that review expires at once. Nothing summarizes or replays the reasoning
 path that filled the old context. Pending advice is stored separately, so a reset
 does not remove its IDs or prevent revision/withdrawal.
 
+### Keeping the bigger picture (optional notebook)
+
+Off by default. When a context reset drops the person's own words, an advisor
+can drift toward whatever the agents are currently absorbed in, and in long
+multi-AI runs asides can harden into invented rules. With `notebook: true`
+(toggle it under `/advisor` → settings → **Advisor ON/OFF**, saved to that
+scope's `WATCHDOG.yml`), each advisor gets a `notebook` tool for one short note
+(up to 1,200 characters) about what the person is trying to accomplish.
+
+The note is shown again only when a context window starts with no earlier
+history: a fresh or rebuilt advisor, or a reset before, during, or after a
+review. It is framed as the advisor's own earlier interpretation, not something
+the person said, and its size counts toward the context budget. Notes are saved
+as session entries, so they follow the branch they were written on and survive
+reloads. A short system-prompt section explains the purpose; there are no rules
+or approval steps. Ask the advisor in chat if you want to see or discuss its note.
+
 ### What the feed shows, and usage
 
 Each tool call is one card: the command, path, or main argument (up to 120
@@ -256,6 +273,7 @@ syncBacklog: off   # backpressure: off, queued turns, or { pauseAt: 4, resumeAt:
 maxBehind: 3       # completed primary turns accumulated per advisor wake (default 3, min 1)
 flushTimeoutMs: 240000 # maximum age of the oldest unseen message (default 4 minutes, min 100ms)
 flushOnSettled: true # deliver pending observations as soon as the primary finishes (default true; set false for strict turn batching)
+notebook: false    # optional advisor notebook (default off; see "Keeping the bigger picture")
 
 advisors:
   - name: advisor

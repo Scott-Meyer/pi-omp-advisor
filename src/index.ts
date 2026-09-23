@@ -95,6 +95,7 @@ const ADVISOR_INBOX_SHORTCUT = "ctrl+shift+a";
 const ADVISOR_PAUSE_SHORTCUT = "ctrl+shift+r";
 const ADVISOR_CLEAR_SHORTCUT = "ctrl+shift+x";
 const ADVISOR_INBOX_STATE_TYPE = "pi-omp-advisor-inbox";
+const ADVISOR_NOTEBOOK_STATE_TYPE = "pi-omp-advisor-notebook";
 const ADVISOR_STOP_STATE_TYPE = "pi-omp-advisor-stop";
 
 const ADVISOR_COMMAND_COMPLETIONS: readonly AutocompleteItem[] = [
@@ -729,6 +730,17 @@ export default function (pi: ExtensionAPI) {
       isAutoResumeSuppressed: () => primaryInterruption.autoResumeSuppressed,
       hasQueuedWork: () => ctx.hasPendingMessages(),
       setStatus: text => ctx.ui.setStatus("advisor", text),
+      // Session entries keep the note with the branch it was written on.
+      readNotebook(advisor) {
+        const entry = [...ctx.sessionManager.getBranch()].reverse().find(candidate =>
+          candidate.type === "custom" && candidate.customType === ADVISOR_NOTEBOOK_STATE_TYPE &&
+          (candidate.data as { advisor?: string } | undefined)?.advisor === advisor);
+        const data = entry?.type === "custom" ? entry.data as { text?: unknown; updatedAt?: unknown } : undefined;
+        return typeof data?.text === "string" && typeof data.updatedAt === "number" ? { text: data.text, updatedAt: data.updatedAt } : undefined;
+      },
+      writeNotebook(advisor, entry) {
+        pi.appendEntry(ADVISOR_NOTEBOOK_STATE_TYPE, { advisor, ...entry });
+      },
     };
   }
 
@@ -1445,9 +1457,12 @@ export default function (pi: ExtensionAPI) {
       const subagentsValue = doc.subagents ?? inherited?.subagentsEnabled ?? false;
       const mainSource = doc.main !== undefined ? "set here" : inherited?.mainEnabled !== undefined ? "inherited" : "built-in default";
       const subagentsSource = doc.subagents !== undefined ? "set here" : inherited?.subagentsEnabled !== undefined ? "inherited" : "built-in default";
+      const notebookValue = doc.notebook ?? inherited?.notebook ?? false;
+      const notebookSource = doc.notebook !== undefined ? "set here" : inherited?.notebook !== undefined ? "inherited" : "built-in default";
       const options = [
         `Watch main sessions by default: ${mainValue ? "on" : "off"} (${mainSource})`,
         `Watch sub-agent sessions by default: ${subagentsValue ? "on" : "off"} (${subagentsSource})`,
+        `Advisor notebook (remembers the person's aim across context resets): ${notebookValue ? "on" : "off"} (${notebookSource})`,
         ...(doc.main !== undefined ? ["Reset main-session default to inherit"] : []),
         ...(doc.subagents !== undefined ? ["Reset sub-agent default to inherit"] : []),
         "Save & Apply changes",
@@ -1485,6 +1500,12 @@ export default function (pi: ExtensionAPI) {
       if (choice.startsWith("Watch sub-agent sessions by default:")) {
         doc.subagents = !subagentsValue;
         subagentsTouched = true;
+        dirty = true;
+        continue;
+      }
+
+      if (choice.startsWith("Advisor notebook")) {
+        doc.notebook = !notebookValue;
         dirty = true;
         continue;
       }

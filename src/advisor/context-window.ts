@@ -259,8 +259,11 @@ export class AdvisorContextWindow {
     return result;
   }
 
-  notice(): UserMessage {
-    return { role: "user", content: advisorObservationContent("Session status", WINDOW_NOTICE), timestamp: 0 };
+  /** `handover` is the advisor's own earlier note, carried into a window that starts fresh. */
+  notice(handover?: string): UserMessage {
+    const content = advisorObservationContent("Session status", WINDOW_NOTICE);
+    if (handover) content.push(...advisorObservationContent("Notebook", handover));
+    return { role: "user", content, timestamp: 0 };
   }
 }
 
@@ -302,7 +305,7 @@ function withoutFailedProviderExchanges(messages: AgentMessage[]): AgentMessage[
 }
 
 /** Install on the advisor only, using whichever public per-request hook the host exposes. */
-export function installAdvisorContextWindow(agent: Agent, requestedTokens?: number): {
+export function installAdvisorContextWindow(agent: Agent, requestedTokens?: number, handover?: () => string | undefined): {
   window: AdvisorContextWindow;
   readonly interrupted: boolean;
   trimRetainedHistory(): void;
@@ -311,8 +314,31 @@ export function installAdvisorContextWindow(agent: Agent, requestedTokens?: numb
   const window = new AdvisorContextWindow(requestedTokens);
   let runSignal: AbortSignal | undefined;
   let runStart = agent.state.messages.length;
+  // The advisor's earlier note is shown when its history was reset — before,
+  // during, or after a review — or a review's view starts with none. The shown
+  // text then stays fixed for the rest of that window, keeping the cached
+  // prefix stable; later edits are visible as the advisor's own tool calls.
+  let shownHandover: string | undefined;
+  let freshThisRun = false;
+  let seenResets = 0;
+  const noticeFor = (view: AdvisorContextWindow): UserMessage => {
+    const reset = window.status.resets !== seenResets;
+    seenResets = window.status.resets;
+    if (handover && (reset || (view.lastCurrentStart === 0 && !freshThisRun))) {
+      freshThisRun = true;
+      shownHandover = handover();
+    }
+    return view.notice(shownHandover);
+  };
+  // Budget for whichever note this request could show: the one already shown
+  // in this window, or the current one if the view turns out to start fresh.
+  const handoverTokens = (text: string | undefined) => text
+    ? estimateContextMessageTokens(window.notice(text)) - estimateContextMessageTokens(window.notice())
+    : 0;
+  const handoverReserve = () => handover ? Math.max(handoverTokens(shownHandover), handoverTokens(handover())) : 0;
   const unsubscribe = agent.subscribe((event, signal) => {
     if (event.type === "agent_start") {
+      freshThisRun = false;
       // Pi supplies the signal here. OMP's single-argument subscription does
       // not, so its provider-context hook below captures the same run signal.
       runSignal = signal;
@@ -334,7 +360,7 @@ export function installAdvisorContextWindow(agent: Agent, requestedTokens?: numb
         ...(providerContext && descriptor.strict !== undefined ? { strict: descriptor.strict } : {}),
       };
     });
-    return Math.ceil((prompt.length + JSON.stringify(tools).length) / 4) + 256;
+    return Math.ceil((prompt.length + JSON.stringify(tools).length) / 4) + 256 + handoverReserve();
   };
   const trim = (messages: AgentMessage[], currentStart?: number, fixed = fixedTokens()) =>
     window.trim(messages, fixed, agent.state.model?.contextWindow ?? 0, currentStart);
@@ -352,7 +378,8 @@ export function installAdvisorContextWindow(agent: Agent, requestedTokens?: numb
       const retained = trim(messages, runStart);
       const transformedCurrentStart = window.lastCurrentStart;
       const transformed = priorTransform ? await priorTransform.call(agent, retained, signal) : retained;
-      return [window.notice(), ...trim(transformed, transformedCurrentStart)];
+      const view = trim(transformed, transformedCurrentStart);
+      return [noticeFor(window), ...view];
     };
     agent.transformContext = transform;
   } else {
@@ -387,7 +414,7 @@ export function installAdvisorContextWindow(agent: Agent, requestedTokens?: numb
         fixed,
         agent.state.model?.contextWindow ?? 0,
       );
-      context.messages = [requestWindow.notice(), ...retained];
+      context.messages = [noticeFor(requestWindow), ...retained];
     });
   }
 

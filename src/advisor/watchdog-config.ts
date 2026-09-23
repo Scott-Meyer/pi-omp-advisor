@@ -175,6 +175,8 @@ export interface DiscoveredAdvisors {
   flushTimeoutMs: number | undefined;
   /** Deliver pending observations at primary settlement instead of waiting for the turn batch (default true; set false for strict turn batching). */
   flushOnSettled: boolean | undefined;
+  /** Top-level `notebook: true|false`: the optional advisor notebook (default off). */
+  notebook: boolean | undefined;
   /**
    * Whether at least one `WATCHDOG.yml`/`.yaml` was found and parsed into a
    * valid mapping, even if it declares no advisors. Activation no longer
@@ -345,6 +347,7 @@ interface WatchdogYamlAdvisorEntry {
   maxBehind?: unknown;
   flushTimeoutMs?: unknown;
   flushOnSettled?: unknown;
+  notebook?: unknown;
 }
 interface WatchdogYamlDoc {
   instructions?: unknown;
@@ -358,6 +361,7 @@ interface WatchdogYamlDoc {
   maxBehind?: unknown;
   flushTimeoutMs?: unknown;
   flushOnSettled?: unknown;
+  notebook?: unknown;
 }
 
 function validateAdvisorEntry(entry: WatchdogYamlAdvisorEntry, sourcePath: string): AdvisorConfig | undefined {
@@ -431,6 +435,7 @@ export async function discoverAdvisorConfigs(
   let maxBehind: number | undefined;
   let flushTimeoutMs: number | undefined;
   let flushOnSettled: boolean | undefined;
+  let notebook: boolean | undefined;
   let parsedAnyConfig = false;
 
   const yaml = items.length > 0 ? await requireYaml() : null;
@@ -490,6 +495,11 @@ export async function discoverAdvisorConfigs(
     } else if (doc.flushOnSettled !== undefined) {
       console.error(`[pi-omp-advisor] advisor config ${item.path}: ignoring invalid "flushOnSettled" (expected true or false)`);
     }
+    if (typeof doc.notebook === "boolean") {
+      notebook = doc.notebook;
+    } else if (doc.notebook !== undefined) {
+      console.error(`[pi-omp-advisor] advisor config ${item.path}: ignoring invalid "notebook" (expected true or false)`);
+    }
 
     if (Array.isArray(doc.advisors)) {
       for (const raw of doc.advisors) {
@@ -533,6 +543,7 @@ export async function discoverAdvisorConfigs(
     maxBehind,
     flushTimeoutMs,
     flushOnSettled,
+    notebook,
     configFound: parsedAnyConfig,
   };
 }
@@ -571,6 +582,8 @@ export interface WatchdogConfigDoc {
   flushTimeoutMs?: number;
   /** Deliver pending observations at primary settlement instead of waiting for the turn batch (default true). */
   flushOnSettled?: boolean;
+  /** See {@link DiscoveredAdvisors.notebook}. */
+  notebook?: boolean;
 }
 
 export function advisorConfigFilePath(scope: AdvisorConfigScope, dirs: { projectDir: string; agentDir: string }): string {
@@ -669,6 +682,7 @@ export async function loadWatchdogConfigFile(filePath: string): Promise<Watchdog
     result.flushTimeoutMs = doc.flushTimeoutMs;
   }
   if (typeof doc.flushOnSettled === "boolean") result.flushOnSettled = doc.flushOnSettled;
+  if (typeof doc.notebook === "boolean") result.notebook = doc.notebook;
   return result;
 }
 
@@ -695,6 +709,7 @@ export async function serializeWatchdogConfig(doc: WatchdogConfigDoc): Promise<s
   if (doc.maxBehind !== undefined) plain.maxBehind = doc.maxBehind;
   if (doc.flushTimeoutMs !== undefined) plain.flushTimeoutMs = doc.flushTimeoutMs;
   if (doc.flushOnSettled !== undefined) plain.flushOnSettled = doc.flushOnSettled;
+  if (doc.notebook !== undefined) plain.notebook = doc.notebook;
 
   if (doc.advisors.length > 0) {
     plain.advisors = doc.advisors.map(a => {

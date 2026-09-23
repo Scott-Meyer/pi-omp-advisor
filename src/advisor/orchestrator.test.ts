@@ -633,6 +633,40 @@ test("pending IDs survive a model-context rebuild and remain withdrawable", asyn
   assert.deepEqual(inbox.items, []);
 });
 
+test("an opted-in advisor's notebook carries across a model-context rebuild as its own earlier note", async t => {
+  let turn = 0;
+  const { orchestrator, createdSessionOptions } = await harness(t, async (text, call) => {
+    if (++turn === 1) {
+      assert.doesNotMatch(text, /Your notebook/, "nothing to hand over yet");
+      await call("notebook", { text: "Scott wants a small app." });
+      const replaced = await call("notebook", { text: "Scott wants a tiny single-user app; keep it simple." });
+      assert.equal(replaced.previous, "Scott wants a small app.", "a rewrite shows the note it replaced");
+    } else {
+      assert.match(text, /model context was rebuilt/);
+      assert.match(text, /Your notebook, written by you/);
+      assert.match(text, /not something they said/);
+      assert.match(text, /tiny single-user app/);
+      assert.doesNotMatch(text, /Scott wants a small app/, "only the latest note is handed over");
+    }
+  }, { watchdogLines: ["main: true", "maxBehind: 1", "notebook: true", "advisors:", "  - name: reviewer", ""] });
+  update(orchestrator, false);
+  await orchestrator.drainForExit(1000);
+  await orchestrator.resetRuntimesOnly();
+  update(orchestrator, true);
+  assert.equal(await orchestrator.drainForExit(1000), true);
+  assert.equal(turn, 2);
+  for (const options of createdSessionOptions) assert.ok(options?.tools?.includes("notebook"));
+  assert.match(createdSessionOptions[0]!.resourceLoader!.getSystemPrompt() ?? "", /Keeping the bigger picture/);
+});
+
+test("the notebook is absent unless opted in", async t => {
+  const { orchestrator, createdSessionOptions } = await harness(t, async () => {});
+  update(orchestrator, true);
+  assert.equal(await orchestrator.drainForExit(1000), true);
+  assert.ok(!createdSessionOptions[0]!.customTools!.some(tool => tool.name === "notebook"));
+  assert.doesNotMatch(createdSessionOptions[0]!.resourceLoader!.getSystemPrompt() ?? "", /notebook/i);
+});
+
 test("pausing during review does not release notes even when an aborted prompt resolves", async t => {
   let turn = 0;
   const reviewing = deferred();

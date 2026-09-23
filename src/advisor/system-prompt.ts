@@ -72,6 +72,8 @@ export interface BuildAdvisorSystemPromptOptions {
   cwd: string;
   /** Project context files (AGENTS.md etc.), if the caller has them (e.g. `ctx.getSystemPromptOptions().contextFiles`). */
   contextFiles?: readonly { path: string; content: string }[];
+  /** Explain the optional notebook tool. */
+  notebook?: boolean;
 }
 
 /**
@@ -82,6 +84,7 @@ export interface BuildAdvisorSystemPromptOptions {
  */
 export async function buildAdvisorSystemPrompt(opts: BuildAdvisorSystemPromptOptions): Promise<string> {
   const parts: string[] = [(await readPrompt("system.md")).trim()];
+  if (opts.notebook) parts.push((await readPrompt("notebook.md")).trim());
 
   const activeRepoRoot = await detectActiveRepoRoot(opts.cwd);
   if (activeRepoRoot) {
