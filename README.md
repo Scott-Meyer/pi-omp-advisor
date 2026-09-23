@@ -222,6 +222,11 @@ pi install npm:pi-omp-advisor
 pi install git:github.com/Scott-Meyer/pi-omp-advisor@v0.5.2
 ```
 
+Prereleases publish to the `next` channel. `pi install npm:pi-omp-advisor@next`
+switches an existing npm install to it (pi replaces the entry for the same
+package), and `pi update` then follows that channel. Install
+`npm:pi-omp-advisor` again to return to stable.
+
 Requires pi **0.84.2 or newer** (it uses `createAgentSession`,
 `DefaultResourceLoader`, and `loadProjectContextFiles`; on an older pi a missing
 export throws during extension load, which takes down the whole session) and
