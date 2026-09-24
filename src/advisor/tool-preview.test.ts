@@ -36,4 +36,11 @@ test("tool previews are Pi's own collapsed view: shell tails, no file bodies, ca
   assert.match(question, /Chose: "Teal"/);
   assert.match(question, /Chose: "Looks good so far"/, "a short result is shown whole");
   assert.doesNotMatch(question, /not shown/);
+
+  // Four short answers put the last one past Pi's 10-line generic preview while staying well under the cap.
+  const four = "The person answered:\n\n" + [1, 2, 3, 4].map(n => `"Question ${n}?"\nChose: "Option ${n}"`).join("\n\n");
+  assert.ok(four.split("\n").length > 10 && four.length < EXTENSION_PREVIEW_CHARACTERS);
+  const fourPreview = preview(call("ask_user_question", {}), result("ask_user_question", four))!;
+  assert.match(fourPreview, /Chose: "Option 4"/);
+  assert.doesNotMatch(fourPreview, /not shown/);
 });

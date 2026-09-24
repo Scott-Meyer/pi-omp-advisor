@@ -58,7 +58,7 @@ export async function createPiToolPreview(cwd: string): Promise<ToolPreview | un
   } catch {
     return undefined;
   }
-  const Component = pi.ToolExecutionComponent as (new (...args: unknown[]) => { markExecutionStarted(): void; setArgsComplete(): void; updateResult(result: unknown): void; render(width: number): string[] }) | undefined;
+  const Component = pi.ToolExecutionComponent as (new (...args: unknown[]) => { markExecutionStarted(): void; setArgsComplete(): void; setExpanded(expanded: boolean): void; updateResult(result: unknown): void; render(width: number): string[] }) | undefined;
   const Text = tui.Text as (new (text: string, x: number, y: number) => unknown) | undefined;
   if (typeof Component !== "function" || typeof Text !== "function") return undefined;
   const definitions = new Map<string, { renderResult?: unknown }>();
@@ -81,6 +81,9 @@ export async function createPiToolPreview(cwd: string): Promise<ToolPreview | un
       const component = new Component(result.toolName, result.toolCallId, call?.arguments ?? {}, { showImages: false }, renderers, ui, cwd);
       component.markExecutionStarted();
       component.setArgsComplete();
+      // Pi's generic preview stops at its first 10 lines; the character cap below
+      // bounds it instead, so a short many-line result isn't cut early.
+      if (!builtIn) component.setExpanded(true);
       component.updateResult({ content: result.content, details: result.details, isError: result.isError });
       const text = plain(component.render(WIDTH));
       return (builtIn ? text : capped(text, EXTENSION_PREVIEW_CHARACTERS)) || undefined;
