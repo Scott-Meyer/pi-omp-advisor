@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import type { ToolCall, ToolResultMessage } from "@earendil-works/pi-ai";
-import { createPiToolPreview, EXTENSION_PREVIEW_LINES } from "./tool-preview.ts";
+import { createPiToolPreview, EXTENSION_PREVIEW_CHARACTERS } from "./tool-preview.ts";
 
 const call = (name: string, args: Record<string, unknown>): ToolCall => ({ type: "toolCall", id: `${name}-1`, name, arguments: args });
 const result = (name: string, text: string): ToolResultMessage =>
@@ -24,8 +24,16 @@ test("tool previews are Pi's own collapsed view: shell tails, no file bodies, ca
     "Pi shows no file body under a collapsed read");
   assert.equal(preview(call("edit", { path: "a.ts" }), result("edit", "Edited a.ts")), undefined, "edits keep the advisor's own diff");
 
-  const extension = preview(call("ask_user_question", {}), result("ask_user_question", numbered("answer", 30)))!;
-  assert.match(extension, /^answer 1\n/);
-  assert.match(extension, /more lines not shown/);
-  assert.equal(extension.split("\n").length, EXTENSION_PREVIEW_LINES + 1);
+  const long = preview(call("mcp", {}), result("mcp", numbered("row " + "x".repeat(90), 30)))!;
+  assert.match(long, /^row x+ 1\n/);
+  assert.match(long, /more lines not shown/);
+  assert.ok(long.length < EXTENSION_PREVIEW_CHARACTERS + 100, "bounded like a shell preview");
+
+  // A real question result from this session: short, but blank lines and one line that wraps.
+  const answered = 'The person answered:\n\n"Pick a color for this test (any is fine)."\nChose: "Teal" (option 1)\n\n' +
+    '"Type a short sentence in your own words (anything), so we can check whether the advisor sees what you wrote."\nChose: "Looks good so far" (option 2)';
+  const question = preview(call("ask_user_question", {}), result("ask_user_question", answered))!;
+  assert.match(question, /Chose: "Teal"/);
+  assert.match(question, /Chose: "Looks good so far"/, "a short result is shown whole");
+  assert.doesNotMatch(question, /not shown/);
 });

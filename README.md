@@ -142,9 +142,9 @@ result, the lines you see under the call before expanding it. Built-in tools use
 Pi's built-in renderers, as Pi does for any tool with a built-in name that brings
 no renderer of its own: a shell shows its last few lines, and a read shows no
 file body. Other tools get Pi's generic preview (their first text lines), capped
-at 6 lines, since their own renderers aren't reachable from another extension.
+at about 600 characters (roughly six lines), since their own renderers aren't reachable from another extension.
 OMP and non-interactive modes show no preview. On one real, shell-heavy session
-this added about 32% input. When calls run in parallel, each card updates in place as
+this added about a third more input. When calls run in parallel, each card updates in place as
 its result arrives. If conversation arrives before a result, such as your
 correction or a peer's message, the completion is shown where it arrived.
 Extension messages, advisor notes, and summaries appear as labeled previews of up

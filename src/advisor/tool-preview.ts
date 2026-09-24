@@ -5,9 +5,11 @@
  * Tools with a built-in name use Pi's built-in result renderer, which is what
  * Pi itself does for any such tool that doesn't bring its own renderer (for
  * example an extension that reroutes read/bash to a remote host). Other tools
- * get Pi's generic preview, their first text lines, capped at the same few
- * lines as a shell preview: their own renderers aren't reachable from another
- * extension, and one long line can otherwise wrap into a page.
+ * get Pi's generic preview, their first text lines, capped at about as much
+ * text as a shell preview: their own renderers aren't reachable from another
+ * extension, and one long line can otherwise wrap into a page. The cap counts
+ * characters, not lines, so a short result with blank lines or one long
+ * wrapped line (a question and its answer, say) stays whole.
  *
  * Edits and writes keep the advisor's own bounded diff. Hosts without Pi's
  * rendering exports (OMP) or without an initialized theme (non-interactive
@@ -20,13 +22,22 @@ export type ToolPreview = (call: ToolCall | undefined, result: ToolResultMessage
 /** Built-ins whose collapsed result Pi renders itself. Edit/write diffs are shown separately. */
 const BUILT_INS = { bash: "createBashToolDefinition", powershell: "createPowerShellToolDefinition", read: "createReadToolDefinition", grep: "createGrepToolDefinition", find: "createFindToolDefinition", ls: "createLsToolDefinition" } as const;
 const WIDTH = 100;
-/** Visible lines kept from an extension tool's generic preview; a shell preview is about this long. */
-export const EXTENSION_PREVIEW_LINES = 6;
+/** Characters kept from an extension tool's generic preview: about six full-width lines, like a shell preview. */
+export const EXTENSION_PREVIEW_CHARACTERS = 600;
 const DIFF_TOOLS = new Set(["edit", "write"]);
 
-function capped(text: string, lines: number): string {
-  const kept = text.split("\n");
-  return kept.length <= lines ? text : [...kept.slice(0, lines), `(${kept.length - lines} more lines not shown)`].join("\n");
+function capped(text: string, characters: number): string {
+  if (text.length <= characters) return text;
+  const lines = text.split("\n");
+  const kept: string[] = [];
+  let used = 0;
+  for (const line of lines) {
+    if (kept.length > 0 && used + line.length + 1 > characters) break;
+    kept.push(kept.length === 0 && line.length > characters ? `${line.slice(0, characters)}…` : line);
+    used += line.length + 1;
+  }
+  const omitted = lines.length - kept.length;
+  return omitted > 0 ? [...kept, `(${omitted} more lines not shown)`].join("\n") : kept.join("\n");
 }
 
 function plain(lines: string[]): string {
@@ -72,7 +83,7 @@ export async function createPiToolPreview(cwd: string): Promise<ToolPreview | un
       component.setArgsComplete();
       component.updateResult({ content: result.content, details: result.details, isError: result.isError });
       const text = plain(component.render(WIDTH));
-      return (builtIn ? text : capped(text, EXTENSION_PREVIEW_LINES)) || undefined;
+      return (builtIn ? text : capped(text, EXTENSION_PREVIEW_CHARACTERS)) || undefined;
     } catch {
       return undefined;
     }
