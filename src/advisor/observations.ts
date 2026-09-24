@@ -2,14 +2,16 @@
  * The advisor's view of the watched session: a readable skim, like someone
  * glancing over the human's shoulder. Conversation stays prominent; each tool
  * call is one short card (what was run, its status and size, the first line of
- * an error, and bounded edit/write diffs). Successful result bodies and ordinary
- * read-file contents stay out, keeping the advisor focused on the conversation
- * rather than a second copy of the primary's research.
+ * an error, bounded edit/write diffs, and the host's own short collapsed result
+ * preview when it has one). Full result bodies and read-file contents stay out,
+ * keeping the advisor focused on the conversation rather than a second copy of
+ * the primary's research.
  */
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ImageContent, TextContent, ToolCall, ToolResultMessage, UserMessage } from "@earendil-works/pi-ai";
 import { truncateDiffLines } from "./file-diff.ts";
 import { formatToolCallPrimaryArg, formatToolResultErrorPreview } from "./session-history-format.ts";
+import type { ToolPreview } from "./tool-preview.ts";
 
 export interface ActivityCard {
   title: string;
@@ -83,13 +85,19 @@ function outcome(result: ToolResultMessage): string {
 /** Who provides a tool, as Pi registered it: "built-in" or an extension/package name. */
 export type ToolSource = (toolName: string) => string | undefined;
 
+/** What the host knows about tools: who provides them and how it previews their results. */
+export interface ToolPresentation {
+  toolSource?: ToolSource;
+  toolPreview?: ToolPreview;
+}
+
 /**
  * One card for a tool call, its result, or both. `startedEarlier` marks a
  * completion shown apart from its invocation, where it arrived.
  */
-export function toolCard(call: ToolCall | undefined, result: ToolResultMessage | undefined, startedEarlier = false, toolSource?: ToolSource): ActivityCard {
+export function toolCard(call: ToolCall | undefined, result: ToolResultMessage | undefined, startedEarlier = false, tools: ToolPresentation = {}): ActivityCard {
   const toolName = result?.toolName ?? call?.name;
-  const source = typeof toolName === "string" ? label(toolSource?.(toolName)) : undefined;
+  const source = typeof toolName === "string" ? label(tools.toolSource?.(toolName)) : undefined;
   const name = `${label(toolName) ?? "unknown"}${source ? ` (${source})` : ""}`;
   const state = result ? (result.isError ? "error" : "completed") : "awaiting result";
   const parts: string[] = [];
@@ -98,6 +106,9 @@ export function toolCard(call: ToolCall | undefined, result: ToolResultMessage |
     parts.push(outcome(result));
     const diff = record(result.details)?.diff;
     if (typeof diff === "string" && diff.trim()) parts.push(fence(truncateDiffLines(diff.trim()), "diff"));
+    // What Pi itself shows collapsed under the call; errors keep their first line above.
+    const preview = result.isError ? undefined : tools.toolPreview?.(call, result);
+    if (preview?.trim()) parts.push(fence(preview));
   }
   return {
     title: `Tool · ${name} · ${state}${startedEarlier ? " · started earlier" : ""}`,
@@ -138,7 +149,7 @@ function advisorNoteCards(details: Record<string, unknown> | undefined): Activit
 }
 
 /** Cards for one watched message, in order. Tool results are paired by the batch renderer. */
-export function observationCards(message: AgentMessage, includeThinking: boolean, toolSource?: ToolSource): ActivityCard[] {
+export function observationCards(message: AgentMessage, includeThinking: boolean, tools: ToolPresentation = {}): ActivityCard[] {
   const conversation = (title: string, body: string): ActivityCard => ({ title, body, kind: "conversation" });
   switch (message.role) {
     case "user": {
@@ -153,11 +164,11 @@ export function observationCards(message: AgentMessage, includeThinking: boolean
       for (const block of message.content) {
         if (block.type === "text" && block.text.trim()) cards.push(conversation("Primary", chat(block.text)));
         else if (block.type === "thinking" && includeThinking && block.thinking.trim()) cards.push(conversation("Primary · reasoning", chat(block.thinking)));
-        else if (block.type === "toolCall") cards.push(toolCard(block, undefined, false, toolSource));
+        else if (block.type === "toolCall") cards.push(toolCard(block, undefined, false, tools));
       }
       return cards;
     }
-    case "toolResult": return [toolCard(undefined, message, false, toolSource)];
+    case "toolResult": return [toolCard(undefined, message, false, tools)];
     case "custom": {
       // Hidden custom messages aren't on the human's screen, so they aren't on the advisor's either.
       if (message.display === false) return [];

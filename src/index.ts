@@ -69,6 +69,7 @@ import { DEFAULT_ADVISOR_CONTEXT_TOKENS, MIN_ADVISOR_CONTEXT_TOKENS, type Contex
 import { FileMutationTracker } from "./advisor/file-diff.ts";
 import { advisorCustomMessageType, isOmpExtensionApi, isOmpHost, isOmpUserResumeMessage, ompAgentEndWasAborted, piHostModelRuntime } from "./advisor/host-compat.ts";
 import { toolSourceName } from "./advisor/tool-source.ts";
+import { createPiToolPreview, type ToolPreview } from "./advisor/tool-preview.ts";
 import {
   DEFAULT_FLUSH_ON_SETTLED,
   DEFAULT_FLUSH_TIMEOUT_MS,
@@ -301,6 +302,7 @@ export default function (pi: ExtensionAPI) {
   );
 
   let orchestrator: AdvisorOrchestrator | undefined;
+  let toolPreview: ToolPreview | undefined;
   const inbox = new AdvisorInbox();
   const primaryInterruption = new PrimaryInterruptionState();
   const fileMutationTracker = new FileMutationTracker();
@@ -722,6 +724,7 @@ export default function (pi: ExtensionAPI) {
       isAutoResumeSuppressed: () => primaryInterruption.autoResumeSuppressed,
       hasQueuedWork: () => ctx.hasPendingMessages(),
       setStatus: text => ctx.ui.setStatus("advisor", text),
+      toolPreview: (call, result) => toolPreview?.(call, result),
       toolSource(toolName) {
         try {
           const info = pi.getAllTools?.().find(tool => tool.name === toolName);
@@ -773,6 +776,8 @@ export default function (pi: ExtensionAPI) {
       const piModelRuntime = isOmpHost(ctx)
         ? undefined
         : piHostModelRuntime(ctx) ?? await (await import("@earendil-works/pi-coding-agent")).ModelRuntime.create();
+      // Pi's own collapsed tool-result previews; OMP doesn't export Pi's renderers.
+      toolPreview = isOmpHost(ctx) ? undefined : await createPiToolPreview(ctx.cwd);
       orchestrator = new AdvisorOrchestrator(makeHost(ctx));
       // Armed here, not only in the `input` handler below: a headless caller must
       // never have an advisor note silently start a turn, and waiting for the

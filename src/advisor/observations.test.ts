@@ -146,3 +146,15 @@ test("each tool says who provides it, as Pi registered it", () => {
     "### Tool · mystery · completed",
   ]);
 });
+
+test("a host's tool-result preview appears under successful calls only", () => {
+  const toolPreview = (_call: unknown, r: { toolName: string }) => `PREVIEW of ${r.toolName}`;
+  const rendered = renderAdvisorDeltaMessages([
+    calls(["bash", "ok", { command: "ls" }], ["bash", "bad", { command: "false" }]),
+    result("bash", "ok", "a\nb"), result("bash", "bad", "boom", undefined, true),
+  ], { wip: false, includeThinking: false, toolPreview } as any)!;
+  const text = joinAdvisorDeltaMessages(rendered);
+  assert.equal(text.split("PREVIEW of bash").length - 1, 1);
+  assert.match(text, /⇒ ok · 2 lines, 3 characters\n```\nPREVIEW of bash\n```/);
+  assert.match(text, /⇒ error · 1 line, 4 characters — boom/);
+});

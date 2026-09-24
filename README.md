@@ -23,9 +23,9 @@ On session start, pi-omp-advisor builds one live in-process `AgentSession` per
 configured advisor, each with its own model and its own throwaway context,
 and feeds it a compact skim of the primary session, much like someone glancing
 over your shoulder: normally one batch per primary turn, with your messages and the
-primary's replies in full and one short card per tool call. Successful tool-result
-bodies and ordinary read-file contents stay out; first-line error previews and
-bounded edit/write diffs may be included. Its recent model context is bounded to
+primary's replies in full and one short card per tool call. Full tool-result
+bodies and read-file contents stay out; Pi's own short collapsed result preview,
+first-line error previews and bounded edit/write diffs may be included. Its recent model context is bounded to
 **32,000 estimated input
 tokens** by default, and primary-agent reasoning is excluded unless explicitly enabled.
 
@@ -136,8 +136,15 @@ hint to re-read the branch.
 ### What the feed shows, and usage
 
 Each tool call is one card: the command, path, or main argument (up to 120
-characters), its status and size, the first line of an error, and a bounded diff
-for edits and writes. When calls run in parallel, each card updates in place as
+characters), its status and size, the first line of an error, a bounded diff
+for edits and writes, and Pi's own short collapsed preview of a successful
+result, the lines you see under the call before expanding it. Built-in tools use
+Pi's built-in renderers, as Pi does for any tool with a built-in name that brings
+no renderer of its own: a shell shows its last few lines, and a read shows no
+file body. Other tools get Pi's generic preview (their first text lines), capped
+at 6 lines, since their own renderers aren't reachable from another extension.
+OMP and non-interactive modes show no preview. On one real, shell-heavy session
+this added about 32% input. When calls run in parallel, each card updates in place as
 its result arrives. If conversation arrives before a result, such as your
 correction or a peer's message, the completion is shown where it arrived.
 Extension messages, advisor notes, and summaries appear as labeled previews of up

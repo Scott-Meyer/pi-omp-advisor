@@ -22,7 +22,7 @@
 import type { ExtensionContext, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { createAgentSession, DefaultResourceLoader, SessionManager } from "@earendil-works/pi-coding-agent";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { ToolCall } from "@earendil-works/pi-ai";
+import type { ToolCall, ToolResultMessage } from "@earendil-works/pi-ai";
 // `ThinkingLevel` must come from pi-agent-core, which is what
 // `CreateAgentSessionOptions.thinkingLevel` is typed against (`sdk.d.ts:1`).
 // pi-ai exports a NARROWER type of the same name that omits "off", so importing
@@ -251,6 +251,8 @@ export interface OrchestratorHost {
   isAborting(): boolean;
   /** Who provides a tool ("built-in" or an extension/package name), when the host knows. */
   toolSource?(toolName: string): string | undefined;
+  /** The host's own collapsed preview of a finished tool result, when it has one. */
+  toolPreview?(call: ToolCall | undefined, result: ToolResultMessage): string | undefined;
   /** Durable storage for the optional notebook; without it, notes last for this orchestrator only. */
   readNotebook?(advisor: string | undefined): NotebookEntry | undefined;
   writeNotebook?(advisor: string | undefined, entry: NotebookEntry): void;
@@ -1063,7 +1065,7 @@ export class AdvisorOrchestrator {
     const earlierCalls = advisor.openCalls;
     advisor.openCalls = openToolCallsAfter(earlierCalls, batch);
     const attempt = async (includeThinking: boolean): Promise<boolean> => {
-      const chunks = renderAdvisorDeltaMessages(batch, { wip, includeThinking, earlierCalls, toolSource: name => this.#host.toolSource?.(name) }) ?? [];
+      const chunks = renderAdvisorDeltaMessages(batch, { wip, includeThinking, earlierCalls, toolSource: name => this.#host.toolSource?.(name), toolPreview: (call, result) => this.#host.toolPreview?.(call, result) }) ?? [];
       const runtimeContext: string[] = [];
       // Tool events do not trigger reviews. If stop access was explicitly
       // granted, sample the controller only when a scheduled review is about
