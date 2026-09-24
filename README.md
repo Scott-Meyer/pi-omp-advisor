@@ -126,6 +126,13 @@ as session entries, so they follow the branch they were written on and survive
 reloads. A short system-prompt section explains the purpose; there are no rules
 or approval steps. Ask the advisor in chat if you want to see or discuss its note.
 
+Other extensions can show notes read-only. Each write appends a session entry
+(`customType: "pi-omp-advisor-notebook"`, data `{ advisor?, text, updatedAt }`;
+`advisor` is absent for the single default advisor). The latest entry per
+advisor on the active branch is its current note. After each write,
+`pi.events` also emits `pi-omp-advisor:notebook:v1` with the same data, as a
+hint to re-read the branch.
+
 ### What the feed shows, and usage
 
 Each tool call is one card: the command, path, or main argument (up to 120
@@ -133,8 +140,13 @@ characters), its status and size, the first line of an error, and a bounded diff
 for edits and writes. When calls run in parallel, each card updates in place as
 its result arrives. If conversation arrives before a result, such as your
 correction or a peer's message, the completion is shown where it arrived.
-Peer, extension, and advisor messages and summaries appear as labeled previews of
-up to 500 characters; messages hidden from your screen are hidden from the advisor too.
+Extension messages, advisor notes, and summaries appear as labeled previews of up
+to 500 characters; messages hidden from your screen are hidden from the advisor too.
+Labels follow Pi rather than knowing particular extensions: an extension message
+is labeled with its message type, as Pi's default view labels it, and each tool
+card names who provides the tool (`built-in` or the registering extension/package).
+A `User message` is Pi's user-role message; extensions can send those too, so it
+isn't proof a person typed it.
 
 `/advisor status` shows cumulative reported usage since the advisor runtime started:
 uncached input, cache-read/write, output (including reported reasoning), model

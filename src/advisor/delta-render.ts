@@ -1,6 +1,6 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { TextContent, ToolCall } from "@earendil-works/pi-ai";
-import { activityContent, advisorObservationBatch, observationCards, toolCard, type ActivityCard } from "./observations.ts";
+import { activityContent, advisorObservationBatch, observationCards, toolCard, type ActivityCard, type ToolSource } from "./observations.ts";
 
 /** User is the transport role, not the author of the watched conversation. */
 export interface AdvisorDeltaMessage {
@@ -12,6 +12,8 @@ export interface RenderAdvisorDeltaOptions {
   includeThinking: boolean;
   /** Calls from earlier batches still awaiting results, by tool-call ID. */
   earlierCalls?: ReadonlyMap<string, ToolCall>;
+  /** Who provides each tool, as the host registered it. */
+  toolSource?: ToolSource;
 }
 
 /**
@@ -31,16 +33,16 @@ export function renderAdvisorDeltaMessages(delta: AgentMessage[], opts: RenderAd
       const local = open.get(message.toolCallId);
       if (local && local.call.name === message.toolName) {
         open.delete(message.toolCallId);
-        if (lastConversation < local.index) cards[local.index] = toolCard(local.call, message);
-        else cards.push(toolCard(local.call, message, true));
+        if (lastConversation < local.index) cards[local.index] = toolCard(local.call, message, false, opts.toolSource);
+        else cards.push(toolCard(local.call, message, true, opts.toolSource));
         continue;
       }
       const earlier = opts.earlierCalls?.get(message.toolCallId);
       const call = earlier?.name === message.toolName ? earlier : undefined;
-      cards.push(toolCard(call, message, Boolean(call)));
+      cards.push(toolCard(call, message, Boolean(call), opts.toolSource));
       continue;
     }
-    for (const card of observationCards(message, opts.includeThinking)) {
+    for (const card of observationCards(message, opts.includeThinking, opts.toolSource)) {
       cards.push(card);
       if (card.kind === "conversation") lastConversation = cards.length - 1;
       else if (card.call) open.set(card.call.id, { index: cards.length - 1, call: card.call });

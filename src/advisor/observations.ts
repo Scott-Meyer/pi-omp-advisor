@@ -80,12 +80,17 @@ function outcome(result: ToolResultMessage): string {
   return `⇒ error · ${size(text)}${first ? ` — ${first}` : ""}`;
 }
 
+/** Who provides a tool, as Pi registered it: "built-in" or an extension/package name. */
+export type ToolSource = (toolName: string) => string | undefined;
+
 /**
  * One card for a tool call, its result, or both. `startedEarlier` marks a
  * completion shown apart from its invocation, where it arrived.
  */
-export function toolCard(call: ToolCall | undefined, result: ToolResultMessage | undefined, startedEarlier = false): ActivityCard {
-  const name = label(result?.toolName ?? call?.name) ?? "unknown";
+export function toolCard(call: ToolCall | undefined, result: ToolResultMessage | undefined, startedEarlier = false, toolSource?: ToolSource): ActivityCard {
+  const toolName = result?.toolName ?? call?.name;
+  const source = typeof toolName === "string" ? label(toolSource?.(toolName)) : undefined;
+  const name = `${label(toolName) ?? "unknown"}${source ? ` (${source})` : ""}`;
   const state = result ? (result.isError ? "error" : "completed") : "awaiting result";
   const parts: string[] = [];
   if (call) parts.push(invocation(call));
@@ -108,20 +113,17 @@ function attribution(message: AgentMessage): string | undefined {
   return value ? `${value}${metadata.steering === true ? " · steering" : ""}` : undefined;
 }
 
+/**
+ * Pi labels an extension's message with its type, not with which extension
+ * sent it, and its text is what the primary receives. Nothing here knows
+ * particular extensions; only this advisor's own messages are recognized.
+ */
 function customTitle(message: AgentMessage & { customType: string; details?: unknown }): string {
-  const details = record(message.details);
-  if (message.customType === "parley_message") {
-    const from = record(details?.from);
-    return `Peer · ${label(from?.name) ?? label(from?.id, 32) ?? "unknown"} · Parley`;
-  }
   if (["advisor", "pi-omp-advisor"].includes(message.customType)) {
-    const name = label(details?.advisor);
+    const name = label(record(message.details)?.advisor);
     return name ? `Advisor · ${name}` : "Advisor";
   }
-  const name = label(details?.title) ?? label(details?.taskName) ?? label(details?.name)
-    ?? label(message.customType.replace(/[_-]/g, " ")) ?? "unnamed";
-  const status = label(details?.status);
-  return `Extension · ${name}${status ? ` · ${status}` : ""}`;
+  return `Extension message · ${label(message.customType) ?? "unnamed"}`;
 }
 
 function advisorNoteCards(details: Record<string, unknown> | undefined): ActivityCard[] | undefined {
@@ -136,25 +138,26 @@ function advisorNoteCards(details: Record<string, unknown> | undefined): Activit
 }
 
 /** Cards for one watched message, in order. Tool results are paired by the batch renderer. */
-export function observationCards(message: AgentMessage, includeThinking: boolean): ActivityCard[] {
+export function observationCards(message: AgentMessage, includeThinking: boolean, toolSource?: ToolSource): ActivityCard[] {
   const conversation = (title: string, body: string): ActivityCard => ({ title, body, kind: "conversation" });
   switch (message.role) {
     case "user": {
       const text = textContent(message.content);
       if (!text.trim()) return [];
       const source = attribution(message);
-      return [conversation(`User${source ? ` · ${source}` : ""}`, chat(text))];
+      // A Pi user-role message. Extensions can send these too, so it isn't proof a person typed it.
+      return [conversation(`User message${source ? ` · ${source}` : ""}`, chat(text))];
     }
     case "assistant": {
       const cards: ActivityCard[] = [];
       for (const block of message.content) {
         if (block.type === "text" && block.text.trim()) cards.push(conversation("Primary", chat(block.text)));
         else if (block.type === "thinking" && includeThinking && block.thinking.trim()) cards.push(conversation("Primary · reasoning", chat(block.thinking)));
-        else if (block.type === "toolCall") cards.push(toolCard(block, undefined));
+        else if (block.type === "toolCall") cards.push(toolCard(block, undefined, false, toolSource));
       }
       return cards;
     }
-    case "toolResult": return [toolCard(undefined, message)];
+    case "toolResult": return [toolCard(undefined, message, false, toolSource)];
     case "custom": {
       // Hidden custom messages aren't on the human's screen, so they aren't on the advisor's either.
       if (message.display === false) return [];

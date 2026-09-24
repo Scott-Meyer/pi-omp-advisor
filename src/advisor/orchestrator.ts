@@ -249,6 +249,8 @@ export interface OrchestratorHost {
   requestStop(advisor: string | undefined, targetId: string, reason: string, model?: string): StopRequestResult;
   isStreaming(): boolean;
   isAborting(): boolean;
+  /** Who provides a tool ("built-in" or an extension/package name), when the host knows. */
+  toolSource?(toolName: string): string | undefined;
   /** Durable storage for the optional notebook; without it, notes last for this orchestrator only. */
   readNotebook?(advisor: string | undefined): NotebookEntry | undefined;
   writeNotebook?(advisor: string | undefined, entry: NotebookEntry): void;
@@ -1061,7 +1063,7 @@ export class AdvisorOrchestrator {
     const earlierCalls = advisor.openCalls;
     advisor.openCalls = openToolCallsAfter(earlierCalls, batch);
     const attempt = async (includeThinking: boolean): Promise<boolean> => {
-      const chunks = renderAdvisorDeltaMessages(batch, { wip, includeThinking, earlierCalls }) ?? [];
+      const chunks = renderAdvisorDeltaMessages(batch, { wip, includeThinking, earlierCalls, toolSource: name => this.#host.toolSource?.(name) }) ?? [];
       const runtimeContext: string[] = [];
       // Tool events do not trigger reviews. If stop access was explicitly
       // granted, sample the controller only when a scheduled review is about

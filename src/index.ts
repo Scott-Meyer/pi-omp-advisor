@@ -68,6 +68,7 @@ import { formatToolCallPrimaryArg } from "./advisor/session-history-format.ts";
 import { DEFAULT_ADVISOR_CONTEXT_TOKENS, MIN_ADVISOR_CONTEXT_TOKENS, type ContextWindowStatus } from "./advisor/context-window.ts";
 import { FileMutationTracker } from "./advisor/file-diff.ts";
 import { advisorCustomMessageType, isOmpExtensionApi, isOmpHost, isOmpUserResumeMessage, ompAgentEndWasAborted, piHostModelRuntime } from "./advisor/host-compat.ts";
+import { toolSourceName } from "./advisor/tool-source.ts";
 import {
   DEFAULT_FLUSH_ON_SETTLED,
   DEFAULT_FLUSH_TIMEOUT_MS,
@@ -96,6 +97,7 @@ const ADVISOR_PAUSE_SHORTCUT = "ctrl+shift+r";
 const ADVISOR_CLEAR_SHORTCUT = "ctrl+shift+x";
 const ADVISOR_INBOX_STATE_TYPE = "pi-omp-advisor-inbox";
 const ADVISOR_NOTEBOOK_STATE_TYPE = "pi-omp-advisor-notebook";
+const ADVISOR_NOTEBOOK_EVENT = "pi-omp-advisor:notebook:v1";
 const ADVISOR_STOP_STATE_TYPE = "pi-omp-advisor-stop";
 
 const ADVISOR_COMMAND_COMPLETIONS: readonly AutocompleteItem[] = [
@@ -720,6 +722,14 @@ export default function (pi: ExtensionAPI) {
       isAutoResumeSuppressed: () => primaryInterruption.autoResumeSuppressed,
       hasQueuedWork: () => ctx.hasPendingMessages(),
       setStatus: text => ctx.ui.setStatus("advisor", text),
+      toolSource(toolName) {
+        try {
+          const info = pi.getAllTools?.().find(tool => tool.name === toolName);
+          return toolSourceName(info?.sourceInfo);
+        } catch {
+          return undefined;
+        }
+      },
       // Session entries keep the note with the branch it was written on.
       readNotebook(advisor) {
         const entry = [...ctx.sessionManager.getBranch()].reverse().find(candidate =>
@@ -730,6 +740,8 @@ export default function (pi: ExtensionAPI) {
       },
       writeNotebook(advisor, entry) {
         pi.appendEntry(ADVISOR_NOTEBOOK_STATE_TYPE, { advisor, ...entry });
+        // A hint for other extensions; the session entry above stays the source of truth.
+        pi.events.emit(ADVISOR_NOTEBOOK_EVENT, { advisor, ...entry });
       },
     };
   }
