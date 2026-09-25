@@ -69,7 +69,7 @@ export interface AdvisorConfig {
   instructions?: string;
   /** Per-advisor on/off toggle (default `true`). */
   enabled?: boolean;
-  /** Estimated total model-input budget; defaults to 32,000 tokens. */
+  /** Estimated total model-input budget; defaults to 48,000 tokens. */
   contextTokens?: number;
   /** Include the primary's reasoning in observations; defaults to false. */
   includePrimaryThinking?: boolean;

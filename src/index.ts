@@ -1278,7 +1278,8 @@ export default function (pi: ExtensionAPI) {
         const picked = await ctx.ui.select(
           "Advisor context ceiling (stable history prefix preserved for prompt caching; resets pre-update history at ceiling)",
           [
-            "32,000 tokens (recommended default)",
+            "48,000 tokens (recommended default)",
+            "32,000 tokens",
             "16,000 tokens (lean memory)",
             "64,000 tokens (large context)",
             "Custom token budget…",
@@ -1286,7 +1287,8 @@ export default function (pi: ExtensionAPI) {
         );
         if (picked !== undefined) {
           let newBudget: number | undefined;
-          if (picked.startsWith("32,000")) newBudget = 32_000;
+          if (picked.startsWith("48,000")) newBudget = 48_000;
+          else if (picked.startsWith("32,000")) newBudget = 32_000;
           else if (picked.startsWith("16,000")) newBudget = 16_000;
           else if (picked.startsWith("64,000")) newBudget = 64_000;
           else if (picked.startsWith("Custom")) {

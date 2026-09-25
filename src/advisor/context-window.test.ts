@@ -20,9 +20,9 @@ const call = (id: string) => assistant([{ type: "toolCall", id, name: "read_file
 const result = (id: string, text: string): AgentMessage => ({ role: "toolResult", toolCallId: id, toolName: "read_file", content: [{ type: "text", text }], isError: false, timestamp: 3 });
 const body = (messages: AgentMessage[]) => JSON.stringify(messages);
 
-test("the default is a bounded 32k memory that resets at an update boundary", () => {
+test("the default is a bounded 48k memory that resets at an update boundary", () => {
   const window = new AdvisorContextWindow();
-  assert.equal(window.requestedTokens, 32_000);
+  assert.equal(window.requestedTokens, 48_000);
   const input = Array.from({ length: 25 }, (_, i) => [
     user(`observation-${i}: ${"x".repeat(25_000)}`), response(`review-${i}`),
   ]).flat();

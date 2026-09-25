@@ -187,7 +187,7 @@ copyright Scott Meyer, MIT (see `LICENSE`):
    the model on every tool start.
    `src/advisor/primary-stop.ts`, `stop-tools.ts`, and `primary-stop.test.ts`
    are original to this project (Scott Meyer, MIT), not OMP features.
-14. **Bounded advisor model context.** `contextTokens` defaults to 32,000
+14. **Bounded advisor model context.** `contextTokens` defaults to 48,000
    estimated input tokens per advisor; `includePrimaryThinking` defaults to false.
    A public `Agent.transformContext` hook applies the bound before every model
    request, including investigative tool follow-ups. The prefix grows unchanged

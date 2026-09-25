@@ -26,7 +26,7 @@ over your shoulder: normally one batch per primary turn, with your messages and 
 primary's replies in full and one short card per tool call. Full tool-result
 bodies and read-file contents stay out; Pi's own short collapsed result preview,
 first-line error previews and bounded edit/write diffs may be included. Its recent model context is bounded to
-**32,000 estimated input
+**48,000 estimated input
 tokens** by default, and primary-agent reasoning is excluded unless explicitly enabled.
 
 An advisor reaches the primary agent and operator through `advise(note, severity?, ShortTitle?)`
@@ -304,7 +304,7 @@ advisors:
   - name: advisor
     model: openai/gpt-5.1-codex-mini   # or provider/id:high for a thinking level
     tools: [read, grep, glob]     # default; `glob` maps to pi's `find`
-    contextTokens: 32000         # default estimated input ceiling; configurable, minimum 2048
+    contextTokens: 48000         # default estimated input ceiling; configurable, minimum 2048
     includePrimaryThinking: false  # default; independent of the advisor's own thinking level
     maxBehind: 3          # per-advisor turn-batch override
     flushTimeoutMs: 240000 # per-advisor maximum wait for a partial batch
