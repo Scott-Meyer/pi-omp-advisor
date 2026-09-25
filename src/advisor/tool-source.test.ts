@@ -10,5 +10,9 @@ test("tool providers get short names from Pi's registry records", () => {
   assert.equal(toolSourceName({ source: "../../git/pi-parley", origin: "package", path: "/u/git/pi-parley/index.ts" }), "pi-parley");
   assert.equal(toolSourceName({ source: "auto", origin: "top-level", path: "/u/.pi/agent/extensions/hello.ts" }), "hello");
   assert.equal(toolSourceName({ source: "local", origin: "top-level", path: "/u/.pi/agent/extensions/todo/index.ts" }), "todo");
+  // OMP 18.2.4 registry records, captured from a real run.
+  assert.equal(toolSourceName({ source: "builtin", path: "<builtin:grep>", origin: "top-level" }), "built-in");
+  assert.equal(toolSourceName({ source: "extension", path: "<extension:init_experiment>", origin: "top-level" }), "extension");
+  assert.equal(toolSourceName({ source: "mcp", path: "<mcp:slack_search>", origin: "top-level" }), "mcp");
   assert.equal(toolSourceName(undefined), undefined);
 });

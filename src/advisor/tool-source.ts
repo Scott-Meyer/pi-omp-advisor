@@ -20,6 +20,8 @@ export function toolSourceName(info: ToolSourceInfo | undefined): string | undef
   const source = info.source ?? "";
   if (source === "builtin") return "built-in";
   if (source === "sdk") return "host";
+  // OMP records a category ("extension", "mcp") with a synthetic "<…>" path, not which extension.
+  if (info.path?.startsWith("<")) return source || undefined;
   if (info.origin === "package" && source) {
     if (source.startsWith("npm:")) return source.slice(4).replace(/(.)@[^/]*$/, "$1") || undefined;
     const spec = source.replace(/^(git:|https?:\/\/)/, "").replace(/@[^/]*$/, "").replace(/\.git$/, "");
