@@ -12,6 +12,7 @@ It covers:
 - recovery after a malformed advisor tool stream, with provider-boundary validation that rejects orphaned, duplicate, or incomplete tool exchanges;
 - session-local disabling of OMP's native advisor inside the extension child while the primary native advisor remains enabled; and
 - the collision-free `/pi-advisor` command, host-aware help, and effective advisor model in detailed status;
+- an opted-in (`notebook: true`) advisor gets the `notebook` tool, writes a note, and sees it handed back once a large read forces its context to reset;
 - with `RUN_TUI=1`, real PTY submission plus visible footer and delivered-card model identity.
 
 ## Run

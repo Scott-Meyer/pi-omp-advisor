@@ -130,7 +130,7 @@ start_server() {
   stop_server
   rm -f "$log" "$WORK/server.log"
   CURRENT_REQUEST_LOG=$log
-  PORT="$PORT" SCENARIO="$scenario" READ_PATH="$WORK/project/large-context-fixture.txt" REQUEST_LOG="$log" \
+  PORT="$PORT" SCENARIO="$scenario" READ_PATH="${READ_PATH_OVERRIDE:-$WORK/project/large-context-fixture.txt}" REQUEST_LOG="$log" \
     node "$ROOT/scripts/omp-compat/fake-openai-server.mjs" >"$WORK/server.log" 2>&1 &
   SERVER_PID=$!
   for _ in {1..100}; do
@@ -161,7 +161,7 @@ run_print() {
   (cd "$WORK/project" && "$OMP_BIN" --model compat/compat-model --no-session -p "Reply exactly PRIMARY_COMPAT_OK.") >"$output" 2>"$stderr"
 }
 
-printf '[1/9] fresh install starts an implicit advisor on the active chat model\n'
+printf '[1/10] fresh install starts an implicit advisor on the active chat model\n'
 start_server direct-advice "$WORK/zero-config.requests.jsonl"
 (cd "$WORK/zero-config-project" && "$OMP_BIN" --model compat/compat-model --no-session -p "Reply exactly PRIMARY_COMPAT_OK.") >"$WORK/zero-config.out" 2>"$WORK/zero-config.err"
 node - "$WORK/zero-config.requests.jsonl" "$WORK/zero-config.out" <<'NODE'
@@ -176,7 +176,7 @@ if (!primary.every(row => row.model === "compat-model") || !advisor.every(row =>
 NODE
 stop_server
 
-printf '[2/9] implicit advisor follows an interactive chat-model switch\n'
+printf '[2/10] implicit advisor follows an interactive chat-model switch\n'
 start_server direct-advice "$WORK/model-switch.requests.jsonl"
 node "$ROOT/scripts/omp-compat/rpc-model-switch-probe.mjs" "$OMP_BIN" "$WORK/zero-config-project" "$WORK/model-switch.rpc.json" >"$WORK/model-switch.probe.txt"
 node - "$WORK/model-switch.requests.jsonl" <<'NODE'
@@ -189,7 +189,7 @@ if (!advisorModels.includes("compat-model") || !advisorModels.includes("saved-de
 NODE
 stop_server
 
-printf '[3/9] npm-packed install and restricted child inventory\n'
+printf '[3/10] npm-packed install and restricted child inventory\n'
 start_server direct-advice "$WORK/direct.requests.jsonl"
 run_print "$WORK/direct.out" "$WORK/direct.err"
 node - "$WORK/direct.requests.jsonl" "$WORK/direct.out" "$WORK/direct.err" <<'NODE'
@@ -207,7 +207,7 @@ if (!/route advisor=/.test(fs.readFileSync(err, "utf8"))) throw new Error("exten
 NODE
 stop_server
 
-printf '[4/9] provider-context bounding across two large tool cycles\n'
+printf '[4/10] provider-context bounding across two large tool cycles\n'
 start_server context-window "$WORK/context.requests.jsonl"
 node "$ROOT/scripts/omp-compat/rpc-two-update-probe.mjs" "$OMP_BIN" "$WORK/project" "$WORK/context.rpc.json" >"$WORK/context.probe.txt"
 node - "$WORK/context.requests.jsonl" <<'NODE'
@@ -219,7 +219,7 @@ if (Math.max(...advisor.map(row => row.totalContentChars)) > 30000) throw new Er
 NODE
 stop_server
 
-printf '[5/9] terminal settlement ignores automatic continuation\n'
+printf '[5/10] terminal settlement ignores automatic continuation\n'
 start_server empty-stop-retry "$WORK/continuation.requests.jsonl"
 run_print "$WORK/continuation.out" "$WORK/continuation.err"
 node - "$WORK/continuation.requests.jsonl" <<'NODE'
@@ -231,7 +231,7 @@ if (rows.length < 3 || rows[0].advisorRequest || rows[1].advisorRequest || !rows
 NODE
 stop_server
 
-printf '[6/9] tool-phase abort, inbox release, and explicit user resume\n'
+printf '[6/10] tool-phase abort, inbox release, and explicit user resume\n'
 start_server tool-abort-blocker "$WORK/abort.requests.jsonl"
 RESUME_PROMPT="/skill:resume-check second fixture response" \
   node "$ROOT/scripts/omp-compat/rpc-tool-abort-probe.mjs" "$OMP_BIN" "$WORK/project" "$WORK/abort.rpc.json" >"$WORK/abort.probe.txt"
@@ -251,12 +251,12 @@ if (latest[0] !== "aborted" || !latest.includes("stop")) throw new Error(`unexpe
 NODE
 stop_server
 
-printf '[7/9] malformed advisor tool stream recovers on the next observation\n'
+printf '[7/10] malformed advisor tool stream recovers on the next observation\n'
 start_server failed-tool-stream-recovery "$WORK/failed-stream.requests.jsonl"
 node "$ROOT/scripts/omp-compat/rpc-failed-stream-recovery-probe.mjs" "$OMP_BIN" "$WORK/project" "$WORK/failed-stream.rpc.json" >"$WORK/failed-stream.probe.txt"
 stop_server
 
-printf '[8/9] primary native advisor enabled without nesting inside extension child\n'
+printf '[8/10] primary native advisor enabled without nesting inside extension child\n'
 cat >"$PI_CODING_AGENT_DIR/config.yml" <<'YAML'
 advisor:
   enabled: true
@@ -278,7 +278,7 @@ advisor:
   enabled: false
 YAML
 
-printf '[9/9] namespaced command and host-aware help\n'
+printf '[9/10] namespaced command and host-aware help\n'
 node "$ROOT/scripts/omp-compat/rpc-command-probe.mjs" "$OMP_BIN" "$WORK/project" "/pi-advisor help" >"$WORK/help.rpc.json"
 node - "$WORK/help.rpc.json" <<'NODE'
 const fs = require("fs");
@@ -302,5 +302,38 @@ if [[ "${RUN_TUI:-0}" == "1" ]]; then
   python3 "$ROOT/scripts/omp-compat/tui-command-probe.py" "$OMP_BIN" "$WORK/project" "$WORK/tui"
   stop_server
 fi
+
+printf '[10/10] optional notebook returns after a context reset\n'
+mkdir -p "$WORK/notebook-project"
+# Many lines, so OMP's read returns enough to fill the advisor's window and force a reset.
+python3 - "$WORK/notebook-project/large-multiline-fixture.txt" <<'PY'
+from pathlib import Path
+import sys
+Path(sys.argv[1]).write_text("\n".join(f"line {i:05d} " + "0123456789abcdef" * 5 for i in range(600)) + "\n")
+PY
+cat >"$WORK/notebook-project/WATCHDOG.yml" <<'YAML'
+main: true
+maxBehind: 1
+flushOnSettled: true
+notebook: true
+advisors:
+  - name: notebook-sentinel
+    model: compat/compat-model
+    tools: [read]
+    contextTokens: 8192
+    instructions: Review the observed turn and call advise once with a short title.
+YAML
+READ_PATH_OVERRIDE="$WORK/notebook-project/large-multiline-fixture.txt" start_server notebook "$WORK/notebook.requests.jsonl"
+node "$ROOT/scripts/omp-compat/rpc-two-update-probe.mjs" "$OMP_BIN" "$WORK/notebook-project" "$WORK/notebook.rpc.json" >"$WORK/notebook.probe.txt"
+node - "$WORK/notebook.requests.jsonl" <<'NODE'
+const fs = require("fs");
+const rows = fs.readFileSync(process.argv[2], "utf8").trim().split(/\n/).map(JSON.parse);
+const advisor = rows.filter(row => row.advisorRequest);
+if (!advisor.every(row => row.toolNames.includes("notebook"))) throw new Error("notebook tool missing from an opted-in advisor");
+if (!advisor.some(row => row.calledTools.includes("notebook"))) throw new Error("advisor never wrote its notebook");
+if (!advisor.some(row => row.hasNotebookHandover && row.hasNotebookSentinel)) throw new Error("the note did not come back after the context reset");
+if (advisor.some(row => row.hasNotebookHandover && !row.hasNotebookSentinel)) throw new Error("a handover appeared without the written note");
+NODE
+stop_server
 
 printf 'OMP %s compatibility: PASS (%s)\n' "$actual_version" "$WORK"

@@ -109,6 +109,8 @@ const server = http.createServer(async (req, res) => {
     lastText: typeof last?.content === "string" ? last.content.slice(0, 240) : undefined,
     systemPreview: contentText(messages.find(message => message.role === "system")).slice(0, 240),
     containsFirstAdvice: allText.includes("OMP compatibility sentinel: the external pi-omp-advisor"),
+    hasNotebookHandover: allText.includes("Your notebook, written by you"),
+    hasNotebookSentinel: allText.includes("NOTEBOOK_SENTINEL"),
     advisorRequest: hasAdvise,
   });
 
@@ -186,6 +188,17 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Notebook: write a note, then fill the window with a large read so the next update starts fresh.
+  if (hasAdvise && scenario === "notebook" && toolNames.includes("notebook") && !calledTools.includes("notebook")) {
+    callTool("notebook", { text: "NOTEBOOK_SENTINEL: the person wants a small single-user app, kept simple." });
+    return;
+  }
+  if (hasAdvise && scenario === "notebook" && !allText.includes("second fixture response") && !currentCalledTools.includes("read")) {
+    if (!readPath) throw new Error("READ_PATH is required for the notebook scenario");
+    callTool("read", { path: readPath });
+    return;
+  }
+
   if (hasAdvise && scenario === "context-window" && !currentCalledTools.includes("read")) {
     if (!readPath) throw new Error("READ_PATH is required for the context-window scenario");
     callTool("read", { path: readPath });
@@ -193,7 +206,8 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (hasAdvise && !currentCalledTools.includes("advise")) {
-    const secondUpdate = advisorRequestNumber > 2 || allText.includes("second fixture response");
+    // The notebook scenario spends extra requests before its first advice, so it keys only on the second prompt.
+    const secondUpdate = allText.includes("second fixture response") || (scenario !== "notebook" && advisorRequestNumber > 2);
     callTool("advise", {
       note: secondUpdate
         ? "Second OMP context cycle sentinel: prior tool history was evicted without breaking call/result pairing."
