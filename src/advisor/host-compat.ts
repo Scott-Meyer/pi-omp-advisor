@@ -1,5 +1,6 @@
 import type { ExtensionContext, ModelRuntime } from "@earendil-works/pi-coding-agent";
-import { DefaultResourceLoader } from "@earendil-works/pi-coding-agent";
+import { DefaultResourceLoader, getAgentDir } from "@earendil-works/pi-coding-agent";
+import { advisorSettingsManager } from "./advisor-settings.ts";
 import type { Api, Model } from "@earendil-works/pi-ai";
 
 /** The model lookup contract shared by extension registries and older Pi runtimes. */
@@ -94,9 +95,11 @@ export function advisorSessionToolOptions(
       skills: [],
     };
   }
+  const settingsManager = advisorSettingsManager(ctx.cwd, getAgentDir());
   return {
     tools: toolNames,
     ...(piModelRuntime ? { modelRuntime: piModelRuntime } : {}),
+    ...(settingsManager ? { settingsManager } : {}),
   };
 }
 
