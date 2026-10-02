@@ -1,6 +1,6 @@
 {
   "name": "pi-omp-advisor",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "description": "A live advisor for pi and Oh My Pi that watches your session as it works and sends advice mid-run.",
   "license": "MIT",
   "author": "Scott Meyer",
