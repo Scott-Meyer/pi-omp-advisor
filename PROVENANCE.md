@@ -89,7 +89,14 @@ copyright Scott Meyer, MIT (see `LICENSE`):
    directly to `pi.sendMessage(msg, { deliverAs: "nextTurn" })`, but pi keeps
    that queue private: extensions cannot enumerate or cancel it, and the TUI
    does not display it. Preserved advice therefore stays in pi-omp-advisor's
-   own session-scoped inbox until the next normal user `input` event. The
+   own session-scoped inbox until the primary next starts a run: the next
+   normal user `input` event, or `agent_start` for runs started any other way
+   (Parley, background-task and subagent notifications), which never pass
+   through `input`. Those are steered into the active run with no
+   `triggerTurn`; Pi defers an explicit `triggerTurn: false` custom message to
+   the end of an active run. Delivery claims the notes before calling
+   `sendMessage`, because a triggered send starts the run (and its
+   `agent_start`) synchronously. The
    extension shows the inbox above the editor and lets the user deliver or dismiss notes;
    its latest state, including session-scoped pause state, is stored in a
    non-context session entry so reloads do not discard it. Uncancelled notes are

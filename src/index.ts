@@ -475,11 +475,26 @@ export default function (pi: ExtensionAPI) {
     });
   }
 
-  function deliverQueuedAdvice(queued: readonly QueuedAdvisorNote[], triggerTurn: boolean): number {
+  /**
+   * How released notes enter the primary:
+   * - `aheadOfPrompt`: a person's prompt is about to be recorded; append now
+   *   so the cards sit above it and become context for its turn.
+   * - `intoRun`: a run is already active; steer into it. Pi defers an
+   *   explicit `triggerTurn: false` custom message to the run's end, so this
+   *   must omit it to reach the model before the run finishes.
+   * - `startTurn`: the person asked for delivery from an idle chat.
+   */
+  type QueuedAdviceDelivery = "aheadOfPrompt" | "intoRun" | "startTurn";
+
+  function deliverQueuedAdvice(queued: readonly QueuedAdvisorNote[], delivery: QueuedAdviceDelivery): number {
     if (advisorPaused) return 0;
     const current = inbox.select(queued.map(item => item.id));
     if (current.length === 0) return 0;
     const notes: AdvisorNote[] = current.map(({ id: _id, ...note }) => note);
+    // Claim before handing off: a triggered send starts the run synchronously,
+    // and that run's agent_start release must not see these notes again.
+    inbox.dismissMany(current.map(item => item.id));
+    persistInbox();
     pi.sendMessage(
       {
         customType: advisorMessageType,
@@ -487,11 +502,13 @@ export default function (pi: ExtensionAPI) {
         display: true,
         details: { notes },
       },
-      triggerTurn ? { deliverAs: "steer", triggerTurn: true } : { deliverAs: "steer", triggerTurn: false },
+      delivery === "startTurn"
+        ? { deliverAs: "steer", triggerTurn: true }
+        : delivery === "aheadOfPrompt"
+          ? { deliverAs: "steer", triggerTurn: false }
+          : { deliverAs: "steer" },
     );
     orchestrator?.markNotesStreamed(notes);
-    inbox.dismissMany(current.map(item => item.id));
-    persistInbox();
     updateInboxWidget();
     updateAdvisorStatus();
     return current.length;
@@ -501,7 +518,17 @@ export default function (pi: ExtensionAPI) {
     // The input event runs before pi records/renders the submitted user
     // message. Appending without triggering therefore places these cards
     // above that message while still making them context for its turn.
-    deliverQueuedAdvice([...inbox.items], false);
+    deliverQueuedAdvice([...inbox.items], "aheadOfPrompt");
+  }
+
+  /**
+   * Notes are held only while the primary is at rest. Once it is working
+   * again — whoever started it: a person, Parley, a background-task or
+   * subagent notification — held notes belong in that run, not in the inbox.
+   */
+  function releaseInboxIntoActiveRun(ctx: ExtensionContext): void {
+    if (inbox.items.length === 0 || ctx.isIdle() || ctx.signal?.aborted === true) return;
+    deliverQueuedAdvice([...inbox.items], "intoRun");
   }
 
   /**
@@ -532,7 +559,7 @@ export default function (pi: ExtensionAPI) {
         state: () => ({ idle: sessionContext?.isIdle() ?? false, paused: advisorPaused, queued: inbox.items.length }),
         deliver: () => {
           const current = sessionContext;
-          const delivered = deliverQueuedAdvice([...inbox.items], true);
+          const delivered = deliverQueuedAdvice([...inbox.items], "startTurn");
           if (delivered > 0) {
             current?.ui.notify(`Delivered ${delivered} queued advisor ${delivered === 1 ? "advisory" : "advisories"}.`, "info");
           }
@@ -564,7 +591,7 @@ export default function (pi: ExtensionAPI) {
           ctx.ui.notify("Advisor is paused; resume it before delivering queued notes.", "warning");
           continue;
         }
-        const delivered = deliverQueuedAdvice(items, true);
+        const delivered = deliverQueuedAdvice(items, "startTurn");
         ctx.ui.notify(`Delivered ${delivered} queued advisories.`, "info");
         return;
       }
@@ -592,7 +619,7 @@ export default function (pi: ExtensionAPI) {
           ctx.ui.notify("Advisor is paused; resume it before delivering queued notes.", "warning");
           continue;
         }
-        const delivered = deliverQueuedAdvice([item], true);
+        const delivered = deliverQueuedAdvice([item], "startTurn");
         ctx.ui.notify(delivered ? `Delivered advisor note #${item.id}.` : `Advisor note #${item.id} is no longer pending.`, "info");
         continue;
       }
@@ -639,6 +666,8 @@ export default function (pi: ExtensionAPI) {
       if (!paused) {
         advisorPaused = false;
         advisorPauseRequests.apply(false);
+        // A run that began while paused skipped its start-of-run release.
+        releaseInboxIntoActiveRun(ctx);
       }
       persistInbox();
       updateInboxWidget(ctx);
@@ -888,6 +917,9 @@ export default function (pi: ExtensionAPI) {
     // Escape aborts this supported signal. Remember it after Pi clears the
     // transient signal at settlement, so a late blocker cannot undo the stop.
     primaryInterruption.watch(ctx.signal);
+    // A person's prompt already released the inbox in `input`; this covers
+    // runs started by anything else, which never pass through `input`.
+    releaseInboxIntoActiveRun(ctx);
   });
 
   pi.on("tool_execution_start", async (event, ctx) => {
@@ -2115,6 +2147,7 @@ export default function (pi: ExtensionAPI) {
         } else {
           await orchestrator.setPaused(false);
         }
+        releaseInboxIntoActiveRun(ctx);
         persistInbox();
         updateInboxWidget(ctx);
         updateAdvisorStatus(ctx);

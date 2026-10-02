@@ -37,6 +37,7 @@
     "typecheck": "tsc -p tsconfig.json",
     "test": "node --import jiti/register --test --test-timeout=10000 \"src/**/*.test.ts\" \"scripts/*.test.mjs\"",
     "test:omp": "scripts/omp-compat/run.sh",
+    "test:pi": "scripts/pi-compat/run.sh",
     "verify:package": "node scripts/verify-package.mjs"
   },
   "pi": {

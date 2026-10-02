@@ -41,7 +41,7 @@ note reaches the primary depends on severity and on what the primary is doing:
 |---|---|
 | `nit` during active work | `aside` — batched, delivered at the next step boundary, no interruption |
 | `concern` / `blocker` | `steer` — interrupts the live turn, or triggers one when idle |
-| Primary already gave its final answer, nothing queued | `preserve` — visible, cancellable inbox entry; released above the next normal user prompt (`blocker` still steers) |
+| Primary already gave its final answer, nothing queued | `preserve` — visible, cancellable inbox entry; released when the primary next starts working (`blocker` still steers) |
 | Within `immuneTurns` (default 3) of a previous interrupt | concerns downgraded to `aside` (`blocker` exempt) |
 | Print mode while idle, or a stopped/aborting primary run | `preserve` — including blockers after a stop |
 
@@ -67,11 +67,15 @@ invisible `nextTurn` queue. A widget above the editor shows up to three queued
 notes immediately. Open the inbox with `Ctrl+Shift+A` or `/advisor inbox` to
 deliver or dismiss one note, or deliver/dismiss the whole queue. `Ctrl+Shift+R`
 pauses or resumes observation without releasing the queue; `Ctrl+Shift+X`
-clears the queue immediately. Notes you keep are rendered as advisor cards above
-the next accepted normal user message and included in that turn's model context.
+clears the queue immediately. The inbox only holds notes while the primary is at rest. When it starts
+working again, the queue is released into that run, whatever started it: a
+normal prompt (cards render above your message and join that turn's context), or
+a Parley message, background-task or subagent notification, or any other wake
+(cards are steered into the run before its first response). Resuming the advisor
+or turning it on mid-run releases the queue into the active run the same way.
 Queue and pause state are persisted as session metadata, so they survive
 extension reloads. Late ordinary notes, including default-severity nits, stay
-here for you to read and discard before submitting your next prompt. Typing alone
+here for you to read and discard before the primary next starts working. Typing alone
 does not release them. Asides queued during work are checked again at handoff in
 case the primary has since finished or been stopped. On **pi**, one more release gesture exists for the empty-chat case: with the
 session idle, the editor empty, and something queued, a bare `Enter` delivers
@@ -82,7 +86,7 @@ advisor is paused or the agent is mid-run.
 
 **OMP 18.2.4 does not expose pi's composable editor API**, so it cannot support
 that optional empty-Enter gesture. A preserved OMP note remains queued until the
-next accepted nonempty user prompt, or until you explicitly deliver it from
+primary next starts working, or until you explicitly deliver it from
 `/pi-advisor inbox`. The inbox widget/card is not a receipt that the note already
 reached the primary agent; there is no automatic standalone delivery in this
 case.
@@ -98,8 +102,8 @@ slot, so their replacement text is not accepted again as fresh advice.
 
 Pending IDs survive within-session model-context rebuilds; preserved inbox notes
 also survive reloads. Deferred notes still being reviewed are in-memory only.
-Normal user prompts still release the preserved inbox immediately, so the advisor
-does not get a fresh review of that new prompt before those notes are handed off.
+A new run releases the preserved inbox immediately, so the advisor does not get
+a fresh review of that run's prompt before those notes are handed off.
 
 ### A limited memory, not a second full transcript
 
@@ -345,7 +349,7 @@ advisor's judgment always lags the primary by its own round-trip time.
   user defaults. Subcommands also provide descriptions and Tab completion
 - `/advisor status` — which advisors are running, and their state
 - `/advisor inbox` — inspect, deliver, or dismiss preserved advisories waiting
-  for the next normal user prompt (`Ctrl+Shift+A` opens the same inbox)
+  for the primary to start working again (`Ctrl+Shift+A` opens the same inbox)
 - `/advisor stream [name]` — open a read-only popup over one advisor's own
   chat stream: its observations, reviews, and tool use as it works, updating
   live. Deliberately rare-use — it exists for the cases where you really want

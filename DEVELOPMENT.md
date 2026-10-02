@@ -134,6 +134,11 @@ is just `yaml`. Rules:
 ./node_modules/.bin/tsc -p tsconfig.json     # must be clean
 ```
 
+For inbox delivery, `npm run test:pi` drives the installed `pi` binary in RPC
+mode against an isolated agent dir and a local fake provider (about 40s). It
+checks what the primary model is actually sent when a held advisory meets a
+peer-started run, a mid-run resume, a normal prompt, and inbox "Deliver all".
+
 Then an end-to-end headless run, in a scratch directory, against a file with an
 obvious defect so the advisor actually has something to say:
 
